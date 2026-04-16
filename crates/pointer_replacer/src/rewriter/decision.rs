@@ -25,7 +25,7 @@ pub enum PtrKind {
     /// or SliceCursorMut<T> for SliceCursor(true)
     SliceCursor(bool),
     /// owning array pointer with cursor: Option<BoxedSliceCursor<T>>
-    BoxedSliceCursor,
+    OptBoxedSliceCursor,
 }
 
 impl PtrKind {
@@ -34,7 +34,7 @@ impl PtrKind {
             PtrKind::OptRef(m) | PtrKind::Raw(m) | PtrKind::Slice(m) | PtrKind::SliceCursor(m) => {
                 *m
             }
-            PtrKind::OptBox | PtrKind::OptBoxedSlice | PtrKind::BoxedSliceCursor => true,
+            PtrKind::OptBox | PtrKind::OptBoxedSlice | PtrKind::OptBoxedSliceCursor => true,
         }
     }
 }
@@ -171,7 +171,7 @@ impl<'tcx> DecisionMaker<'tcx> {
             if is_local_struct {
                 Some(PtrKind::Raw(self.mutable_pointers[local]))
             } else if self.needs_cursor.contains(local) {
-                Some(PtrKind::BoxedSliceCursor)
+                Some(PtrKind::OptBoxedSliceCursor)
             } else if self._output_params.contains(local) {
                 Some(PtrKind::Slice(true))
             } else {
@@ -292,7 +292,7 @@ impl SigDecisions {
                         kind @ (PtrKind::Raw(_)
                         | PtrKind::OptBox
                         | PtrKind::OptBoxedSlice
-                        | PtrKind::BoxedSliceCursor),
+                        | PtrKind::OptBoxedSliceCursor),
                     ) => Some(kind),
                     _ => None,
                 };
@@ -304,15 +304,15 @@ impl SigDecisions {
                     Some(
                         kind @ (PtrKind::OptBox
                         | PtrKind::OptBoxedSlice
-                        | PtrKind::BoxedSliceCursor),
+                        | PtrKind::OptBoxedSliceCursor),
                     ),
                 ) => Some(kind),
                 (Some(PtrKind::Raw(m)), _) => Some(PtrKind::Raw(m)),
-                (Some(PtrKind::OptBox), Some(PtrKind::OptBoxedSlice | PtrKind::BoxedSliceCursor)) => {
+                (Some(PtrKind::OptBox), Some(PtrKind::OptBoxedSlice | PtrKind::OptBoxedSliceCursor)) => {
                     Some(PtrKind::OptBoxedSlice)
                 }
-                (Some(PtrKind::OptBoxedSlice), Some(PtrKind::BoxedSliceCursor)) => {
-                    Some(PtrKind::BoxedSliceCursor)
+                (Some(PtrKind::OptBoxedSlice), Some(PtrKind::OptBoxedSliceCursor)) => {
+                    Some(PtrKind::OptBoxedSliceCursor)
                 }
                 (Some(kind), None) | (None, Some(kind)) => Some(kind),
                 (Some(kind), Some(_)) => Some(kind),
@@ -389,7 +389,7 @@ fn infer_returned_local_box_kind<'tcx>(
     let decl = &body.local_decls[local];
     let aliases = aliases.and_then(|aliases| aliases.get(&local));
     match decision_maker.decide(local, decl, aliases) {
-        Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice | PtrKind::BoxedSliceCursor)) => {
+        Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice | PtrKind::OptBoxedSliceCursor)) => {
             Some(kind)
         }
         _ => None,
@@ -557,18 +557,18 @@ pub unsafe fn foo(p: {pointer_ty}) {{
     }
 
     #[test]
-    fn owning_array_output_with_cursor_need_becomes_boxed_slice_cursor() {
+    fn owning_array_output_with_cursor_need_becomes_boxed_cursor() {
         assert_eq!(
             decide_for_param(true, true, true, true, false, false, true),
-            PtrKind::BoxedSliceCursor
+            PtrKind::OptBoxedSliceCursor
         );
     }
 
     #[test]
-    fn owning_array_non_output_with_cursor_need_becomes_boxed_slice_cursor() {
+    fn owning_array_non_output_with_cursor_need_becomes_boxed_cursor() {
         assert_eq!(
             decide_for_param(true, false, true, true, false, false, true),
-            PtrKind::BoxedSliceCursor
+            PtrKind::OptBoxedSliceCursor
         );
     }
 
