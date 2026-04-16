@@ -415,5 +415,124 @@ fn slice_cursor_mod_str() -> &'static str {
     impl_readable_index!(SliceCursorMut, isize, usize, i32);
     impl_readable_index!(SliceCursor, isize, usize, i32);
     impl_mutable_index!(isize, usize, i32);
+
+    pub struct BoxedSliceCursor<T> {
+        base: Box<[T]>,
+        pos: usize,
+    }
+
+    impl<T> BoxedSliceCursor<T> {
+        pub fn new(base: Box<[T]>) -> Self {
+            Self { base, pos: 0 }
+        }
+
+        pub fn with_pos(base: Box<[T]>, pos: usize) -> Self {
+            Self { base, pos }
+        }
+
+        pub fn seek(&mut self, offset: isize) {
+            self.pos = self.pos.wrapping_add_signed(offset);
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.pos >= self.base.len()
+        }
+
+        pub fn as_mut_ptr(&mut self) -> *mut T {
+            self.base[self.pos..].as_mut_ptr()
+        }
+
+        pub fn as_ptr(&self) -> *const T {
+            self.base[self.pos..].as_ptr()
+        }
+
+        pub fn first(&self) -> Option<&T> {
+            self.base.get(self.pos)
+        }
+
+        pub fn first_mut(&mut self) -> Option<&mut T> {
+            self.base.get_mut(self.pos)
+        }
+
+        pub fn as_slice(&self) -> &[T] {
+            &self.base[self.pos..]
+        }
+
+        pub fn as_slice_mut(&mut self) -> &mut [T] {
+            &mut self.base[self.pos..]
+        }
+
+        pub fn as_cursor(&self) -> SliceCursor<'_, T> {
+            SliceCursor::new(&self.base[self.pos..])
+        }
+
+        pub fn as_cursor_mut(&mut self) -> SliceCursorMut<'_, T> {
+            SliceCursorMut::new(&mut self.base[self.pos..])
+        }
+
+        /// take ownership from current position (elements before pos are dropped)
+        pub fn into_boxed_slice(self) -> Box<[T]> {
+            if self.pos == 0 {
+                self.base
+            } else {
+                let mut v = self.base.into_vec();
+                v.drain(..self.pos);
+                v.into_boxed_slice()
+            }
+        }
+
+        /// take full underlying box ignoring cursor position (for free()-equivalents)
+        pub fn into_inner(self) -> Box<[T]> {
+            self.base
+        }
+    }
+
+    impl<T> Index<isize> for BoxedSliceCursor<T> {
+        type Output = T;
+        #[inline]
+        fn index(&self, index: isize) -> &Self::Output {
+            &self.base[abs_idx(self.pos, index)]
+        }
+    }
+
+    impl<T> IndexMut<isize> for BoxedSliceCursor<T> {
+        #[inline]
+        fn index_mut(&mut self, index: isize) -> &mut Self::Output {
+            let i = abs_idx(self.pos, index);
+            &mut self.base[i]
+        }
+    }
+
+    impl<T> Index<usize> for BoxedSliceCursor<T> {
+        type Output = T;
+        #[inline]
+        fn index(&self, index: usize) -> &Self::Output {
+            &self.base[abs_idx(self.pos, index as isize)]
+        }
+    }
+
+    impl<T> IndexMut<usize> for BoxedSliceCursor<T> {
+        #[inline]
+        fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+            let i = abs_idx(self.pos, index as isize);
+            &mut self.base[i]
+        }
+    }
+
+    impl<T> Index<i32> for BoxedSliceCursor<T> {
+        type Output = T;
+        #[inline]
+        fn index(&self, index: i32) -> &Self::Output {
+            &self.base[abs_idx(self.pos, index as isize)]
+        }
+    }
+
+    impl<T> IndexMut<i32> for BoxedSliceCursor<T> {
+        #[inline]
+        fn index_mut(&mut self, index: i32) -> &mut Self::Output {
+            let i = abs_idx(self.pos, index as isize);
+            &mut self.base[i]
+        }
+    }
 }"#
 }

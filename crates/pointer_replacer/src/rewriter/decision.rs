@@ -24,6 +24,8 @@ pub enum PtrKind {
     /// slice cursor with offset tracking: SliceCursor<T> for SliceCursor(false),
     /// or SliceCursorMut<T> for SliceCursor(true)
     SliceCursor(bool),
+    /// owning array pointer with cursor: Option<BoxedSliceCursor<T>>
+    BoxedSliceCursor,
 }
 
 impl PtrKind {
@@ -32,7 +34,7 @@ impl PtrKind {
             PtrKind::OptRef(m) | PtrKind::Raw(m) | PtrKind::Slice(m) | PtrKind::SliceCursor(m) => {
                 *m
             }
-            PtrKind::OptBox | PtrKind::OptBoxedSlice => true,
+            PtrKind::OptBox | PtrKind::OptBoxedSlice | PtrKind::BoxedSliceCursor => true,
         }
     }
 }
@@ -166,8 +168,10 @@ impl<'tcx> DecisionMaker<'tcx> {
         }) {
             Some(PtrKind::Raw(self.mutable_pointers[local]))
         } else if self._owning_pointers[local] && self.array_pointers[local] {
-            if self.needs_cursor.contains(local) || is_local_struct {
+            if is_local_struct {
                 Some(PtrKind::Raw(self.mutable_pointers[local]))
+            } else if self.needs_cursor.contains(local) {
+                Some(PtrKind::BoxedSliceCursor)
             } else if self._output_params.contains(local) {
                 Some(PtrKind::Slice(true))
             } else {
@@ -284,9 +288,12 @@ impl SigDecisions {
             let return_aliases = aliases.and_then(|a| a.get(&return_local));
             let direct_output_dec =
                 match decision_maker.decide(return_local, return_decl, return_aliases) {
-                    Some(kind @ (PtrKind::Raw(_) | PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
-                        Some(kind)
-                    }
+                    Some(
+                        kind @ (PtrKind::Raw(_)
+                        | PtrKind::OptBox
+                        | PtrKind::OptBoxedSlice
+                        | PtrKind::BoxedSliceCursor),
+                    ) => Some(kind),
                     _ => None,
                 };
             let returned_local_output_dec =
@@ -294,11 +301,18 @@ impl SigDecisions {
             let output_dec = match (direct_output_dec, returned_local_output_dec) {
                 (
                     Some(PtrKind::Raw(_)),
-                    Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)),
+                    Some(
+                        kind @ (PtrKind::OptBox
+                        | PtrKind::OptBoxedSlice
+                        | PtrKind::BoxedSliceCursor),
+                    ),
                 ) => Some(kind),
                 (Some(PtrKind::Raw(m)), _) => Some(PtrKind::Raw(m)),
-                (Some(PtrKind::OptBox), Some(PtrKind::OptBoxedSlice)) => {
+                (Some(PtrKind::OptBox), Some(PtrKind::OptBoxedSlice | PtrKind::BoxedSliceCursor)) => {
                     Some(PtrKind::OptBoxedSlice)
+                }
+                (Some(PtrKind::OptBoxedSlice), Some(PtrKind::BoxedSliceCursor)) => {
+                    Some(PtrKind::BoxedSliceCursor)
                 }
                 (Some(kind), None) | (None, Some(kind)) => Some(kind),
                 (Some(kind), Some(_)) => Some(kind),
@@ -375,7 +389,9 @@ fn infer_returned_local_box_kind<'tcx>(
     let decl = &body.local_decls[local];
     let aliases = aliases.and_then(|aliases| aliases.get(&local));
     match decision_maker.decide(local, decl, aliases) {
-        Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => Some(kind),
+        Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice | PtrKind::BoxedSliceCursor)) => {
+            Some(kind)
+        }
         _ => None,
     }
 }
@@ -541,18 +557,18 @@ pub unsafe fn foo(p: {pointer_ty}) {{
     }
 
     #[test]
-    fn owning_array_output_with_cursor_need_stays_raw() {
+    fn owning_array_output_with_cursor_need_becomes_boxed_slice_cursor() {
         assert_eq!(
             decide_for_param(true, true, true, true, false, false, true),
-            PtrKind::Raw(true)
+            PtrKind::BoxedSliceCursor
         );
     }
 
     #[test]
-    fn owning_array_non_output_with_cursor_need_stays_raw() {
+    fn owning_array_non_output_with_cursor_need_becomes_boxed_slice_cursor() {
         assert_eq!(
             decide_for_param(true, false, true, true, false, false, true),
-            PtrKind::Raw(true)
+            PtrKind::BoxedSliceCursor
         );
     }
 
