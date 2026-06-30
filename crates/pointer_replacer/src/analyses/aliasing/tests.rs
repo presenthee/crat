@@ -65,3 +65,96 @@ fn detects_same_base_mut_and_const_args() {
         "expected one candidate with mutable arg 0 and immutable arg 1"
     );
 }
+
+#[test]
+fn different_arrays_are_not_same_base() {
+    let candidates = run_detection(
+        r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+            let _ = (*out, *src, len);
+        }
+        pub unsafe fn driver(len: i32) {
+            let mut a: [i32; 16] = [0; 16];
+            let mut b: [i32; 16] = [0; 16];
+            let p = a.as_mut_ptr();
+            let q = b.as_ptr();
+            callee(p, q, len);
+        }
+        "#,
+    );
+
+    assert!(
+        candidates.is_empty(),
+        "distinct array bases must not be same-base: {candidates:#?}"
+    );
+}
+
+#[test]
+fn mismatched_pointee_types_are_rejected() {
+    // out: *mut i32 and src: *const u8 are not a compatible element type pair even
+    // if they share a base, so the call site is rejected.
+    let candidates = run_detection(
+        r#"
+        pub unsafe fn callee(out: *mut i32, src: *const u8, len: i32) {
+            let _ = (*out, *src, len);
+        }
+        pub unsafe fn driver(len: i32) {
+            let mut a: [i32; 16] = [0; 16];
+            let p = a.as_mut_ptr();
+            let q = a.as_ptr() as *const u8;
+            callee(p, q, len);
+        }
+        "#,
+    );
+
+    assert!(
+        candidates.is_empty(),
+        "mismatched pointee types must be rejected: {candidates:#?}"
+    );
+}
+
+#[test]
+fn non_rewriteable_base_is_rejected() {
+    // Both arguments share a single non-directly-rewriteable base (an opaque/heap
+    // pointer from an extern allocation), so the call site is rejected.
+    let candidates = run_detection(
+        r#"
+        extern "C" {
+            fn xalloc(n: usize) -> *mut i32;
+        }
+        pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+            let _ = (*out, *src, len);
+        }
+        pub unsafe fn driver(len: i32) {
+            let base = xalloc(64);
+            let p = base;
+            let q = base as *const i32;
+            callee(p, q, len);
+        }
+        "#,
+    );
+
+    assert!(
+        candidates.is_empty(),
+        "non-directly-rewriteable base must be rejected: {candidates:#?}"
+    );
+}
+
+#[test]
+fn indirect_calls_are_rejected() {
+    let candidates = run_detection(
+        r#"
+        pub unsafe fn driver(len: i32, f: unsafe fn(*mut i32, *const i32, i32)) {
+            let mut a: [i32; 16] = [0; 16];
+            let p = a.as_mut_ptr();
+            let q = a.as_ptr();
+            f(p, q, len);
+        }
+        "#,
+    );
+
+    assert!(
+        candidates.is_empty(),
+        "indirect calls must be rejected: {candidates:#?}"
+    );
+}

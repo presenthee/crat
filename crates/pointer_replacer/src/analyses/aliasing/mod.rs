@@ -5,6 +5,10 @@
 //! This is detection only. A detected candidate still requires a read-before-write
 //! proof and bounds evidence before its read-only arguments can be safely isolated
 //! into an immutable snapshot.
+//!
+//! The detection is not yet wired into the rewrite pipeline, so the public items
+//! below are exercised only by tests for now.
+#![allow(dead_code)]
 
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::LocalDefId;
