@@ -1,10 +1,9 @@
 use points_to::andersen;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir, ItemKind, OwnerNode, PatKind, intravisit};
+use rustc_middle::mir::{Operand, Place};
 use typed_arena::Arena;
 use utils::ty_shape;
-
-use rustc_middle::mir::{Operand, Place};
 
 use super::{
     BaseAdmissibility, BaseId, OperandBase, PfgNode, UnknownReason, analyze_body,

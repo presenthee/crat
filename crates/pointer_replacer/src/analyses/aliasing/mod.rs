@@ -112,8 +112,11 @@ pub fn detect_pattern2_candidates<'tcx>(
                 // Need at least one mutable and one immutable raw-pointer argument.
                 let mut_params: Vec<usize> =
                     group.iter().filter(|a| a.is_mut).map(|a| a.index).collect();
-                let imm_params: Vec<usize> =
-                    group.iter().filter(|a| !a.is_mut).map(|a| a.index).collect();
+                let imm_params: Vec<usize> = group
+                    .iter()
+                    .filter(|a| !a.is_mut)
+                    .map(|a| a.index)
+                    .collect();
                 if mut_params.is_empty() || imm_params.is_empty() {
                     continue;
                 }
