@@ -158,3 +158,68 @@ fn indirect_calls_are_rejected() {
         "indirect calls must be rejected: {candidates:#?}"
     );
 }
+
+#[test]
+fn null_initialized_pointer_still_resolves_to_base() {
+    // `p` is null-initialized then assigned the array pointer; the null must be
+    // seen through so `p` resolves to the same base as `q`.
+    let candidates = run_detection(
+        r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+            let _ = (*out, *src, len);
+        }
+        pub unsafe fn driver(len: i32) {
+            let mut a: [i32; 16] = [0; 16];
+            let mut p: *mut i32 = core::ptr::null_mut();
+            p = a.as_mut_ptr();
+            let q = a.as_ptr();
+            callee(p, q, len);
+        }
+        "#,
+    );
+
+    assert_eq!(
+        candidates,
+        vec![(
+            "driver".to_string(),
+            "callee".to_string(),
+            vec![0usize],
+            vec![1usize]
+        )],
+        "null-initialized pointer must still resolve to the array base: {candidates:#?}"
+    );
+}
+
+#[test]
+fn mixed_call_sites_keep_only_the_same_base_site() {
+    // callee is called twice: once with same-base args, once with distinct arrays.
+    // Only the same-base call site is a candidate.
+    let candidates = run_detection(
+        r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+            let _ = (*out, *src, len);
+        }
+        pub unsafe fn driver(len: i32) {
+            let mut a: [i32; 16] = [0; 16];
+            let mut b: [i32; 16] = [0; 16];
+            let p = a.as_mut_ptr();
+            let q = a.as_ptr();
+            callee(p, q, len);
+            let r = a.as_mut_ptr();
+            let s = b.as_ptr();
+            callee(r, s, len);
+        }
+        "#,
+    );
+
+    assert_eq!(
+        candidates,
+        vec![(
+            "driver".to_string(),
+            "callee".to_string(),
+            vec![0usize],
+            vec![1usize]
+        )],
+        "exactly one same-base call site should be a candidate: {candidates:#?}"
+    );
+}
