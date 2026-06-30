@@ -1,3 +1,4 @@
+pub mod aliasing;
 pub mod array_local_provenance;
 pub mod borrow;
 mod encoding;
