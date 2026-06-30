@@ -4,8 +4,10 @@ use rustc_hir::{self as hir, ItemKind, OwnerNode, PatKind, intravisit};
 use typed_arena::Arena;
 use utils::ty_shape;
 
+use rustc_middle::mir::{Operand, Place};
+
 use super::{
-    BaseAdmissibility, BaseId, PfgNode, UnknownReason, analyze_body,
+    BaseAdmissibility, BaseId, OperandBase, PfgNode, UnknownReason, analyze_body,
     array_local_provenance_analysis,
 };
 use crate::{
@@ -2970,4 +2972,108 @@ fn builtin_summary_mismatched_foreign_strstr_not_base_preserving() {
             .any(|b| matches!(b, BaseId::Param { .. })),
         "signature-mismatched foreign strstr must not receive a Param base: {str_tmp:#?}"
     );
+}
+
+// Maps (fn_name, var_name) -> the OperandBase for `Place::from(local)` of that binding.
+fn run_place_bases(code: &str) -> FxHashMap<(String, String), Option<OperandBase>> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let rust_program = build_rust_program(tcx);
+        let alloc_fns = FxHashSet::default();
+        let mut facts = FxHashMap::default();
+
+        for &did in &rust_program.functions {
+            let fn_name = tcx.item_name(did.to_def_id()).to_string();
+            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            let result = analyze_body(tcx, did, &body, &alloc_fns);
+            let hir_to_mir = utils::ir::map_thir_to_mir(did, false, tcx);
+            let hir_body = tcx.hir_body_owned_by(did);
+            let bindings = collect_bindings(hir_body);
+
+            for (hir_id, local) in &hir_to_mir.binding_to_local {
+                let Some(var_name) = bindings.get(hir_id) else {
+                    continue;
+                };
+                let place = Place::from(*local);
+                let ob = result.unique_non_null_base_of_place(place, &body, tcx);
+                facts.insert((fn_name.clone(), var_name.clone()), ob);
+            }
+        }
+
+        facts
+    })
+    .unwrap()
+}
+
+#[test]
+fn operand_base_of_place_resolves_local_array_pointer() {
+    let map = run_place_bases(
+        r#"
+        pub unsafe fn f() {
+            let mut a: [i32; 16] = [0; 16];
+            let p = a.as_mut_ptr();
+            let _ = *p;
+        }
+        "#,
+    );
+
+    let ob = map
+        .get(&("f".to_string(), "p".to_string()))
+        .unwrap_or_else(|| panic!("missing f::p: {map:#?}"))
+        .clone()
+        .expect("p should have a unique non-null base");
+    assert!(
+        matches!(ob.base, BaseId::LocalArray { .. }),
+        "expected LocalArray base, got {ob:#?}"
+    );
+    assert_eq!(ob.admissibility, BaseAdmissibility::DirectlyRewriteable);
+}
+
+#[test]
+fn operand_base_of_operand_matches_place_and_rejects_constants() {
+    ::utils::compilation::run_compiler_on_str(
+        r#"
+        pub unsafe fn f() {
+            let mut a: [i32; 16] = [0; 16];
+            let p = a.as_mut_ptr();
+            let _ = *p;
+        }
+        "#,
+        |tcx| {
+            let rust_program = build_rust_program(tcx);
+            let alloc_fns = FxHashSet::default();
+            let did = rust_program.functions[0];
+            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            let result = analyze_body(tcx, did, &body, &alloc_fns);
+            let hir_to_mir = utils::ir::map_thir_to_mir(did, false, tcx);
+            let hir_body = tcx.hir_body_owned_by(did);
+            let bindings = collect_bindings(hir_body);
+
+            let p_local = hir_to_mir
+                .binding_to_local
+                .iter()
+                .find(|(hir_id, _)| bindings.get(hir_id).map(|s| s.as_str()) == Some("p"))
+                .map(|(_, local)| *local)
+                .expect("p local");
+
+            let place = Place::from(p_local);
+            let via_place = result.unique_non_null_base_of_place(place, &body, tcx);
+            let via_operand =
+                result.unique_non_null_base_of_operand(&Operand::Copy(place), &body, tcx);
+            assert_eq!(via_place, via_operand, "copy operand must match its place");
+
+            let const_operand = Operand::const_from_scalar(
+                tcx,
+                tcx.types.i32,
+                rustc_middle::mir::interpret::Scalar::from_i32(0),
+                rustc_span::DUMMY_SP,
+            );
+            assert!(
+                result
+                    .unique_non_null_base_of_operand(&const_operand, &body, tcx)
+                    .is_none(),
+                "constant operand must resolve to None"
+            );
+        },
+    )
+    .unwrap();
 }
