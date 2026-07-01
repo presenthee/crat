@@ -33,6 +33,8 @@ fn reads_all_inputs_before_writing_output() {
 #[test]
 fn write_then_read_is_flagged() {
     // The assignment *out = *src reads through src after the write to *out.
+    // The read is placed in the second store's rvalue because a bare
+    // `let _ = *src` is elided from MIR for Copy types.
     let s = run(r#"
         pub unsafe fn callee(out: *mut i32, src: *const i32) {
             *out = 5;
@@ -105,6 +107,21 @@ fn branchy_read_after_conditional_write() {
         pub unsafe fn callee(out: *mut i32, src: *const i32, cond: bool) {
             if cond { *out = 5; }
             *out = *src;
+        }
+        "#);
+    assert!(!s["callee"].unanalyzable);
+    assert!(!s["callee"].reads_precede_writes(&[0], &[1]));
+}
+
+#[test]
+fn write_through_effect_intrinsic_is_tracked() {
+    // A volatile write to `out` is a real write; a later read of `src` (as
+    // the return value) may observe it. The callee must stay analyzable AND
+    // flag the pair (src read after out written).
+    let s = run(r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32) -> i32 {
+            core::ptr::write_volatile(out, 5);
+            *src
         }
         "#);
     assert!(!s["callee"].unanalyzable);
