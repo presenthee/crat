@@ -56,6 +56,16 @@ pub struct BaseClassification {
     pub reason: String,
 }
 
+/// The unique non-null base of a pointer operand or place, with its admissibility.
+/// Same-base is pure provenance equality; admissibility is returned as data so
+/// callers, not the analysis, decide whether the base is rewriteable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperandBase {
+    pub slot: SlotIdx,
+    pub base: BaseId,
+    pub admissibility: BaseAdmissibility,
+}
+
 #[derive(Clone, Debug)]
 pub struct ArrayLocalProvenance {
     pub flow: PointerFlowResult,
@@ -127,6 +137,37 @@ impl ArrayLocalProvenance {
             .get(base)
             .map(|classification| classification.admissibility.clone())
             .unwrap_or(BaseAdmissibility::Reject)
+    }
+
+    /// The unique non-null base of a place that resolves to a raw-pointer slot.
+    /// Returns `None` for non-pointer places, missing or zero-slot places,
+    /// multi-base slots, and null-only slots.
+    pub fn unique_non_null_base_of_place<'tcx>(
+        &self,
+        place: Place<'tcx>,
+        body: &Body<'tcx>,
+        tcx: TyCtxt<'tcx>,
+    ) -> Option<OperandBase> {
+        let slot = self.slot_table.place_head_slot(place, body, tcx)?;
+        let base = self.provenance.unique_non_null_base(&PfgNode::Slot(slot))?;
+        let admissibility = self.admissibility_of_base(&base);
+        Some(OperandBase {
+            slot,
+            base,
+            admissibility,
+        })
+    }
+
+    /// Like [`Self::unique_non_null_base_of_place`], but for a MIR operand.
+    /// Returns `None` for constants and other non-place operands.
+    pub fn unique_non_null_base_of_operand<'tcx>(
+        &self,
+        operand: &Operand<'tcx>,
+        body: &Body<'tcx>,
+        tcx: TyCtxt<'tcx>,
+    ) -> Option<OperandBase> {
+        let place = operand.place()?;
+        self.unique_non_null_base_of_place(place, body, tcx)
     }
 
     pub fn is_potential_rewrite_base(&self, base: &BaseId) -> bool {
