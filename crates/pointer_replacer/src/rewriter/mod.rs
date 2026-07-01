@@ -252,10 +252,10 @@ pub fn rewrite_array_local_provenance(config: &Config, tcx: TyCtxt<'_>) -> (Stri
     let provenances =
         analyses::array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
 
-    if std::env::var_os("CRAT_DETECT_PATTERN2").is_some() {
-        for candidate in analyses::aliasing::detect_pattern2_candidates(&input, &provenances) {
+    if std::env::var_os("CRAT_DETECT_SNAPSHOT").is_some() {
+        for candidate in analyses::aliasing::detect_snapshot_candidates(&input, &provenances) {
             eprintln!(
-                "PATTERN2 caller={} callee={} mut={:?} imm={:?}",
+                "SNAPSHOT caller={} callee={} mut={:?} imm={:?}",
                 tcx.def_path_str(candidate.caller.to_def_id()),
                 tcx.def_path_str(candidate.callee.to_def_id()),
                 candidate.mut_params,

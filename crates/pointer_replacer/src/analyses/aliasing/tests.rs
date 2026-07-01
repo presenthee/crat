@@ -3,7 +3,7 @@ use rustc_hash::FxHashSet;
 use typed_arena::Arena;
 use utils::ty_shape;
 
-use super::detect_pattern2_candidates;
+use super::detect_snapshot_candidates;
 use crate::{analyses::array_local_provenance, rewriter::collect_input};
 
 /// (caller_name, callee_name, mut_params, imm_params) for each detected candidate.
@@ -21,7 +21,7 @@ fn run_detection(code: &str) -> Vec<(String, String, Vec<usize>, Vec<usize>)> {
         let provenances =
             array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
 
-        let mut out: Vec<_> = detect_pattern2_candidates(&input, &provenances)
+        let mut out: Vec<_> = detect_snapshot_candidates(&input, &provenances)
             .into_iter()
             .map(|c| {
                 (

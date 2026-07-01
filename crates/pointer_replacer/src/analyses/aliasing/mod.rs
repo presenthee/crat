@@ -29,7 +29,7 @@ mod tests;
 /// share the same directly-rewriteable base. Arguments are identified by their
 /// 0-based position in the call's argument list.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Pattern2Candidate {
+pub struct SnapshotCandidate {
     pub caller: LocalDefId,
     pub callee: LocalDefId,
     pub location: Location,
@@ -45,10 +45,10 @@ struct ArgInfo<'tcx> {
     admissibility: BaseAdmissibility,
 }
 
-pub fn detect_pattern2_candidates<'tcx>(
+pub fn detect_snapshot_candidates<'tcx>(
     input: &RustProgram<'tcx>,
     provenances: &FxHashMap<LocalDefId, ArrayLocalProvenance>,
-) -> Vec<Pattern2Candidate> {
+) -> Vec<SnapshotCandidate> {
     let tcx = input.tcx;
     let mut candidates = vec![];
 
@@ -129,7 +129,7 @@ pub fn detect_pattern2_candidates<'tcx>(
                     continue;
                 }
 
-                candidates.push(Pattern2Candidate {
+                candidates.push(SnapshotCandidate {
                     caller,
                     callee,
                     location,
