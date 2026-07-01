@@ -219,6 +219,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .iter()
                         .flat_map(|arg| self.get_read_paths_of_ptr(&arg.ptrv, &[]));
                     reads.extend(reads2);
+                    new_state.note_param_reads(reads.iter().filter_map(read_base).cloned());
                     new_state.add_reads(reads.into_iter());
                     let (writes, nonnulls) =
                         new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
@@ -311,6 +312,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             .map(|v| {
                 let (mut new_state, writes_ret) = self.assign(dst, v, &state);
                 new_state.add_excludes(offsets.iter().cloned());
+                new_state.note_param_reads(reads.iter().filter_map(read_base).cloned());
                 new_state.add_reads(reads.iter().cloned());
                 let (writes, nonnulls) = new_state.add_writes(
                     writes.iter().cloned().chain(writes_ret),
