@@ -9,6 +9,7 @@
 #![warn(unused_extern_crates)]
 
 extern crate either;
+extern crate outparam_replacer;
 extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;

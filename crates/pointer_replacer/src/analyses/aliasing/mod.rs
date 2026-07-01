@@ -48,6 +48,7 @@ struct ArgInfo<'tcx> {
 pub fn detect_snapshot_candidates<'tcx>(
     input: &RustProgram<'tcx>,
     provenances: &FxHashMap<LocalDefId, ArrayLocalProvenance>,
+    access_order: &FxHashMap<LocalDefId, outparam_replacer::ai::access_order::AccessOrderSummary>,
 ) -> Vec<SnapshotCandidate> {
     let tcx = input.tcx;
     let mut candidates = vec![];
@@ -126,6 +127,15 @@ pub fn detect_snapshot_candidates<'tcx>(
                 let mut pointees = group.iter().map(|a| tcx.erase_regions(a.pointee));
                 let first = pointees.next().expect("group is non-empty");
                 if !pointees.all(|p| p == first) {
+                    continue;
+                }
+
+                // Keep the call site only when the callee never reads an
+                // immutable-argument parameter after writing the mutable one.
+                let ordered = access_order
+                    .get(&callee)
+                    .is_some_and(|s| s.reads_precede_writes(&mut_params, &imm_params));
+                if !ordered {
                     continue;
                 }
 
