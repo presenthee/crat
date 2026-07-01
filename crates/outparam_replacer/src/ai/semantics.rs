@@ -131,6 +131,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TerminatorKind::SwitchInt { discr, targets } => {
                 let (v, reads) = self.transfer_operand(discr, state);
                 let mut new_state = state.clone();
+                new_state.note_param_reads(reads.iter().map(|p| p.base));
                 new_state.add_reads(reads.into_iter());
                 let locations = if v.intv.is_bot() && v.uintv.is_bot() {
                     v.boolv
@@ -253,6 +254,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TerminatorKind::Assert { cond, target, .. } => {
                 let (_, reads) = self.transfer_operand(cond, state);
                 let mut new_state = state.clone();
+                new_state.note_param_reads(reads.iter().map(|p| p.base));
                 new_state.add_reads(reads.into_iter());
                 TransferedTerminator::state_location(new_state, target.start_location())
             }
@@ -718,10 +720,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 self.indirect_assign(&args[0].ptrv, &args[1], &[], state);
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
-                let bases = self
-                    .get_write_bases_of_ptr(&args[0].ptrv)
-                    .unwrap_or_default();
-                call_kind = CallKind::RustEffect(Some(bases));
+                call_kind = effect_write_call_kind(&args[0].ptrv);
                 AbsValue::top()
             }
             ("", "", "ptr", "read_volatile")
@@ -797,19 +796,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 reads.extend(reads2);
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
-                let bases = self
-                    .get_write_bases_of_ptr(&args[0].ptrv)
-                    .unwrap_or_default();
-                call_kind = CallKind::RustEffect(Some(bases));
+                call_kind = effect_write_call_kind(&args[0].ptrv);
                 args[0].clone()
             }
             ("", "unix", _, "memset") => {
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
-                let bases = self
-                    .get_write_bases_of_ptr(&args[0].ptrv)
-                    .unwrap_or_default();
-                call_kind = CallKind::RustEffect(Some(bases));
+                call_kind = effect_write_call_kind(&args[0].ptrv);
                 args[0].clone()
             }
             ("", "vec", _, "as_mut_ptr") => AbsValue::top_ptr(),
@@ -1558,5 +1551,22 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let idx = callee_base.index() - 1;
         let arg = args.get(idx)?;
         self.param_write_bases(&arg.ptrv)
+    }
+}
+
+/// Build the `CallKind` for an effect intrinsic (write_volatile, memcpy, memset)
+/// based on all pointer targets of the destination argument. Every parameter
+/// target is collected; a `Top` pointer or any `Heap` target means the write
+/// destination cannot be bounded, which the caller will treat as unanalyzable.
+fn effect_write_call_kind(dst: &AbsPtr) -> CallKind {
+    match dst {
+        AbsPtr::Top => CallKind::RustEffect(None),
+        AbsPtr::Set(ptrs) => {
+            if ptrs.iter().any(|p| matches!(p.base, AbsBase::Heap)) {
+                CallKind::RustEffect(None)
+            } else {
+                CallKind::RustEffect(Some(ptrs.iter().map(|p| p.base).collect()))
+            }
+        }
     }
 }
