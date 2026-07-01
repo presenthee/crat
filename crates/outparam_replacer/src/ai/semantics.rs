@@ -1274,7 +1274,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TyKind::Slice(_) => unreachable!("{:?}", ty),
             TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) => AbsValue::heap_or_null(),
             TyKind::FnDef(_, _) => unreachable!("{:?}", ty),
-            TyKind::FnPtr(_, _) => AbsValue::top_list(),
+            TyKind::FnPtr(_, _) => AbsValue::top_fn(),
             TyKind::UnsafeBinder(_) => unreachable!("{:?}", ty),
             TyKind::Dynamic(_, _, _) => unreachable!("{:?}", ty),
             TyKind::Closure(_, _) => unreachable!("{:?}", ty),
