@@ -168,7 +168,11 @@ pub fn analyze(
     config: &crate::Config,
     verbose: bool,
     tcx: TyCtxt<'_>,
-) -> (AnalysisResult, FunctionSummaries) {
+) -> (
+    AnalysisResult,
+    FunctionSummaries,
+    FxHashMap<LocalDefId, crate::ai::access_order::AccessOrderSummary>,
+) {
     let mut call_graph = FxHashMap::default();
     let mut inputs_map = FxHashMap::default();
     let mut if_map = FxHashMap::default();
@@ -270,6 +274,8 @@ pub fn analyze(
     let mut wm_map = FxHashMap::default();
     let mut call_args_map = FxHashMap::default();
     let mut analysis_times: FxHashMap<_, u128> = FxHashMap::default();
+    let mut access_order_map: FxHashMap<LocalDefId, crate::ai::access_order::AccessOrderSummary> =
+        FxHashMap::default();
 
     let mut wfrs: FxHashMap<DefId, Vec<WriteForReturn>> = FxHashMap::default();
     let mut bb_musts: FxHashMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> =
@@ -327,6 +333,29 @@ pub fn analyze(
                     call_info_map,
                     is_merged,
                 } = analyzer.analyze_body(&body);
+
+                if config.track_access_order {
+                    let mut pairs: FxHashSet<(Local, Local)> = FxHashSet::default();
+                    for per_key in states.values() {
+                        for st in per_key.values() {
+                            if let Some(ao) = &st.access_order {
+                                pairs.extend(ao.pairs.iter().copied());
+                            }
+                        }
+                    }
+                    let read_after_write = pairs
+                        .into_iter()
+                        .map(|(r, w)| (r.index() - 1, w.index() - 1))
+                        .collect();
+                    access_order_map.insert(
+                        local_def_id,
+                        crate::ai::access_order::AccessOrderSummary {
+                            unanalyzable: analyzer.access_order_unanalyzable,
+                            read_after_write,
+                        },
+                    );
+                }
+
                 if config.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
                         "{:?}\n{}",
@@ -607,7 +636,7 @@ pub fn analyze(
         println!("Total Analaysis Time: {:.3}", time as f32 / 1000.0);
     }
 
-    summaries
+    let (results_map, summaries_map): (AnalysisResult, FunctionSummaries) = summaries
         .into_iter()
         .map(|(def_id, summary)| {
             let output_params = output_params_map.remove(&def_id).unwrap();
@@ -621,7 +650,8 @@ pub fn analyze(
             let path_str = tcx.def_path_str(def_id);
             ((path_str.clone(), res), (path_str, summary))
         })
-        .collect()
+        .collect();
+    (results_map, summaries_map, access_order_map)
 }
 
 fn return_location(body: &Body<'_>) -> Option<Location> {
@@ -652,6 +682,7 @@ pub struct Analyzer<'a, 'tcx> {
     pub indirect_assigns: BTreeSet<Local>,
     pub is_merged: bool,
     pub local_decl: &'a IndexVec<Local, LocalDecl<'tcx>>,
+    pub access_order_unanalyzable: bool,
 }
 
 struct AnalyzedBody {
@@ -690,6 +721,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             indirect_assigns: BTreeSet::new(),
             is_merged: false,
             local_decl,
+            access_order_unanalyzable: false,
         }
     }
 
@@ -1350,6 +1382,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             for a in self.pre_context.alias {
                 start_state.excludes.insert(AbsPath::new(*a, vec![]));
             }
+        }
+
+        if self.config.track_access_order {
+            start_state.access_order = Some(Default::default());
         }
 
         let init_state = start_state.clone();
