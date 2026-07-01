@@ -95,3 +95,18 @@ fn helper_write_then_read_is_flagged() {
     assert!(!s["callee"].unanalyzable);
     assert!(!s["callee"].reads_precede_writes(&[0], &[1]));
 }
+
+#[test]
+fn branchy_read_after_conditional_write() {
+    // On one path `out` is written before `src` is read, so the read of `src`
+    // may observe that write. The final store uses `*src` as its rvalue so the
+    // read appears in MIR (a bare `let _ = *src` is eliminated for Copy types).
+    let s = run(r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32, cond: bool) {
+            if cond { *out = 5; }
+            *out = *src;
+        }
+        "#);
+    assert!(!s["callee"].unanalyzable);
+    assert!(!s["callee"].reads_precede_writes(&[0], &[1]));
+}
