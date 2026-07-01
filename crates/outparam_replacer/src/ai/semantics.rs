@@ -713,6 +713,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 }
             }
             ("ptr", "mut_ptr" | "const_ptr", _, "offset_from") => AbsValue::top_int(),
+            ("", "", "ptr", "null" | "null_mut") => AbsValue::null(),
             ("", "", "ptr", "write_volatile") => {
                 self.indirect_assign(&args[0].ptrv, &args[1], &[], state);
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
@@ -1063,7 +1064,15 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     let reads = readss.into_iter().flatten().collect();
                     (v, reads, vec![])
                 }
-                AggregateKind::Tuple => unreachable!("{:?}", rvalue),
+                AggregateKind::Tuple => {
+                    let (vs, readss): (Vec<_>, Vec<_>) = fields
+                        .iter()
+                        .map(|operand| self.transfer_operand(operand, state))
+                        .unzip();
+                    let v = AbsValue::alpha_list(vs.into_iter().collect());
+                    let reads = readss.into_iter().flatten().collect();
+                    (v, reads, vec![])
+                }
                 AggregateKind::Adt(def_id, _, _, _, _) => {
                     let adt_def = self.tcx.adt_def(def_id);
                     match adt_def.adt_kind() {
@@ -1265,7 +1274,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TyKind::Slice(_) => unreachable!("{:?}", ty),
             TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) => AbsValue::heap_or_null(),
             TyKind::FnDef(_, _) => unreachable!("{:?}", ty),
-            TyKind::FnPtr(_, _) => todo!("{:?}", ty),
+            TyKind::FnPtr(_, _) => AbsValue::top_list(),
             TyKind::UnsafeBinder(_) => unreachable!("{:?}", ty),
             TyKind::Dynamic(_, _, _) => unreachable!("{:?}", ty),
             TyKind::Closure(_, _) => unreachable!("{:?}", ty),

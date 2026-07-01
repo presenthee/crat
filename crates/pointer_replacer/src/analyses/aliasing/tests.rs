@@ -21,7 +21,8 @@ fn run_detection(code: &str) -> Vec<(String, String, Vec<usize>, Vec<usize>)> {
         let provenances =
             array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
 
-        let mut out: Vec<_> = detect_snapshot_candidates(&input, &provenances)
+        let access_order = outparam_replacer::ai::access_order::analyze_access_order(tcx);
+        let mut out: Vec<_> = detect_snapshot_candidates(&input, &provenances, &access_order)
             .into_iter()
             .map(|c| {
                 (
@@ -221,5 +222,60 @@ fn mixed_call_sites_keep_only_the_same_base_site() {
             vec![1usize]
         )],
         "exactly one same-base call site should be a candidate: {candidates:#?}"
+    );
+}
+
+#[test]
+fn read_before_write_callee_is_kept() {
+    // All reads through `src` happen before the store through `out`.
+    let candidates = run_detection(
+        r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+            let mut acc = 0;
+            let mut i = 0;
+            while i < len { acc += *src.offset(i as isize); i += 1; }
+            *out = acc;
+        }
+        pub unsafe fn driver(len: i32) {
+            let mut a: [i32; 16] = [0; 16];
+            let p = a.as_mut_ptr();
+            let q = a.as_ptr();
+            callee(p, q, len);
+        }
+        "#,
+    );
+    assert_eq!(
+        candidates,
+        vec![(
+            "driver".to_string(),
+            "callee".to_string(),
+            vec![0usize],
+            vec![1usize]
+        )],
+    );
+}
+
+#[test]
+fn read_after_write_callee_is_dropped() {
+    // The second store reads through `src` after writing through `out`. A bare
+    // `let _ = *src` is eliminated from MIR for Copy types, so the read is
+    // anchored as the rvalue of a subsequent store to ensure it appears in MIR.
+    let candidates = run_detection(
+        r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32) {
+            *out = 5;
+            *out = *src;
+        }
+        pub unsafe fn driver() {
+            let mut a: [i32; 16] = [0; 16];
+            let p = a.as_mut_ptr();
+            let q = a.as_ptr();
+            callee(p, q);
+        }
+        "#,
+    );
+    assert!(
+        candidates.is_empty(),
+        "read-after-write callee must be dropped: {candidates:#?}"
     );
 }

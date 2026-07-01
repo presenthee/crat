@@ -253,7 +253,10 @@ pub fn rewrite_array_local_provenance(config: &Config, tcx: TyCtxt<'_>) -> (Stri
         analyses::array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
 
     if std::env::var_os("CRAT_DETECT_SNAPSHOT").is_some() {
-        for candidate in analyses::aliasing::detect_snapshot_candidates(&input, &provenances) {
+        let access_order = outparam_replacer::ai::access_order::analyze_access_order(tcx);
+        for candidate in
+            analyses::aliasing::detect_snapshot_candidates(&input, &provenances, &access_order)
+        {
             eprintln!(
                 "SNAPSHOT caller={} callee={} mut={:?} imm={:?}",
                 tcx.def_path_str(candidate.caller.to_def_id()),
