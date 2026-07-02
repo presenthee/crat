@@ -832,7 +832,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 call_kind = effect_write_call_kind(&args[0].ptrv);
                 args[0].clone()
             }
-            ("", "vec", _, "as_mut_ptr") => AbsValue::top_ptr(),
+            ("", "vec", _, "as_mut_ptr") => AbsValue::heap(),
             ("ffi", "va_list", _, "arg" | "as_va_list")
             | ("", "", "AsmCastTrait", "cast_in")
             | ("", "f128_t", _, "new")
