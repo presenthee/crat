@@ -366,6 +366,33 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         st.note_param_writes(param_locals.iter().copied());
                     }
                 }
+                // memcpy/memmove/memset copy into their first pointer argument and
+                // read the others; the source read is already recorded above, so
+                // only the destination needs to be treated as a write. Modeling
+                // this avoids giving up whenever a parameter pointer is copied.
+                _ if matches!(
+                    name.rsplit("::").next(),
+                    Some("memcpy") | Some("memmove") | Some("memset")
+                ) =>
+                {
+                    match args.first().map(|a| &a.ptrv) {
+                        Some(AbsPtr::Set(ptrs)) => {
+                            let dest: Vec<_> = ptrs
+                                .iter()
+                                .filter_map(|p| match p.base {
+                                    AbsBase::Arg(a) => Some(self.ptr_params[a]),
+                                    _ => None,
+                                })
+                                .collect();
+                            for st in &mut new_states {
+                                st.note_param_writes(dest.iter().copied());
+                            }
+                        }
+                        // Unknown destination target: the write cannot be bounded.
+                        Some(AbsPtr::Top) => self.access_order_unanalyzable = true,
+                        None => {}
+                    }
+                }
                 // All other calls (unknown effects, extern, method, function
                 // pointer): if any argument is a parameter-derived pointer the
                 // callee's accesses cannot be bounded.
