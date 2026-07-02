@@ -1046,7 +1046,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 };
                 (v, reads, vec![])
             }
-            Rvalue::Discriminant(_) => todo!("{:?}", rvalue),
+            Rvalue::Discriminant(place) => {
+                let (_, reads) = self.transfer_place(place, state);
+                (AbsValue::top_int(), reads, vec![])
+            }
             Rvalue::Aggregate(box kind, fields) => match kind {
                 AggregateKind::Array(_) => {
                     let (vs, readss): (Vec<_>, Vec<_>) = fields
@@ -1089,21 +1092,25 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             (v, reads, vec![])
                         }
                         AdtKind::Enum => {
-                            assert_eq!(
-                                format!("{adt_def:?}"),
-                                "std::option::Option",
-                                "{:?}",
-                                rvalue
-                            );
-                            if let Some(field) = fields.get(FieldIdx::from_usize(0)) {
-                                let (v, reads) = self.transfer_operand(field, state);
-                                if v.is_bot() {
-                                    (AbsValue::bot(), reads, vec![])
+                            if format!("{adt_def:?}") == "std::option::Option" {
+                                if let Some(field) = fields.get(FieldIdx::from_usize(0)) {
+                                    let (v, reads) = self.transfer_operand(field, state);
+                                    if v.is_bot() {
+                                        (AbsValue::bot(), reads, vec![])
+                                    } else {
+                                        (AbsValue::some(v), reads, vec![])
+                                    }
                                 } else {
-                                    (AbsValue::some(v), reads, vec![])
+                                    (AbsValue::none(), vec![], vec![])
                                 }
                             } else {
-                                (AbsValue::none(), vec![], vec![])
+                                // Any other enum variant: the composed value is not
+                                // modeled, but its field operands are still read.
+                                let reads = fields
+                                    .iter()
+                                    .flat_map(|operand| self.transfer_operand(operand, state).1)
+                                    .collect();
+                                (AbsValue::top(), reads, vec![])
                             }
                         }
                     }
@@ -1303,6 +1310,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     ) -> Vec<AbsProjElem> {
         projection
             .iter()
+            .filter(|e| !matches!(e, ProjectionElem::Downcast(_, _)))
             .map(|e| self.abstract_elem(e, state))
             .collect()
     }
