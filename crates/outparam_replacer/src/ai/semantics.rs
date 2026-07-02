@@ -366,6 +366,36 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         st.note_param_writes(param_locals.iter().copied());
                     }
                 }
+                // memcpy/memmove/memset copy into their first pointer argument and
+                // read the others; the source read is already recorded above, so
+                // only the destination needs to be treated as a write. Modeling
+                // this avoids giving up whenever a parameter pointer is copied.
+                _ if matches!(
+                    name.rsplit("::").next(),
+                    Some("memcpy") | Some("memmove") | Some("memset")
+                ) =>
+                {
+                    match args.first().map(|a| &a.ptrv) {
+                        Some(AbsPtr::Set(ptrs)) => {
+                            let dest: Vec<_> = ptrs
+                                .iter()
+                                .filter_map(|p| match p.base {
+                                    AbsBase::Arg(a) => Some(self.ptr_params[a]),
+                                    _ => None,
+                                })
+                                .collect();
+                            for st in &mut new_states {
+                                st.note_param_writes(dest.iter().copied());
+                            }
+                        }
+                        // An unresolved destination is not attributable to any
+                        // parameter, so no write is recorded for it. This mirrors
+                        // how get_write_paths_of_ptr treats Top elsewhere in this
+                        // module, rather than giving up on the whole function.
+                        Some(AbsPtr::Top) => {}
+                        None => {}
+                    }
+                }
                 // All other calls (unknown effects, extern, method, function
                 // pointer): if any argument is a parameter-derived pointer the
                 // callee's accesses cannot be bounded.
@@ -1046,7 +1076,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 };
                 (v, reads, vec![])
             }
-            Rvalue::Discriminant(_) => todo!("{:?}", rvalue),
+            Rvalue::Discriminant(place) => {
+                let (_, reads) = self.transfer_place(place, state);
+                (AbsValue::top_int(), reads, vec![])
+            }
             Rvalue::Aggregate(box kind, fields) => match kind {
                 AggregateKind::Array(_) => {
                     let (vs, readss): (Vec<_>, Vec<_>) = fields
@@ -1089,21 +1122,25 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             (v, reads, vec![])
                         }
                         AdtKind::Enum => {
-                            assert_eq!(
-                                format!("{adt_def:?}"),
-                                "std::option::Option",
-                                "{:?}",
-                                rvalue
-                            );
-                            if let Some(field) = fields.get(FieldIdx::from_usize(0)) {
-                                let (v, reads) = self.transfer_operand(field, state);
-                                if v.is_bot() {
-                                    (AbsValue::bot(), reads, vec![])
+                            if format!("{adt_def:?}") == "std::option::Option" {
+                                if let Some(field) = fields.get(FieldIdx::from_usize(0)) {
+                                    let (v, reads) = self.transfer_operand(field, state);
+                                    if v.is_bot() {
+                                        (AbsValue::bot(), reads, vec![])
+                                    } else {
+                                        (AbsValue::some(v), reads, vec![])
+                                    }
                                 } else {
-                                    (AbsValue::some(v), reads, vec![])
+                                    (AbsValue::none(), vec![], vec![])
                                 }
                             } else {
-                                (AbsValue::none(), vec![], vec![])
+                                // Any other enum variant: the composed value is not
+                                // modeled, but its field operands are still read.
+                                let reads = fields
+                                    .iter()
+                                    .flat_map(|operand| self.transfer_operand(operand, state).1)
+                                    .collect();
+                                (AbsValue::top(), reads, vec![])
                             }
                         }
                     }
@@ -1249,7 +1286,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     match ty.as_str() {
                         "std::option::Option" => AbsValue::top_option(),
                         "libc::c_void" | "std::ffi::c_void" => AbsValue::top(),
-                        _ => unreachable!("{:?}", ty),
+                        _ => AbsValue::top(),
                     }
                 }
             },
@@ -1303,6 +1340,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     ) -> Vec<AbsProjElem> {
         projection
             .iter()
+            .filter(|e| !matches!(e, ProjectionElem::Downcast(_, _)))
             .map(|e| self.abstract_elem(e, state))
             .collect()
     }
