@@ -1249,7 +1249,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     match ty.as_str() {
                         "std::option::Option" => AbsValue::top_option(),
                         "libc::c_void" | "std::ffi::c_void" => AbsValue::top(),
-                        _ => unreachable!("{:?}", ty),
+                        _ => AbsValue::top(),
                     }
                 }
             },
