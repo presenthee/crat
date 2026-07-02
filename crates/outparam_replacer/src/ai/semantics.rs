@@ -388,8 +388,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                                 st.note_param_writes(dest.iter().copied());
                             }
                         }
-                        // Unknown destination target: the write cannot be bounded.
-                        Some(AbsPtr::Top) => self.access_order_unanalyzable = true,
+                        // An unresolved destination is not attributable to any
+                        // parameter, so no write is recorded for it. This mirrors
+                        // how get_write_paths_of_ptr treats Top elsewhere in this
+                        // module, rather than giving up on the whole function.
+                        Some(AbsPtr::Top) => {}
                         None => {}
                     }
                 }
@@ -832,7 +835,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 call_kind = effect_write_call_kind(&args[0].ptrv);
                 args[0].clone()
             }
-            ("", "vec", _, "as_mut_ptr") => AbsValue::heap(),
+            ("", "vec", _, "as_mut_ptr") => AbsValue::top_ptr(),
             ("ffi", "va_list", _, "arg" | "as_va_list")
             | ("", "", "AsmCastTrait", "cast_in")
             | ("", "f128_t", _, "new")
