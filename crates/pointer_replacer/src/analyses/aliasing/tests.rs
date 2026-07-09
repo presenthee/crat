@@ -3,7 +3,7 @@ use rustc_hash::FxHashSet;
 use typed_arena::Arena;
 use utils::ty_shape;
 
-use super::detect_snapshot_candidates;
+use super::{attribute_alias_pairs, detect_snapshot_candidates};
 use crate::{analyses::array_local_provenance, rewriter::collect_input};
 
 /// (caller_name, callee_name, mut_params, imm_params) for each detected candidate.
@@ -31,6 +31,40 @@ fn run_detection(code: &str) -> Vec<(String, String, Vec<usize>, Vec<usize>)> {
                     c.mut_params,
                     c.imm_params,
                 )
+            })
+            .collect();
+        out.sort();
+        out
+    })
+    .unwrap()
+}
+
+/// (callee_name, pair, sorted caller_names of the pair's call sites) for each
+/// attributed alias pair.
+fn run_attribution(code: &str) -> Vec<(String, (usize, usize), Vec<String>)> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let arena = Arena::new();
+        let tss = ty_shape::get_ty_shapes(&arena, tcx, false);
+        let andersen_config = andersen::Config {
+            use_optimized_mir: false,
+            c_exposed_fns: FxHashSet::default(),
+        };
+        let pre = andersen::pre_analyze(&andersen_config, &tss, tcx);
+        let solutions = andersen::analyze(&andersen_config, &pre, &tss, tcx);
+        let sites = attribute_alias_pairs(tcx, &pre, &solutions);
+        let mut out: Vec<_> = sites
+            .pairs
+            .into_iter()
+            .flat_map(|(callee, pairs)| {
+                let callee = tcx.item_name(callee.to_def_id()).to_string();
+                pairs.into_iter().map(move |(pair, sites)| {
+                    let mut callers: Vec<_> = sites
+                        .iter()
+                        .map(|(caller, _)| tcx.item_name(caller.to_def_id()).to_string())
+                        .collect();
+                    callers.sort();
+                    (callee.clone(), pair, callers)
+                })
             })
             .collect();
         out.sort();
@@ -115,9 +149,11 @@ fn mismatched_pointee_types_are_rejected() {
 }
 
 #[test]
-fn non_rewriteable_base_is_rejected() {
+fn non_rewriteable_base_is_detected() {
     // Both arguments share a single non-directly-rewriteable base (an opaque/heap
-    // pointer from an extern allocation), so the call site is rejected.
+    // pointer from an extern allocation). The call site still feeds the callee's
+    // alias cluster, so it must be detected; whether a copy can be planned for it
+    // is decided later from the recorded admissibility.
     let candidates = run_detection(
         r#"
         extern "C" {
@@ -135,9 +171,15 @@ fn non_rewriteable_base_is_rejected() {
         "#,
     );
 
-    assert!(
-        candidates.is_empty(),
-        "non-directly-rewriteable base must be rejected: {candidates:#?}"
+    assert_eq!(
+        candidates,
+        vec![(
+            "driver".to_string(),
+            "callee".to_string(),
+            vec![0usize],
+            vec![1usize]
+        )],
+        "non-directly-rewriteable base must still be detected: {candidates:#?}"
     );
 }
 
@@ -252,6 +294,72 @@ fn read_before_write_callee_is_kept() {
             vec![0usize],
             vec![1usize]
         )],
+    );
+}
+
+#[test]
+fn alias_pair_attributed_to_both_call_sites() {
+    // Two callers each pass same-base argument pairs to one callee: the pair
+    // (0, 1) must map to both calls.
+    let pairs = run_attribution(
+        r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+            let _ = (*out, *src, len);
+        }
+        pub unsafe fn caller_a(len: i32) {
+            let mut a: [i32; 16] = [0; 16];
+            callee(a.as_mut_ptr(), a.as_ptr(), len);
+        }
+        pub unsafe fn caller_b(len: i32) {
+            let mut b: [i32; 8] = [0; 8];
+            callee(b.as_mut_ptr(), b.as_ptr(), len);
+        }
+        "#,
+    );
+    assert_eq!(
+        pairs,
+        vec![(
+            "callee".to_string(),
+            (0usize, 1usize),
+            vec!["caller_a".to_string(), "caller_b".to_string()],
+        )],
+        "expected one pair attributed to both call sites"
+    );
+}
+
+#[test]
+fn distinct_bases_contribute_no_pair() {
+    let pairs = run_attribution(
+        r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+            let _ = (*out, *src, len);
+        }
+        pub unsafe fn driver(len: i32) {
+            let mut a: [i32; 16] = [0; 16];
+            let mut b: [i32; 16] = [0; 16];
+            callee(a.as_mut_ptr(), b.as_ptr(), len);
+        }
+        "#,
+    );
+    assert!(
+        pairs.is_empty(),
+        "distinct bases must contribute no pair: {pairs:#?}"
+    );
+}
+
+#[test]
+fn indirect_call_contributes_no_pair() {
+    let pairs = run_attribution(
+        r#"
+        pub unsafe fn driver(len: i32, f: unsafe fn(*mut i32, *const i32, i32)) {
+            let mut a: [i32; 16] = [0; 16];
+            f(a.as_mut_ptr(), a.as_ptr(), len);
+        }
+        "#,
+    );
+    assert!(
+        pairs.is_empty(),
+        "indirect calls must contribute no pair: {pairs:#?}"
     );
 }
 

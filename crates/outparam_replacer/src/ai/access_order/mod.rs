@@ -12,6 +12,9 @@ pub struct AccessOrderSummary {
     /// `(reader, writer)` means a read through parameter `reader` may run after a
     /// write through parameter `writer`.
     pub read_after_write: FxHashSet<(usize, usize)>,
+    /// Parameters that may be written through on some path, including paths that
+    /// do not reach an exit. Argument indices are 0-based.
+    pub may_write_params: FxHashSet<usize>,
 }
 
 impl AccessOrderSummary {
@@ -23,6 +26,11 @@ impl AccessOrderSummary {
                 mut_.iter()
                     .any(|m| self.read_after_write.contains(&(*i, *m)))
             })
+    }
+
+    /// True when no listed parameter may be written through in the callee.
+    pub fn params_never_written(&self, params: &[usize]) -> bool {
+        !self.unanalyzable && !params.iter().any(|p| self.may_write_params.contains(p))
     }
 }
 

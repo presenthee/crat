@@ -243,6 +243,35 @@ pub fn rewrite_struct_param_fields(
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
     let alloc_fns = pre_points_to.alloc_fns.clone();
     let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+
+    // Debug check: the site-attributed alias pairs must agree with
+    // `find_param_aliases`. This runs here, not in the detection block below,
+    // because `post_analyze` consumes the pre-analysis data both need.
+    if std::env::var_os("CRAT_DETECT_SNAPSHOT").is_some()
+        && std::env::var_os("CRAT_SNAPSHOT_AO_EQUIV").is_some()
+    {
+        let aliases = find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
+        let sites =
+            analyses::aliasing::attribute_alias_pairs(tcx, &pre_points_to, &points_to_solutions);
+        let mut expected: FxHashMap<LocalDefId, FxHashSet<(usize, usize)>> = FxHashMap::default();
+        for (callee, aliases) in &aliases {
+            let set = expected.entry(*callee).or_default();
+            for (a, bs) in aliases {
+                for b in bs {
+                    let (a, b) = (a.index() - 1, b.index() - 1);
+                    set.insert((a.min(b), a.max(b)));
+                }
+            }
+        }
+        let actual: FxHashMap<LocalDefId, FxHashSet<(usize, usize)>> = sites
+            .pairs
+            .iter()
+            .map(|(callee, pairs)| (*callee, pairs.keys().copied().collect()))
+            .collect();
+        assert_eq!(expected, actual);
+        eprintln!("SNAPSHOT_EQUIV ok ({} callees)", expected.len());
+    }
+
     let points_to = andersen::post_analyze(
         &andersen_config,
         pre_points_to,
