@@ -336,10 +336,14 @@ pub fn analyze(
 
                 if config.track_access_order {
                     let mut pairs: FxHashSet<(Local, Local)> = FxHashSet::default();
+                    // Union written bases over all states, not only exit states: a
+                    // write on a path that later diverges still happened.
+                    let mut written: FxHashSet<Local> = FxHashSet::default();
                     for per_key in states.values() {
                         for st in per_key.values() {
                             if let Some(ao) = &st.access_order {
                                 pairs.extend(ao.pairs.iter().copied());
+                                written.extend(ao.written_so_far.iter().copied());
                             }
                         }
                     }
@@ -347,11 +351,13 @@ pub fn analyze(
                         .into_iter()
                         .map(|(r, w)| (r.index() - 1, w.index() - 1))
                         .collect();
+                    let may_write_params = written.into_iter().map(|w| w.index() - 1).collect();
                     access_order_map.insert(
                         local_def_id,
                         crate::ai::access_order::AccessOrderSummary {
                             unanalyzable: analyzer.access_order_unanalyzable,
                             read_after_write,
+                            may_write_params,
                         },
                     );
                 }

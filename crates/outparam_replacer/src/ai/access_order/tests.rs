@@ -114,6 +114,49 @@ fn branchy_read_after_conditional_write() {
 }
 
 #[test]
+fn write_through_const_param_via_cast_is_rejected() {
+    // A mutability-changing pointer cast joins the value with Heap, so the
+    // write cannot be attributed to `src` and the summary is unanalyzable.
+    // Either way, `src` must not pass as never-written.
+    let s = run(r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32) {
+            *out = 1;
+            *(src as *mut i32) = 2;
+        }
+        "#);
+    let callee = &s["callee"];
+    assert!(callee.unanalyzable || callee.may_write_params.contains(&1));
+    assert!(!callee.params_never_written(&[1]));
+}
+
+#[test]
+fn conditional_write_is_reported() {
+    let s = run(r#"
+        pub unsafe fn callee(out: *mut i32, cond: bool) {
+            if cond { *out = 5; }
+        }
+        "#);
+    let callee = &s["callee"];
+    assert!(!callee.unanalyzable);
+    assert!(callee.may_write_params.contains(&0));
+    assert!(!callee.params_never_written(&[0]));
+}
+
+#[test]
+fn read_only_param_is_not_reported() {
+    let s = run(r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32) {
+            *out = *src;
+        }
+        "#);
+    let callee = &s["callee"];
+    assert!(!callee.unanalyzable);
+    assert!(callee.may_write_params.contains(&0));
+    assert!(!callee.may_write_params.contains(&1));
+    assert!(callee.params_never_written(&[1]));
+}
+
+#[test]
 fn write_through_effect_intrinsic_is_tracked() {
     // A volatile write to `out` is a real write; a later read of `src` (as
     // the return value) may observe it. The callee must stay analyzable AND

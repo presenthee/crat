@@ -13,6 +13,7 @@ pub mod offset_sign;
 pub(crate) mod output_params;
 pub mod ownership;
 pub mod pointer_flow;
+pub mod read_extent;
 pub mod struct_array_field;
 pub mod struct_copy;
 pub mod struct_param_field_spec;
