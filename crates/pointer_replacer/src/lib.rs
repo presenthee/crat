@@ -30,7 +30,7 @@ mod utils;
 
 pub use rewriter::{
     BytemuckDependency, Config, InitialPointerDecisions, PointerDecisionOptions, PtrKind,
-    SigDecision, SigDecisions, initial_pointer_decisions, replace_local_borrows,
+    SigDecision, SigDecisions, initial_pointer_decisions, replace_local_borrows, rewrite_aliasing,
     rewrite_array_local_provenance, rewrite_epoch_split, rewrite_struct_arrays,
     rewrite_struct_param_fields,
 };

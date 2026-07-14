@@ -32,6 +32,9 @@ pub enum BaseId {
     LocalArray {
         local: Local,
     },
+    LocalVec {
+        local: Local,
+    },
     LocalScalar {
         local: Local,
     },
