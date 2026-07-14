@@ -4,7 +4,7 @@ use rustc_middle::{
     mir::{Body, Operand, Place},
     ty::{self, Ty, TyCtxt},
 };
-use rustc_span::{def_id::DefId, source_map::Spanned};
+use rustc_span::{def_id::DefId, source_map::Spanned, sym};
 
 use crate::analyses::pointer_flow::{
     collector::operand_place,
@@ -49,6 +49,17 @@ pub(crate) fn is_as_ptr(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
     matches!(crate_name.as_str(), "core" | "std")
         && (name.contains("::slice::") || name.contains("::array::"))
         && matches!(name.rsplit("::").next(), Some("as_ptr" | "as_mut_ptr"))
+}
+
+pub(crate) fn is_vec_as_ptr(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
+    let crate_name = tcx.crate_name(def_id.krate);
+    crate_name.as_str() == "alloc"
+        && name.contains("::vec::")
+        && matches!(name.rsplit("::").next(), Some("as_ptr" | "as_mut_ptr"))
+}
+
+pub(crate) fn is_vec_ty<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    matches!(ty.kind(), ty::TyKind::Adt(adt, _) if tcx.is_diagnostic_item(sym::Vec, adt.did()))
 }
 
 pub(crate) fn call_no_writes(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {

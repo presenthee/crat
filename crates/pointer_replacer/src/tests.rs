@@ -11905,3 +11905,124 @@ pub mod b {
     assert!(!mod_b.contains("use crate::build_field"), "{s}");
     assert!(!mod_b.contains("use crate::a::build_field"), "{s}");
 }
+
+fn rewrite_aliasing_with_config(code: &str, config: &Config) -> (String, bool) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| rewrite_aliasing(config, tcx)).unwrap()
+}
+
+#[test]
+fn snapshot_prefix_copy_is_emitted() {
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+    let _ = len;
+    *out = *src;
+}
+pub unsafe fn driver(len: i32) {
+    let mut a: [i32; 16] = [0; 16];
+    callee(a.as_mut_ptr(), a.as_ptr(), len);
+}
+"#;
+    let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
+    assert!(changed);
+    assert!(
+        s.contains("*(a.as_ptr() as *const i32 as *const [i32; 1]);"),
+        "expected the snapshot let in:\n{s}"
+    );
+    assert!(
+        s.contains("callee(a.as_mut_ptr(), __crat_snap_0.as_ptr(), len);"),
+        "expected the rewritten argument in:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
+#[test]
+fn snapshot_in_safe_fn_wraps_initializer_in_unsafe() {
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) {
+    *out = *src;
+}
+pub fn driver() {
+    let mut a: [i32; 16] = [0; 16];
+    unsafe {
+        callee(a.as_mut_ptr(), a.as_ptr());
+    }
+}
+"#;
+    let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
+    assert!(changed);
+    assert!(
+        s.contains("unsafe { *(a.as_ptr() as *const i32 as *const [i32; 1]) };"),
+        "expected an unsafe-wrapped initializer in:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
+#[test]
+fn snapshot_expression_position_call_is_untouched() {
+    // The call's value is used, so there is no statement to insert before;
+    // the site is infeasible and the callee must not be rewritten at all.
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) -> i32 {
+    *out = *src;
+    0
+}
+pub unsafe fn driver() -> i32 {
+    let mut a: [i32; 16] = [0; 16];
+    let r = callee(a.as_mut_ptr(), a.as_ptr());
+    r
+}
+"#;
+    let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
+    assert!(!changed);
+    assert!(!s.contains("__crat_snap"), "no snapshot expected in:\n{s}");
+}
+
+#[test]
+fn snapshot_whole_array_is_shared_across_arguments() {
+    // The read extent is unknown (a runtime offset), so both read-only
+    // arguments fall back to one whole-array snapshot.
+    let code = r#"
+pub unsafe fn callee(out: *mut u8, a: *const u8, b: *const u8, n: usize) {
+    let v = *a.offset(n as isize) ^ *b.offset(n as isize);
+    *out = v;
+}
+pub unsafe fn driver(n: usize) {
+    let mut arr: [u8; 16] = [0; 16];
+    callee(arr.as_mut_ptr(), arr.as_ptr(), arr.as_ptr(), n);
+}
+"#;
+    let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
+    assert!(changed);
+    assert_eq!(
+        s.matches("let __crat_snap_0: [u8; 16] = arr;").count(),
+        1,
+        "expected one shared snapshot in:\n{s}"
+    );
+    assert_eq!(
+        s.matches("__crat_snap_0.as_ptr()").count(),
+        2,
+        "expected both arguments rewritten in:\n{s}"
+    );
+    assert!(
+        !s.contains("arr.as_ptr()"),
+        "no read-only base access may remain in:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
+#[test]
+fn snapshot_pass_reports_unchanged_without_candidates() {
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) {
+    *out = *src;
+}
+pub unsafe fn driver() {
+    let mut a: [i32; 4] = [0; 4];
+    let mut b: [i32; 4] = [0; 4];
+    callee(a.as_mut_ptr(), b.as_ptr());
+}
+"#;
+    let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
+    assert!(!changed);
+    assert!(!s.contains("__crat_snap"), "no snapshot expected in:\n{s}");
+}

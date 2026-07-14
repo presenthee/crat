@@ -40,6 +40,7 @@ pub(crate) mod decision;
 pub(crate) mod diagnostics;
 mod epoch_split;
 mod lifetimes;
+mod snapshot_rewriter;
 mod struct_array_field_pre;
 mod struct_param_field_spec;
 mod transform;
@@ -243,35 +244,6 @@ pub fn rewrite_struct_param_fields(
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
     let alloc_fns = pre_points_to.alloc_fns.clone();
     let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
-
-    // Debug check: the site-attributed alias pairs must agree with
-    // `find_param_aliases`. This runs here, not in the detection block below,
-    // because `post_analyze` consumes the pre-analysis data both need.
-    if std::env::var_os("CRAT_DETECT_SNAPSHOT").is_some()
-        && std::env::var_os("CRAT_SNAPSHOT_AO_EQUIV").is_some()
-    {
-        let aliases = find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
-        let sites =
-            analyses::aliasing::attribute_alias_pairs(tcx, &pre_points_to, &points_to_solutions);
-        let mut expected: FxHashMap<LocalDefId, FxHashSet<(usize, usize)>> = FxHashMap::default();
-        for (callee, aliases) in &aliases {
-            let set = expected.entry(*callee).or_default();
-            for (a, bs) in aliases {
-                for b in bs {
-                    let (a, b) = (a.index() - 1, b.index() - 1);
-                    set.insert((a.min(b), a.max(b)));
-                }
-            }
-        }
-        let actual: FxHashMap<LocalDefId, FxHashSet<(usize, usize)>> = sites
-            .pairs
-            .iter()
-            .map(|(callee, pairs)| (*callee, pairs.keys().copied().collect()))
-            .collect();
-        assert_eq!(expected, actual);
-        eprintln!("SNAPSHOT_EQUIV ok ({} callees)", expected.len());
-    }
-
     let points_to = andersen::post_analyze(
         &andersen_config,
         pre_points_to,
@@ -295,6 +267,112 @@ pub fn rewrite_struct_param_fields(
         changed,
         field_specs,
     )
+}
+
+/// Snapshot-isolation sub-pass: inserts immutable copies of read-only
+/// pointer arguments at call sites where they share a base with a mutable
+/// argument, so `replace_local_borrows` can later promote the callee's
+/// read-only parameters out of their mutable alias cluster. Decision prints
+/// go to stderr under `CRAT_SNAPSHOT_TRACE`; `CRAT_SNAPSHOT_VALIDATE` adds a
+/// `debug_assert_eq!` after each exact-prefix copy.
+pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+    let mut krate = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+
+    let input = collect_input(tcx);
+    let arena = typed_arena::Arena::new();
+    let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+    let andersen_config = andersen::Config {
+        use_optimized_mir: false,
+        c_exposed_fns: config.c_exposed_fns.clone(),
+    };
+    let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
+    let alloc_fns = pre_points_to.alloc_fns.clone();
+    let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+
+    let trace = snapshot_rewriter::trace_enabled();
+
+    // Debug check: the site-attributed alias pairs must agree with
+    // `find_param_aliases`.
+    if std::env::var_os("CRAT_SNAPSHOT_AO_EQUIV").is_some() {
+        let aliases = find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
+        let sites =
+            analyses::aliasing::attribute_alias_pairs(tcx, &pre_points_to, &points_to_solutions);
+        let mut expected: FxHashMap<LocalDefId, FxHashSet<(usize, usize)>> = FxHashMap::default();
+        for (callee, aliases) in &aliases {
+            let set = expected.entry(*callee).or_default();
+            for (a, bs) in aliases {
+                for b in bs {
+                    let (a, b) = (a.index() - 1, b.index() - 1);
+                    set.insert((a.min(b), a.max(b)));
+                }
+            }
+        }
+        let actual: FxHashMap<LocalDefId, FxHashSet<(usize, usize)>> = sites
+            .pairs
+            .iter()
+            .map(|(callee, pairs)| (*callee, pairs.keys().copied().collect()))
+            .collect();
+        assert_eq!(expected, actual);
+        eprintln!("SNAPSHOT_EQUIV ok ({} callees)", expected.len());
+    }
+
+    let provenances =
+        analyses::array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
+    let access_order = outparam_replacer::ai::access_order::analyze_access_order(tcx);
+    let candidates =
+        analyses::aliasing::detect_snapshot_candidates(&input, &provenances, &access_order);
+    if trace {
+        for candidate in &candidates {
+            eprintln!(
+                "SNAPSHOT caller={} callee={} mut={:?} imm={:?}",
+                tcx.def_path_str(candidate.caller.to_def_id()),
+                tcx.def_path_str(candidate.callee.to_def_id()),
+                candidate.mut_params,
+                candidate.imm_params,
+            );
+        }
+    }
+
+    let changed = if candidates.is_empty() {
+        false
+    } else {
+        let mut extents = analyses::read_extent::ReadExtentAnalysis::new(tcx);
+        let gated = analyses::aliasing::gate_candidates(
+            tcx,
+            candidates,
+            &access_order,
+            &mut extents,
+            trace,
+        );
+        let (feasible, sites) =
+            snapshot_rewriter::plan_sites(tcx, gated, &krate, &ast_to_hir, trace);
+        let pair_sites =
+            analyses::aliasing::attribute_alias_pairs(tcx, &pre_points_to, &points_to_solutions);
+        let selected = analyses::aliasing::select_callees(tcx, &feasible, &pair_sites, trace);
+        if trace {
+            let mut names: Vec<_> = selected
+                .iter()
+                .map(|c| tcx.def_path_str(c.to_def_id()))
+                .collect();
+            names.sort();
+            for name in names {
+                eprintln!("SNAPSHOT_SELECT callee={name}");
+            }
+        }
+        let sites: Vec<_> = sites
+            .into_iter()
+            .filter(|s| selected.contains(&s.callee))
+            .collect();
+        if trace {
+            eprintln!("SNAPSHOT_EMIT sites={}", sites.len());
+        }
+        let validate = std::env::var_os("CRAT_SNAPSHOT_VALIDATE").is_some();
+        snapshot_rewriter::apply_snapshot_isolation(&mut krate, &sites, &ast_to_hir, validate)
+    };
+
+    (pprust::crate_to_string_for_macros(&krate), changed)
 }
 
 pub fn rewrite_array_local_provenance(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
@@ -327,21 +405,6 @@ pub fn rewrite_array_local_provenance(config: &Config, tcx: TyCtxt<'_>) -> (Stri
         source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
     let provenances =
         analyses::array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
-
-    if std::env::var_os("CRAT_DETECT_SNAPSHOT").is_some() {
-        let access_order = outparam_replacer::ai::access_order::analyze_access_order(tcx);
-        for candidate in
-            analyses::aliasing::detect_snapshot_candidates(&input, &provenances, &access_order)
-        {
-            eprintln!(
-                "SNAPSHOT caller={} callee={} mut={:?} imm={:?}",
-                tcx.def_path_str(candidate.caller.to_def_id()),
-                tcx.def_path_str(candidate.callee.to_def_id()),
-                candidate.mut_params,
-                candidate.imm_params,
-            );
-        }
-    }
 
     let changed = array_local_index_rewriter::apply_array_local_index_rewrite(
         &mut krate,

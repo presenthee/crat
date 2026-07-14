@@ -140,9 +140,10 @@ fn summary_source_for_base(base: &BaseId, result: &PointerFlowResult) -> Summary
         BaseId::OpaqueReturn { .. } => SummarySource::OpaqueReturn,
         BaseId::Unknown { reason, .. } => SummarySource::Unknown(reason.clone()),
         BaseId::IntToPtr { .. } => SummarySource::Unknown(UnknownReason::ConstantPointer),
-        BaseId::LocalArray { .. } | BaseId::LocalScalar { .. } | BaseId::RawBorrow { .. } => {
-            SummarySource::Unknown(UnknownReason::UnsupportedMemoryLoad)
-        }
+        BaseId::LocalArray { .. }
+        | BaseId::LocalVec { .. }
+        | BaseId::LocalScalar { .. }
+        | BaseId::RawBorrow { .. } => SummarySource::Unknown(UnknownReason::UnsupportedMemoryLoad),
     }
 }
 

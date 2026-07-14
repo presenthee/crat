@@ -148,8 +148,8 @@ impl ArrayLocalProvenance {
         body: &Body<'tcx>,
         tcx: TyCtxt<'tcx>,
     ) -> Option<OperandBase> {
-        let slot = self.slot_table.place_head_slot(place, body, tcx)?;
-        let base = self.provenance.unique_non_null_base(&PfgNode::Slot(slot))?;
+        let slot = self.slot_table().place_head_slot(place, body, tcx)?;
+        let base = self.provenance().unique_non_null_base(&PfgNode::Slot(slot))?;
         let admissibility = self.admissibility_of_base(&base);
         Some(OperandBase {
             slot,
@@ -1564,6 +1564,10 @@ fn classify_base(base: &BaseId) -> BaseClassification {
         BaseId::LocalArray { .. } => (
             BaseAdmissibility::DirectlyRewriteable,
             "local array pointer can later become array/slice indexing",
+        ),
+        BaseId::LocalVec { .. } => (
+            BaseAdmissibility::TrackOnly,
+            "vec-backed pointer has a stable base but no in-place rewrite; only call-site copies may use it",
         ),
         BaseId::LocalScalar { .. } => (
             BaseAdmissibility::DirectlyRewriteable,

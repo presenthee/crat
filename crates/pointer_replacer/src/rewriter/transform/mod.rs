@@ -5452,6 +5452,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 && self.try_require_bytemuck_slice_cast(rhs_inner_ty, lhs_inner_ty, m))
         {
             self.bytemuck.set(true);
+            // An array-of-element target reads one fixed-size block (e.g. a
+            // snapshot copy's `*(p as *const [T; K])`). `cast_slice` panics
+            // unless the whole source length is a multiple of the block
+            // size, so limit the source to exactly one block.
+            if let ty::TyKind::Array(elem_ty, len) = lhs_inner_ty.kind()
+                && *elem_ty == rhs_inner_ty
+                && let Some(len) = len.try_to_target_usize(self.tcx)
+            {
+                return utils::expr!(
+                    "bytemuck::cast_slice{}::<_, {}>(&{}({})[..{}])",
+                    if m { "_mut" } else { "" },
+                    lhs_ty,
+                    if m { "mut " } else { "" },
+                    pprust::expr_to_string(e),
+                    len,
+                );
+            }
             let reference = if matches!(e.kind, ExprKind::Index(..)) {
                 if m { "&mut " } else { "&" }
             } else {
@@ -6957,6 +6974,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 && self.try_require_bytemuck_slice_cast(rhs_inner_ty, lhs_inner_ty, m))
         {
             self.bytemuck.set(true);
+            // An array-of-element target reads one fixed-size block (e.g. a
+            // snapshot copy's `*(p as *const [T; K])`). `cast_slice` panics
+            // unless the whole source length is a multiple of the block
+            // size, so limit the source to exactly one block.
+            if let ty::TyKind::Array(elem_ty, len) = lhs_inner_ty.kind()
+                && *elem_ty == rhs_inner_ty
+                && let Some(len) = len.try_to_target_usize(self.tcx)
+            {
+                return utils::expr!(
+                    "bytemuck::cast_slice{}::<_, {}>(&{}({})[..{}])",
+                    if m { "_mut" } else { "" },
+                    mir_ty_to_string(lhs_inner_ty, self.tcx),
+                    if m { "mut " } else { "" },
+                    pprust::expr_to_string(e),
+                    len,
+                );
+            }
             let reference = get_reference(
                 matches!(e.kind, ExprKind::Index(..))
                     || (pe.base_kind != PtrExprBaseKind::Alloca && !is_rewritten_slice_like_local),
