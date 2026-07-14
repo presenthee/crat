@@ -1236,6 +1236,29 @@ fn array_local_provenance_unknown_pointer_return_is_track_only() {
 }
 
 #[test]
+fn array_local_provenance_vec_as_mut_ptr_bases_on_vec_local() {
+    let map = run_analysis(
+        r#"
+        pub unsafe fn f() {
+            let mut v: Vec<u8> = vec![0; 64];
+            let p = v.as_mut_ptr();
+            let q = v.as_mut_ptr().offset(2);
+            let _ = (*p, *q);
+        }
+        "#,
+    );
+
+    let p = facts(&map, "f", "p");
+    let q = facts(&map, "f", "q");
+    assert!(
+        matches!(p.unique, Some(BaseId::LocalVec { .. })),
+        "expected LocalVec base for p: {p:#?}"
+    );
+    assert_eq!(p.unique, q.unique, "p and q must share the vec base");
+    assert_eq!(p.admissibility, Some(BaseAdmissibility::TrackOnly));
+}
+
+#[test]
 fn array_local_provenance_simple_field_store_and_load_preserves_base() {
     let map = run_analysis(
         r#"

@@ -22,7 +22,8 @@ use crate::{
             builtin::{
                 builtin_summary, call_name, call_no_writes, call_propagates_first_arg,
                 constant_pointer_reason, is_as_ptr, is_empty_array_ref_ty, is_heap_alloc_call,
-                is_null_ptr_call, is_pointer_arithmetic, is_zero_int_operand,
+                is_null_ptr_call, is_pointer_arithmetic, is_vec_as_ptr, is_vec_ty,
+                is_zero_int_operand,
             },
             field_access::{
                 FieldAccess, FieldAccessReject, FieldAccessRejectKind, FieldEventScanner,
@@ -703,6 +704,21 @@ impl<'tcx> Collector<'_, 'tcx> {
                 return;
             }
 
+            // `Vec::as_ptr`/`as_mut_ptr` come from crate `alloc`, so they miss
+            // `is_as_ptr` and would fall to the opaque-return arm below. When the
+            // receiver resolves to a vec-typed local, base the returned pointer on
+            // that local; otherwise fall through to the generic handling.
+            if is_vec_as_ptr(self.tcx, def_id, &name)
+                && let Some(arg) = args.first()
+                && let Some(place) = operand_place(&arg.node)
+                && let Some(base) = self.local_vec_base_from_place(place)
+            {
+                if let Some(dst) = self.destination_node(*destination, location) {
+                    self.graph.add_base_edge(base, dst);
+                }
+                return;
+            }
+
             if is_as_ptr(self.tcx, def_id, &name)
                 && let Some(arg) = args.first()
                 && let Some(place) = operand_place(&arg.node)
@@ -1096,6 +1112,40 @@ impl<'tcx> Collector<'_, 'tcx> {
 
         self.array_source_for_local(place.local, &mut FxHashSet::default())
             .map(|local| BaseId::LocalArray { local })
+    }
+
+    fn local_vec_base_from_place(&self, place: Place<'tcx>) -> Option<BaseId> {
+        self.vec_source_for_local(place.local, &mut FxHashSet::default())
+            .map(|local| BaseId::LocalVec { local })
+    }
+
+    fn vec_source_for_local(&self, local: Local, visited: &mut FxHashSet<Local>) -> Option<Local> {
+        if !visited.insert(local) {
+            return None;
+        }
+
+        if is_vec_ty(self.local_ty(local), self.tcx) {
+            return Some(local);
+        }
+
+        for rhs in self.rhs_map.get(&local).into_iter().flatten() {
+            match rhs {
+                AssignRhs::ArrayBorrow(place) => {
+                    if place.projection.is_empty()
+                        && is_vec_ty(self.local_ty(place.local), self.tcx)
+                    {
+                        return Some(place.local);
+                    }
+                }
+                AssignRhs::Follow(src_local) => {
+                    if let Some(vec_local) = self.vec_source_for_local(*src_local, visited) {
+                        return Some(vec_local);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn array_source_for_local(

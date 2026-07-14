@@ -6,24 +6,32 @@
 //! not used as a candidacy filter: every same-base call site feeds the callee's
 //! alias cluster regardless of whether the caller's base will ever be promoted.
 //!
-//! This is detection only. A detected candidate still requires a read-before-write
-//! proof and bounds evidence before its read-only arguments can be safely isolated
-//! into an immutable snapshot.
+//! Detected candidates then pass through per-site gates that plan the copies
+//! (`gate_candidates`: the callee must never write through the read-only
+//! parameters, and each read-only argument needs bounds evidence — an exact
+//! read prefix or a whole caller-local array), and a per-callee selection
+//! (`select_callees`) that keeps only callees whose every alias-inducing call
+//! site is resolved, so the inserted copies actually dissolve the callee's
+//! mutable alias cluster.
 //!
-//! The detection is not yet wired into the rewrite pipeline, so the public items
-//! below are exercised only by tests for now.
+//! `rewriter::rewrite_aliasing` drives the detect → gate → select stages and
+//! emits the copies.
 #![allow(dead_code)]
 
+use outparam_replacer::ai::access_order::AccessOrderSummary;
 use points_to::andersen;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ItemKind, def_id::LocalDefId};
 use rustc_middle::{
-    mir::{Const, Location, TerminatorKind},
-    ty::{self, Ty, TyCtxt},
+    mir::{Body, CastKind, Const, Local, Location, Operand, Rvalue, StatementKind, TerminatorKind},
+    ty::{self, Ty, TyCtxt, adjustment::PointerCoercion},
 };
 
 use crate::{
-    analyses::array_local_provenance::{ArrayLocalProvenance, BaseAdmissibility, BaseId},
+    analyses::{
+        array_local_provenance::{ArrayLocalProvenance, BaseAdmissibility, BaseId},
+        read_extent::{Extent, ReadExtentAnalysis, call_context},
+    },
     utils::rustc::RustProgram,
 };
 
@@ -263,4 +271,349 @@ pub fn detect_snapshot_candidates<'tcx>(
     }
 
     candidates
+}
+
+/// A candidate that passed every per-site gate, with the copy each immutable
+/// argument needs.
+#[derive(Clone, Debug)]
+pub struct GatedCandidate {
+    pub candidate: SnapshotCandidate,
+    /// One plan per entry of the candidate's `imm_params`, in order.
+    pub copies: Vec<CopyPlan>,
+}
+
+/// How one immutable argument's bytes reach the snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyPlan {
+    /// Copy `elems` elements of the argument's pointee type from the
+    /// argument pointer into a fresh local array.
+    ExactPrefix { arg_index: usize, elems: u64 },
+    /// Copy the whole caller-local array base and re-derive the argument
+    /// from the copy.
+    WholeArray {
+        arg_index: usize,
+        base_local: Local,
+        len: u64,
+    },
+}
+
+/// Applies the per-site gates and plans the copies. Detection already
+/// required reads through the immutable arguments to precede writes; a
+/// candidate additionally needs its callee to never write through those
+/// parameters (the write would land in the dropped copy and be lost), and
+/// every immutable argument needs bounds evidence: the exact prefix the
+/// callee reads under this call's constant scalar arguments, or — when no
+/// extent is known — a caller-local array base whose whole contents can be
+/// copied because the callee never observes the pointer's address.
+pub fn gate_candidates<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    candidates: Vec<SnapshotCandidate>,
+    access_order: &FxHashMap<LocalDefId, AccessOrderSummary>,
+    extents: &mut ReadExtentAnalysis<'tcx>,
+    trace: bool,
+) -> Vec<GatedCandidate> {
+    let gate_skip = |candidate: &SnapshotCandidate, reason: &str| {
+        if trace {
+            eprintln!(
+                "SNAPSHOT_GATE_SKIP caller={} callee={} reason={reason}",
+                tcx.def_path_str(candidate.caller.to_def_id()),
+                tcx.def_path_str(candidate.callee.to_def_id()),
+            );
+        }
+    };
+    let mut gated = vec![];
+    'candidates: for candidate in candidates {
+        let never_written = access_order
+            .get(&candidate.callee)
+            .is_some_and(|s| s.params_never_written(&candidate.imm_params));
+        if !never_written {
+            gate_skip(
+                &candidate,
+                "callee may write through an immutable parameter",
+            );
+            continue;
+        }
+        let body = tcx
+            .mir_drops_elaborated_and_const_checked(candidate.caller)
+            .borrow();
+        let TerminatorKind::Call { args, .. } = &body.basic_blocks[candidate.location.block]
+            .terminator()
+            .kind
+        else {
+            continue;
+        };
+        let ctx = call_context(tcx, candidate.caller, candidate.location);
+        let typing_env = ty::TypingEnv::post_analysis(tcx, candidate.caller);
+
+        let mut copies = vec![];
+        for &imm in &candidate.imm_params {
+            let Some(arg) = args.get(imm) else {
+                continue 'candidates;
+            };
+            let arg_ty = arg.node.ty(&body.local_decls, tcx);
+            let ty::TyKind::RawPtr(pointee, _) = arg_ty.kind() else {
+                continue 'candidates;
+            };
+            // Exact prefix first: it copies the fewest bytes and needs no
+            // knowledge of the base.
+            let extent = extents.extent(candidate.callee, imm, &ctx);
+            if let Extent::Const(bytes) = extent {
+                let elem_size = tcx
+                    .layout_of(typing_env.as_query_input(*pointee))
+                    .ok()
+                    .map(|l| l.size.bytes());
+                if let Some(size) = elem_size
+                    && size > 0
+                    && bytes % size == 0
+                {
+                    copies.push(CopyPlan::ExactPrefix {
+                        arg_index: imm,
+                        elems: bytes / size,
+                    });
+                    continue;
+                }
+            }
+            // Whole-array fallback: the base must be a caller-local array of
+            // known length, and the callee must never observe the pointer's
+            // address, which the copy would change.
+            if let BaseId::LocalArray { local } = &candidate.base
+                && let ty::TyKind::Array(_, len) = body.local_decls[*local].ty.kind()
+                && let Some(len) = len.try_to_target_usize(tcx)
+                && !extents
+                    .classify_param_uses(candidate.callee, imm)
+                    .identity_observed
+            {
+                copies.push(CopyPlan::WholeArray {
+                    arg_index: imm,
+                    base_local: *local,
+                    len,
+                });
+                continue;
+            }
+            gate_skip(
+                &candidate,
+                &format!(
+                    "no copy plan for argument {imm}: extent={extent:?} ctx={ctx:?} base={:?}",
+                    candidate.base
+                ),
+            );
+            continue 'candidates;
+        }
+        gated.push(GatedCandidate { candidate, copies });
+    }
+    gated
+}
+
+/// The resolution status of one call site contributing an alias pair.
+enum SiteStatus {
+    /// A gated candidate at this site isolates the pair.
+    Covered,
+    /// The site passes the caller's own parameters straight through; the
+    /// pair is resolved when the caller's pair is.
+    Forwarded(LocalDefId, (usize, usize)),
+    Blocked,
+}
+
+/// Selects the callees whose every attributed alias pair is resolved by the
+/// gated candidates, iterating because a forwarding site's discharge depends
+/// on the caller's own pair being resolved first. C-exposed callees are
+/// selected like any other: the pointer pass rewrites their signatures too,
+/// and the interface pass restores their C ABI behind a wrapper afterwards.
+/// Emission applies to the covering candidates of selected callees only.
+pub fn select_callees(
+    tcx: TyCtxt<'_>,
+    gated: &[GatedCandidate],
+    pair_sites: &AliasPairSites,
+    trace: bool,
+) -> FxHashSet<LocalDefId> {
+    // The gated candidates at each call site. A candidate isolates a pair
+    // when both indices share its base and at least one is immutable:
+    // immutable arguments get fresh copies, while two mutable arguments
+    // keep aliasing even at a gated site.
+    let mut covering: FxHashMap<(LocalDefId, Location, LocalDefId), Vec<&SnapshotCandidate>> =
+        FxHashMap::default();
+    for g in gated {
+        let c = &g.candidate;
+        covering
+            .entry((c.caller, c.location, c.callee))
+            .or_default()
+            .push(c);
+    }
+    let covers =
+        |caller: LocalDefId, location: Location, callee: LocalDefId, i: usize, j: usize| {
+            covering
+                .get(&(caller, location, callee))
+                .is_some_and(|cands| {
+                    cands.iter().any(|c| {
+                        let in_group =
+                            |x: &usize| c.mut_params.contains(x) || c.imm_params.contains(x);
+                        in_group(&i)
+                            && in_group(&j)
+                            && !(c.mut_params.contains(&i) && c.mut_params.contains(&j))
+                    })
+                })
+        };
+
+    let mut statuses: FxHashMap<(LocalDefId, (usize, usize)), Vec<SiteStatus>> =
+        FxHashMap::default();
+    for (&callee, pairs) in &pair_sites.pairs {
+        for (&(i, j), sites) in pairs {
+            let entry = statuses.entry((callee, (i, j))).or_default();
+            for &(caller, location) in sites {
+                if covers(caller, location, callee, i, j) {
+                    entry.push(SiteStatus::Covered);
+                } else {
+                    entry.push(forwarding_status(tcx, caller, location, i, j));
+                }
+            }
+        }
+    }
+
+    let mut resolved: FxHashSet<(LocalDefId, (usize, usize))> = FxHashSet::default();
+    loop {
+        let mut changed = false;
+        for (key, sites) in &statuses {
+            if resolved.contains(key) {
+                continue;
+            }
+            let done = sites.iter().all(|s| match s {
+                SiteStatus::Covered => true,
+                SiteStatus::Forwarded(caller, pair) => {
+                    // A pair no call site ever creates cannot hold at
+                    // runtime (parameters bind at a single call), so an
+                    // absent dependency is vacuously resolved.
+                    resolved.contains(&(*caller, *pair))
+                        || !statuses.contains_key(&(*caller, *pair))
+                }
+                SiteStatus::Blocked => false,
+            });
+            if done {
+                resolved.insert(*key);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let candidate_callees = gated.iter().map(|g| g.candidate.callee);
+    let mut selected = FxHashSet::default();
+    for callee in candidate_callees.chain(pair_sites.pairs.keys().copied()) {
+        let all_resolved = pair_sites
+            .pairs
+            .get(&callee)
+            .is_none_or(|pairs| pairs.keys().all(|&p| resolved.contains(&(callee, p))));
+        if all_resolved {
+            selected.insert(callee);
+        } else if trace {
+            for (&pair, sites) in &pair_sites.pairs[&callee] {
+                if resolved.contains(&(callee, pair)) {
+                    continue;
+                }
+                for (status, &(caller, _)) in statuses[&(callee, pair)].iter().zip(sites) {
+                    let status = match status {
+                        SiteStatus::Covered => continue,
+                        SiteStatus::Forwarded(dep_caller, dep_pair) => format!(
+                            "forwarded-to-unresolved {} {dep_pair:?}",
+                            tcx.def_path_str(dep_caller.to_def_id())
+                        ),
+                        SiteStatus::Blocked => "blocked".to_string(),
+                    };
+                    eprintln!(
+                        "SNAPSHOT_UNRESOLVED callee={} pair={pair:?} site={} status={status}",
+                        tcx.def_path_str(callee.to_def_id()),
+                        tcx.def_path_str(caller.to_def_id()),
+                    );
+                }
+            }
+        }
+    }
+    selected
+}
+
+/// Classifies a non-covered site: forwarding when both pair operands are the
+/// caller's own distinct parameters passed unmodified, blocked otherwise.
+fn forwarding_status(
+    tcx: TyCtxt<'_>,
+    caller: LocalDefId,
+    location: Location,
+    i: usize,
+    j: usize,
+) -> SiteStatus {
+    let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+    let TerminatorKind::Call { args, .. } = &body.basic_blocks[location.block].terminator().kind
+    else {
+        return SiteStatus::Blocked;
+    };
+    let roots = (
+        args.get(i)
+            .and_then(|arg| param_root_of_operand(&body, &arg.node)),
+        args.get(j)
+            .and_then(|arg| param_root_of_operand(&body, &arg.node)),
+    );
+    let (Some(a), Some(b)) = roots else {
+        return SiteStatus::Blocked;
+    };
+    // The same parameter passed twice aliases on its own; nothing upstream
+    // can discharge that.
+    if a == b {
+        return SiteStatus::Blocked;
+    }
+    SiteStatus::Forwarded(caller, (a.min(b), a.max(b)))
+}
+
+/// The 0-based caller parameter an argument operand copies, when the operand
+/// is the parameter's incoming value passed unmodified: an unprojected place
+/// reached through single-definition plain copies and pointer casts, from a
+/// parameter local that is never reassigned.
+fn param_root_of_operand<'a, 'tcx>(
+    body: &'a Body<'tcx>,
+    operand: &'a Operand<'tcx>,
+) -> Option<usize> {
+    // Locals with exactly one plain-statement definition, mapped to its
+    // rvalue; `None` for reassigned locals and call results.
+    let mut defs: FxHashMap<Local, Option<&'a Rvalue<'tcx>>> = FxHashMap::default();
+    for data in body.basic_blocks.iter() {
+        for stmt in &data.statements {
+            if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind
+                && place.projection.is_empty()
+            {
+                defs.entry(place.local)
+                    .and_modify(|e| *e = None)
+                    .or_insert(Some(rvalue));
+            }
+        }
+        if let TerminatorKind::Call { destination, .. } = &data.terminator().kind
+            && destination.projection.is_empty()
+        {
+            defs.insert(destination.local, None);
+        }
+    }
+    let mut op = operand;
+    for _ in 0..32 {
+        let (Operand::Copy(place) | Operand::Move(place)) = op else {
+            return None;
+        };
+        if !place.projection.is_empty() {
+            return None;
+        }
+        let index = place.local.as_usize();
+        if index >= 1 && index <= body.arg_count {
+            // A reassigned parameter local no longer names the incoming
+            // value.
+            return (!defs.contains_key(&place.local)).then_some(index - 1);
+        }
+        match defs.get(&place.local) {
+            Some(Some(Rvalue::Use(inner))) => op = inner,
+            Some(Some(Rvalue::Cast(
+                CastKind::PtrToPtr
+                | CastKind::PointerCoercion(PointerCoercion::MutToConstPointer, _),
+                inner,
+                _,
+            ))) => op = inner,
+            _ => return None,
+        }
+    }
+    None
 }
