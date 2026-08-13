@@ -1,5 +1,5 @@
 use points_to::andersen;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use typed_arena::Arena;
 use utils::ty_shape;
 
@@ -26,7 +26,8 @@ fn run_detection(code: &str) -> Vec<(String, String, Vec<usize>, Vec<usize>)> {
         let provenances =
             array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
 
-        let access_order = outparam_replacer::ai::access_order::analyze_access_order(tcx);
+        let access_order =
+            outparam_replacer::ai::access_order::analyze_access_order(tcx, &FxHashMap::default());
         let mut out: Vec<_> = detect_snapshot_candidates(&input, &provenances, &access_order)
             .into_iter()
             .map(|c| {
@@ -97,7 +98,8 @@ fn run_planning(code: &str) -> (Vec<(String, String, Vec<String>)>, Vec<String>)
         let solutions = andersen::analyze(&andersen_config, &pre, &tss, tcx);
         let provenances =
             array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
-        let access_order = outparam_replacer::ai::access_order::analyze_access_order(tcx);
+        let access_order =
+            outparam_replacer::ai::access_order::analyze_access_order(tcx, &FxHashMap::default());
 
         let candidates = detect_snapshot_candidates(&input, &provenances, &access_order);
         let mut extents = ReadExtentAnalysis::new(tcx);
