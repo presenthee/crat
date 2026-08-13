@@ -184,7 +184,7 @@ pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> Stri
         let file = File::open(file).unwrap();
         serde_json::from_reader(file).unwrap()
     } else {
-        analyze(config, verbose, tcx).0
+        analyze(config, verbose, &FxHashMap::default(), tcx).0
     };
 
     let hir_to_thir = utils::ir::map_hir_to_thir(tcx);

@@ -100,12 +100,17 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let (mut new_state, writes) = self.assign(place, new_v, state);
             new_state.add_excludes(cmps.into_iter());
             new_state.add_reads(reads.iter().cloned());
-            new_state.note_param_reads(reads.iter().map(|p| p.base));
+            if !self.in_summarized_region {
+                new_state.note_param_reads(reads.iter().map(|p| p.base));
+            }
             let (writes, nonnulls) = new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
             if !self.is_merged {
                 new_state.add_nonnulls(nonnulls.into_iter());
             }
-            if new_state.access_order.is_some() && place.is_indirect_first_projection() {
+            if new_state.access_order.is_some()
+                && !self.in_summarized_region
+                && place.is_indirect_first_projection()
+            {
                 let ptr = state.local.get(place.local).ptrv.clone();
                 match self.param_write_bases(&ptr) {
                     Some(bases) => new_state.note_param_writes(bases.into_iter()),
@@ -131,7 +136,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TerminatorKind::SwitchInt { discr, targets } => {
                 let (v, reads) = self.transfer_operand(discr, state);
                 let mut new_state = state.clone();
-                new_state.note_param_reads(reads.iter().map(|p| p.base));
+                if !self.in_summarized_region {
+                    new_state.note_param_reads(reads.iter().map(|p| p.base));
+                }
                 new_state.add_reads(reads.into_iter());
                 let locations = if v.intv.is_bot() && v.uintv.is_bot() {
                     v.boolv
@@ -220,7 +227,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .iter()
                         .flat_map(|arg| self.get_read_paths_of_ptr(&arg.ptrv, &[]));
                     reads.extend(reads2);
-                    new_state.note_param_reads(reads.iter().map(|p| p.base));
+                    if !self.in_summarized_region {
+                        new_state.note_param_reads(reads.iter().map(|p| p.base));
+                    }
                     new_state.add_reads(reads.into_iter());
                     let (writes, nonnulls) =
                         new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
@@ -231,6 +240,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
                     }
                     if new_state.access_order.is_some()
+                        && !self.in_summarized_region
                         && args.iter().any(|arg| {
                             self.param_write_bases(&arg.ptrv)
                                 .is_some_and(|b| !b.is_empty())
@@ -254,7 +264,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TerminatorKind::Assert { cond, target, .. } => {
                 let (_, reads) = self.transfer_operand(cond, state);
                 let mut new_state = state.clone();
-                new_state.note_param_reads(reads.iter().map(|p| p.base));
+                if !self.in_summarized_region {
+                    new_state.note_param_reads(reads.iter().map(|p| p.base));
+                }
                 new_state.add_reads(reads.into_iter());
                 TransferedTerminator::state_location(new_state, target.start_location())
             }
@@ -314,7 +326,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             .map(|v| {
                 let (mut new_state, writes_ret) = self.assign(dst, v, &state);
                 new_state.add_excludes(offsets.iter().cloned());
-                new_state.note_param_reads(reads.iter().map(|p| p.base));
+                if !self.in_summarized_region {
+                    new_state.note_param_reads(reads.iter().map(|p| p.base));
+                }
                 new_state.add_reads(reads.iter().cloned());
                 let (writes, nonnulls) = new_state.add_writes(
                     writes.iter().cloned().chain(writes_ret),
@@ -342,7 +356,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
 
         let writes = writess.into_iter().flatten().collect();
         // Update access-order state based on what kind of call this is.
-        if new_states.first().is_some_and(|s| s.access_order.is_some()) {
+        if !self.in_summarized_region
+            && new_states.first().is_some_and(|s| s.access_order.is_some())
+        {
             match &call_kind {
                 // Pure Rust intrinsics (e.g. ptr::offset) do not write through
                 // their arguments; nothing to do.
@@ -501,8 +517,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             state.add_excludes(callee_excludes.into_iter());
             state.add_null_excludes(callee_null_excludes.into_iter());
-            state.note_param_reads(reads.iter().map(|p| p.base));
-            state.note_param_reads(callee_reads.iter().map(|p| p.base));
+            if !self.in_summarized_region {
+                state.note_param_reads(reads.iter().map(|p| p.base));
+                state.note_param_reads(callee_reads.iter().map(|p| p.base));
+            }
             state.add_reads(reads.clone().into_iter());
             state.add_reads(callee_reads.into_iter());
 
@@ -516,6 +534,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
 
             if state.access_order.is_some()
+                && !self.in_summarized_region
                 && let Some(callee_ao) = &return_state.access_order
             {
                 // A read-after-write that happens entirely inside the callee,
@@ -683,16 +702,26 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let offsets2 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
                 offsets.extend(offsets2);
                 let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
-                    if ptrs.iter().any(|ptr| matches!(ptr.base, AbsBase::Arg(_))) {
+                    // Collapsing Arg bases to Top would make every offset write
+                    // unanalyzable; the access-order run only needs parameter-
+                    // granularity attribution, not precise indices, so keep the base.
+                    if ptrs.iter().any(|ptr| matches!(ptr.base, AbsBase::Arg(_)))
+                        && !self.config.track_access_order
+                    {
                         AbsPtr::top()
                     } else {
                         AbsPtr::alphas(
                             ptrs.iter()
                                 .cloned()
                                 .map(|mut ptr| {
-                                    let last = ptr.projections.last_mut();
-                                    if let Some(AbsProjElem::Index(i)) = last {
-                                        *i = i.to_i64().add(&args[1].intv).to_u64();
+                                    match ptr.projections.last_mut() {
+                                        Some(AbsProjElem::Index(i)) => {
+                                            *i = i.to_i64().add(&args[1].intv).to_u64();
+                                        }
+                                        // Also fires for non-Arg bases without a trailing
+                                        // Index; harmless since AbsPath::from_place only
+                                        // resolves Arg bases.
+                                        _ => ptr.projections.push(AbsProjElem::Index(AbsUint::Top)),
                                     }
                                     ptr
                                 })

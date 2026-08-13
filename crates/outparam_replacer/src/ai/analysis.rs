@@ -167,6 +167,7 @@ pub fn write_analysis_result(path: &Path, result: &AnalysisResult) {
 pub fn analyze(
     config: &crate::Config,
     verbose: bool,
+    loop_summaries: &FxHashMap<LocalDefId, Vec<crate::ai::access_order::LoopSummary>>,
     tcx: TyCtxt<'_>,
 ) -> (
     AnalysisResult,
@@ -282,6 +283,7 @@ pub fn analyze(
         FxHashMap::default();
     let mut time = 0;
 
+    let no_summaries: Vec<crate::ai::access_order::LoopSummary> = Vec::new();
     let mut rcfws = FxHashMap::default();
     for id in &po {
         let def_ids = &sccs.scc_elems[*id];
@@ -317,6 +319,8 @@ pub fn analyze(
                     );
                 }
 
+                let fn_loop_summaries = loop_summaries.get(&local_def_id).unwrap_or(&no_summaries);
+
                 let mut analyzer = Analyzer::new(
                     tcx,
                     &info_map[def_id],
@@ -324,6 +328,7 @@ pub fn analyze(
                     &summaries,
                     pre_context,
                     &body.local_decls,
+                    fn_loop_summaries,
                 );
 
                 let AnalyzedBody {
@@ -540,6 +545,8 @@ pub fn analyze(
                         .mir_drops_elaborated_and_const_checked(local_def_id)
                         .borrow();
                     let pre_context = PreAnalysisContext::new(*def_id, &pre_data, &solutions);
+                    let fn_loop_summaries =
+                        loop_summaries.get(&local_def_id).unwrap_or(&no_summaries);
                     let mut analyzer = Analyzer::new(
                         tcx,
                         &info_map[def_id],
@@ -547,6 +554,7 @@ pub fn analyze(
                         &summaries,
                         pre_context,
                         &body.local_decls,
+                        fn_loop_summaries,
                     );
                     analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();
                     analyzer.ptr_params_inv = ptr_params_inv_map.remove(def_id).unwrap();
@@ -676,10 +684,40 @@ fn return_location(body: &Body<'_>) -> Option<Location> {
     None
 }
 
+/// Applies a recognized loop's access-order effect to a state leaving the
+/// loop: pairs for reads-in-loop after writes-before-loop, the loop's
+/// internal pairs, then the loop's writes. Param index i maps to local i+1.
+fn apply_loop_summary(
+    state: &AbsState,
+    summary: &crate::ai::access_order::LoopSummary,
+) -> AbsState {
+    let mut st = state.clone();
+    if let Some(ao) = &mut st.access_order {
+        let to_local = |i: usize| Local::from_usize(i + 1);
+        let entry_writes: Vec<Local> = ao.written_so_far.iter().copied().collect();
+        for &r in &summary.reads {
+            for &w in &entry_writes {
+                if to_local(r) != w {
+                    ao.pairs.insert((to_local(r), w));
+                }
+            }
+        }
+        for &(r, w) in &summary.internal_pairs {
+            if r != w {
+                ao.pairs.insert((to_local(r), to_local(w)));
+            }
+        }
+        for &w in &summary.writes {
+            ao.written_so_far.insert(to_local(w));
+        }
+    }
+    st
+}
+
 pub struct Analyzer<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
     info: &'a FuncInfo,
-    config: &'a crate::Config,
+    pub config: &'a crate::Config,
     pub summaries: &'a FxHashMap<DefId, FunctionSummary>,
     pub ptr_params: IndexVec<ArgIdx, Local>,
     pub ptr_params_inv: FxHashMap<Local, ArgIdx>,
@@ -689,6 +727,8 @@ pub struct Analyzer<'a, 'tcx> {
     pub is_merged: bool,
     pub local_decl: &'a IndexVec<Local, LocalDecl<'tcx>>,
     pub access_order_unanalyzable: bool,
+    pub loop_summaries: &'a [crate::ai::access_order::LoopSummary],
+    pub in_summarized_region: bool,
 }
 
 struct AnalyzedBody {
@@ -714,6 +754,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         summaries: &'a FxHashMap<DefId, FunctionSummary>,
         pre_context: PreAnalysisContext<'a>,
         local_decl: &'a IndexVec<Local, LocalDecl<'tcx>>,
+        loop_summaries: &'a [crate::ai::access_order::LoopSummary],
     ) -> Self {
         Self {
             tcx,
@@ -728,6 +769,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             is_merged: false,
             local_decl,
             access_order_unanalyzable: false,
+            loop_summaries,
+            in_summarized_region: false,
         }
     }
 
@@ -1440,6 +1483,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     block,
                     statement_index,
                 } = label.location;
+                self.in_summarized_region = self
+                    .loop_summaries
+                    .iter()
+                    .any(|s| s.blocks.contains(&block));
                 let bbd = &body.basic_blocks[block];
                 let (new_next_states, next_locations, writes) =
                     if statement_index < bbd.statements.len() {
@@ -1468,6 +1515,19 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
                 for location in &next_locations {
                     let dead_locals = &self.info.dead_locals[location.block];
+                    let applied;
+                    let new_next_states: &[AbsState] =
+                        if let Some(summary) = self.loop_summaries.iter().find(|s| {
+                            s.blocks.contains(&block) && !s.blocks.contains(&location.block)
+                        }) {
+                            applied = new_next_states
+                                .iter()
+                                .map(|st| apply_loop_summary(st, summary))
+                                .collect::<Vec<_>>();
+                            &applied
+                        } else {
+                            &new_next_states
+                        };
                     if merging_blocks.contains(&location.block) {
                         let next_state = if let Some(states) = states.get(location) {
                             assert_eq!(states.len(), 1);
@@ -1504,7 +1564,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             states.insert(*location, new_map);
                         }
                     } else {
-                        for new_next_state in &new_next_states {
+                        for new_next_state in new_next_states {
                             let next_state = states
                                 .get(location)
                                 .and_then(|states| {

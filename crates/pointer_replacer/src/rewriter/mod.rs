@@ -320,7 +320,13 @@ pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
 
     let provenances =
         analyses::array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
-    let access_order = outparam_replacer::ai::access_order::analyze_access_order(tcx);
+    let loop_summaries: FxHashMap<_, _> = input
+        .functions
+        .iter()
+        .map(|&f| (f, analyses::loop_summary::summarize_loops(tcx, f)))
+        .collect();
+    let access_order =
+        outparam_replacer::ai::access_order::analyze_access_order(tcx, &loop_summaries);
     let candidates =
         analyses::aliasing::detect_snapshot_candidates(&input, &provenances, &access_order);
     if trace {

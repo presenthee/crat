@@ -647,6 +647,7 @@ fn main() {
                     let res = outparam_replacer::ai::analysis::analyze(
                         &config.outparam,
                         config.verbose,
+                        &Default::default(),
                         tcx,
                     )
                     .0;
