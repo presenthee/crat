@@ -5,7 +5,7 @@ use super::{AccessOrderSummary, analyze_access_order};
 /// Map function name -> its summary, for assertions.
 fn run(code: &str) -> FxHashMap<String, AccessOrderSummary> {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        analyze_access_order(tcx)
+        analyze_access_order(tcx, &FxHashMap::default())
             .into_iter()
             .map(|(def_id, summary)| (tcx.item_name(def_id.to_def_id()).to_string(), summary))
             .collect()
@@ -154,6 +154,54 @@ fn read_only_param_is_not_reported() {
     assert!(callee.may_write_params.contains(&0));
     assert!(!callee.may_write_params.contains(&1));
     assert!(callee.params_never_written(&[1]));
+}
+
+#[test]
+fn two_loop_offset_writes_are_analyzable() {
+    // Reads all inputs into a local buffer, then writes out: no pair, and —
+    // with the offset fix — no unanalyzable flag despite `*out.offset(i) = ..`.
+    let s = run(r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+            let mut tmp = [0i32; 100];
+            let mut i = 0;
+            while i < len { tmp[i as usize] = *src.offset(i as isize); i += 1; }
+            i = 0;
+            while i < len { *out.offset(i as isize) = tmp[i as usize]; i += 1; }
+        }
+        "#);
+    let callee = &s["callee"];
+    assert!(!callee.unanalyzable);
+    assert!(callee.reads_precede_writes(&[0], &[1]));
+    assert!(callee.may_write_params.contains(&0));
+}
+
+#[test]
+fn interleaved_offset_loop_pairs_at_param_granularity() {
+    // Without loop summaries the interleaved loop must record honest pairs
+    // (read of src on iteration i+1 follows the write of out on iteration i).
+    let s = run(r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+            let mut i = 0;
+            while i < len { *out.offset(i as isize) = *src.offset(i as isize); i += 1; }
+        }
+        "#);
+    let callee = &s["callee"];
+    assert!(!callee.unanalyzable);
+    assert!(!callee.reads_precede_writes(&[0], &[1]));
+}
+
+#[test]
+fn offset_read_after_plain_write_is_paired() {
+    // src is read through an offset pointer after the write to *out: the
+    // offset fix keeps src's Arg base live, so the existing read-path
+    // bookkeeping attributes the read to the parameter.
+    let s = run(r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32) {
+            *out = 5;
+            *out = *src.offset(0);
+        }
+        "#);
+    assert!(!s["callee"].reads_precede_writes(&[0], &[1]));
 }
 
 #[test]
