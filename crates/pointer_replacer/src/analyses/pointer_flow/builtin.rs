@@ -8,7 +8,7 @@ use rustc_span::{def_id::DefId, source_map::Spanned, sym};
 
 use crate::analyses::pointer_flow::{
     collector::operand_place,
-    graph::UnknownReason,
+    graph::{Offset, UnknownReason},
     summary::{FunctionSummary, SummaryCompleteness, SummaryFlow, SummarySource},
 };
 
@@ -42,6 +42,41 @@ pub(crate) fn is_pointer_arithmetic(tcx: TyCtxt<'_>, def_id: DefId, name: &str) 
                     | "wrapping_sub"
             )
         )
+}
+
+pub(crate) fn call_byte_displacement<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    name: &str,
+    receiver_ty: Ty<'tcx>,
+    count: i128,
+) -> Option<i64> {
+    let last = name.rsplit("::").next()?;
+    let count = match last {
+        "sub" | "wrapping_sub" => count.checked_neg()?,
+        "offset"
+        | "wrapping_offset"
+        | "add"
+        | "wrapping_add"
+        | "byte_offset"
+        | "wrapping_byte_offset" => count,
+        _ => return None,
+    };
+    let bytes = match last {
+        "byte_offset" | "wrapping_byte_offset" => count,
+        _ => {
+            let ty::TyKind::RawPtr(pointee, _) = receiver_ty.kind() else {
+                return None;
+            };
+            let pointee_size = tcx
+                .layout_of(typing_env.as_query_input(*pointee))
+                .ok()?
+                .size
+                .bytes();
+            count.checked_mul(i128::from(pointee_size))?
+        }
+    };
+    i64::try_from(bytes).ok()
 }
 
 pub(crate) fn is_as_ptr(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
@@ -125,10 +160,12 @@ pub(crate) fn builtin_summary<'tcx>(
                     arg_index: 0,
                     path: vec![],
                 },
+                offset: Offset::Const(0),
             },
             SummaryFlow {
                 dst_return_path: vec![],
                 src: SummarySource::Unknown(UnknownReason::NullLike),
+                offset: Offset::Const(0),
             },
         ],
         ..FunctionSummary::default()
