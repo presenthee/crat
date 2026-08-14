@@ -9,7 +9,7 @@ use super::{
         FieldAccess, FieldAccessKind, FieldAccessReject, FieldAccessRejectKind,
         field_accesses_reachable_from_param,
     },
-    graph::{BaseId, PfgNode, UnknownReason},
+    graph::{BaseId, Offset, PfgNode, UnknownReason},
     pointer_flow_analysis,
 };
 use crate::utils::rustc::RustProgram;
@@ -129,6 +129,182 @@ fn return_bases(result: &PointerFlowResult) -> FxHashSet<BaseId> {
         .get(&return_node(result))
         .cloned()
         .unwrap_or_default()
+}
+
+fn assert_param_return_offset(result: &PointerFlowResult, param_index: usize, expected: Offset) {
+    let base = param_base(result, param_index);
+    let node = return_node(result);
+    assert_eq!(result.provenance.unique_base(&node), Some(base.clone()));
+    assert_eq!(
+        result.provenance.offset_from_base(&node, &base),
+        Some(expected)
+    );
+}
+
+#[test]
+fn positive_element_offset_is_scaled_in_bytes() {
+    let result = analyze_single(
+        r#"
+pub unsafe fn advance(p: *mut u32) -> *mut u32 {
+    p.add(3)
+}
+"#,
+        "advance",
+    );
+    assert_param_return_offset(&result, 0, Offset::Const(12));
+}
+
+#[test]
+fn negative_element_offset_is_signed() {
+    let result = analyze_single(
+        r#"
+pub unsafe fn retreat(p: *mut u32) -> *mut u32 {
+    p.offset(-1)
+}
+"#,
+        "retreat",
+    );
+    assert_param_return_offset(&result, 0, Offset::Const(-4));
+}
+
+#[test]
+fn byte_offset_is_not_scaled() {
+    let result = analyze_single(
+        r#"
+pub unsafe fn advance_bytes(p: *mut u32) -> *mut u32 {
+    p.byte_offset(3)
+}
+"#,
+        "advance_bytes",
+    );
+    assert_param_return_offset(&result, 0, Offset::Const(3));
+}
+
+#[test]
+fn non_raw_non_null_arithmetic_uses_opaque_call_provenance() {
+    let result = analyze_single(
+        r#"
+pub unsafe fn advance_non_null(
+    p: core::ptr::NonNull<u32>,
+) -> core::ptr::NonNull<u32> {
+    p.add(1)
+}
+"#,
+        "advance_non_null",
+    );
+    assert!(matches!(
+        result.provenance.unique_base(&return_node(&result)),
+        Some(BaseId::OpaqueReturn { .. })
+    ));
+}
+
+#[test]
+fn chained_offsets_compose() {
+    let result = analyze_single(
+        r#"
+pub unsafe fn advance_one(p: *mut u32) -> *mut u32 {
+    p.add(2).sub(1)
+}
+"#,
+        "advance_one",
+    );
+    assert_param_return_offset(&result, 0, Offset::Const(4));
+}
+
+#[test]
+fn dynamic_offset_keeps_base_with_unknown_offset() {
+    let result = analyze_single(
+        r#"
+pub unsafe fn advance_dynamic(p: *mut u32, count: usize) -> *mut u32 {
+    p.add(count)
+}
+"#,
+        "advance_dynamic",
+    );
+    assert_param_return_offset(&result, 0, Offset::Unknown);
+}
+
+#[test]
+fn local_return_summary_preserves_offset() {
+    let result = analyze_interprocedural(
+        r#"
+pub unsafe fn advance(p: *mut u32) -> *mut u32 {
+    p.add(2)
+}
+pub unsafe fn caller(p: *mut u32) -> *mut u32 {
+    advance(p)
+}
+"#,
+        "caller",
+    );
+    assert_param_return_offset(&result, 0, Offset::Const(8));
+}
+
+#[test]
+fn local_arg_write_summary_preserves_offset() {
+    let result = analyze_interprocedural(
+        r#"
+pub unsafe fn write_advanced(src: *mut u32, out: *mut *mut u32) {
+    *out = src.add(2);
+}
+pub unsafe fn caller(p: *mut u32) -> *mut u32 {
+    let mut out = core::ptr::null_mut();
+    write_advanced(p, &raw mut out);
+    out
+}
+"#,
+        "caller",
+    );
+    let base = param_base(&result, 0);
+    let node = return_node(&result);
+    assert_eq!(
+        result.provenance.unique_non_null_base(&node),
+        Some(base.clone())
+    );
+    assert_eq!(
+        result.provenance.offset_from_base(&node, &base),
+        Some(Offset::Const(8))
+    );
+}
+
+#[test]
+fn two_local_return_layers_compose_offsets() {
+    let result = analyze_interprocedural(
+        r#"
+pub unsafe fn advance(p: *mut u32) -> *mut u32 {
+    p.add(2)
+}
+pub unsafe fn advance_again(p: *mut u32) -> *mut u32 {
+    advance(p).add(1)
+}
+pub unsafe fn caller(p: *mut u32) -> *mut u32 {
+    advance_again(p)
+}
+"#,
+        "caller",
+    );
+    assert_param_return_offset(&result, 0, Offset::Const(12));
+}
+
+#[test]
+fn base_only_fixture_is_identical_after_annotation() {
+    let result = analyze_single(
+        r#"
+pub unsafe fn choose_advanced(
+    p: *mut u32,
+    q: *mut u32,
+    choose_p: bool,
+) -> *mut u32 {
+    let chosen = if choose_p { p } else { q };
+    chosen.add(1)
+}
+"#,
+        "choose_advanced",
+    );
+    assert_eq!(
+        return_bases(&result),
+        FxHashSet::from_iter([param_base(&result, 0), param_base(&result, 1)])
+    );
 }
 
 #[test]
