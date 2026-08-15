@@ -54,8 +54,6 @@ pub struct Config {
     pub function_times: Option<usize>,
     #[serde(default)]
     pub print_functions: Vec<String>,
-    #[serde(default)]
-    pub track_access_order: bool,
 }
 
 pub mod ai;

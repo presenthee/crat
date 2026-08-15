@@ -236,6 +236,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn core_ptr_builtin_effect(
         &self,
         caller: LocalDefId,
@@ -411,15 +412,11 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
 
         let effect = match name.as_str() {
             "memcpy" | "memmove" => {
-                let Some([destination, source, count]) = exact_args::<3>(args) else {
-                    return None;
-                };
+                let [destination, source, count] = exact_args::<3>(args)?;
                 self.byte_copy_effect(caller, body, flow, source, destination, count, location)
             }
             "memset" => {
-                let Some([destination, _value, count]) = exact_args::<3>(args) else {
-                    return None;
-                };
+                let [destination, _value, count] = exact_args::<3>(args)?;
                 self.byte_access_effect(
                     caller,
                     body,
@@ -431,9 +428,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
                 )
             }
             "memcmp" => {
-                let Some([left, right, count]) = exact_args::<3>(args) else {
-                    return None;
-                };
+                let [left, right, count] = exact_args::<3>(args)?;
                 let Some(width) = constant_usize(count, self.tcx) else {
                     return Some(self.unknown_width_effect(
                         caller,
@@ -474,6 +469,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         Some(effect)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn copy_effect(
         &self,
         caller: LocalDefId,
@@ -515,6 +511,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn byte_copy_effect(
         &self,
         caller: LocalDefId,
@@ -554,6 +551,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn repeated_access_effect(
         &self,
         caller: LocalDefId,
@@ -577,6 +575,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         self.pointer_access_effect(caller, body, flow, pointer, width, kind, location)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn byte_access_effect(
         &self,
         caller: LocalDefId,
@@ -596,6 +595,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         self.pointer_access_effect(caller, body, flow, pointer, width, kind, location)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn typed_access_effect(
         &self,
         caller: LocalDefId,
@@ -612,6 +612,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         self.pointer_access_effect(caller, body, flow, pointer, width, kind, location)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pointer_access_effect(
         &self,
         caller: LocalDefId,
@@ -756,6 +757,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
             .map(|layout| layout.size.bytes())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn substitute_effect(
         &self,
         caller: LocalDefId,

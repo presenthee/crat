@@ -318,17 +318,11 @@ pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
         eprintln!("SNAPSHOT_EQUIV ok ({} callees)", expected.len());
     }
 
-    let provenances =
-        analyses::array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
-    let loop_summaries: FxHashMap<_, _> = input
-        .functions
-        .iter()
-        .map(|&f| (f, analyses::loop_summary::summarize_loops(tcx, f)))
-        .collect();
-    let access_order =
-        outparam_replacer::ai::access_order::analyze_access_order(tcx, &loop_summaries);
+    let flows = analyses::pointer_flow::pointer_flow_analysis(&input, &alloc_fns);
+    let provenances = analyses::array_local_provenance::array_local_provenance_from_flows(&flows);
+    let access_order = analyses::access_order::AccessOrderAnalysis::analyze(&input, &flows);
     let candidates =
-        analyses::aliasing::detect_snapshot_candidates(&input, &provenances, &access_order);
+        analyses::aliasing::detect_snapshot_candidates(&input, &provenances, &access_order, trace);
     if trace {
         for candidate in &candidates {
             eprintln!(

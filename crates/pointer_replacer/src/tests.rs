@@ -11978,9 +11978,9 @@ pub unsafe fn driver() -> i32 {
 }
 
 #[test]
-fn snapshot_whole_array_is_shared_across_arguments() {
-    // The read extent is unknown (a runtime offset), so both read-only
-    // arguments fall back to one whole-array snapshot.
+fn snapshot_whole_array_is_rejected_when_access_order_is_unknown() {
+    // Dynamic parameter offsets make the call-site access-order query unknown,
+    // so snapshotting is rejected before the whole-array fallback.
     let code = r#"
 pub unsafe fn callee(out: *mut u8, a: *const u8, b: *const u8, n: usize) {
     let v = *a.offset(n as isize) ^ *b.offset(n as isize);
@@ -11992,22 +11992,8 @@ pub unsafe fn driver(n: usize) {
 }
 "#;
     let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
-    assert!(changed);
-    assert_eq!(
-        s.matches("let __crat_snap_0: [u8; 16] = arr;").count(),
-        1,
-        "expected one shared snapshot in:\n{s}"
-    );
-    assert_eq!(
-        s.matches("__crat_snap_0.as_ptr()").count(),
-        2,
-        "expected both arguments rewritten in:\n{s}"
-    );
-    assert!(
-        !s.contains("arr.as_ptr()"),
-        "no read-only base access may remain in:\n{s}"
-    );
-    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(!changed);
+    assert!(!s.contains("__crat_snap"), "no snapshot expected in:\n{s}");
 }
 
 #[test]
