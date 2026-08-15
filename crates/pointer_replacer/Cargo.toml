@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 utils = { path = "../utils" }
 points_to = { path = "../points_to" }
-outparam_replacer = { path = "../outparam_replacer" }
 itertools = "0.14.0"
 petgraph = "0.8.2"
 regex = "1.12.2"

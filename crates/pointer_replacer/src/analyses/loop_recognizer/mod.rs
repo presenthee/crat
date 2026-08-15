@@ -54,6 +54,7 @@ pub struct InductionModel {
 pub struct RecognizedLoop {
     pub id: LoopId,
     pub region: LoopRegion,
+    #[allow(dead_code)]
     pub entry: BasicBlock,
     pub exits: Vec<LoopExit>,
     pub induction: InductionModel,

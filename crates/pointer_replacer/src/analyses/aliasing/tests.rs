@@ -1,13 +1,24 @@
 use points_to::andersen;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
+use rustc_hir::def_id::LocalDefId;
+use rustc_middle::{
+    mir::{Location, TerminatorKind},
+    ty::{self, TyCtxt},
+};
 use typed_arena::Arena;
 use utils::ty_shape;
 
 use super::{
-    CopyPlan, attribute_alias_pairs, detect_snapshot_candidates, gate_candidates, select_callees,
+    CopyPlan, access_order_rejection_evidence, attribute_alias_pairs, detect_snapshot_candidates,
+    gate_candidates, query_error_evidence, select_callees,
 };
 use crate::{
-    analyses::{array_local_provenance, read_extent::ReadExtentAnalysis},
+    analyses::{
+        access_order::{AccessOrderAnalysis, AccessUnknownReason, QueryError},
+        array_local_provenance,
+        pointer_flow::pointer_flow_analysis,
+        read_extent::ReadExtentAnalysis,
+    },
     rewriter::collect_input,
 };
 
@@ -23,22 +34,21 @@ fn run_detection(code: &str) -> Vec<(String, String, Vec<usize>, Vec<usize>)> {
         };
         let pre = andersen::pre_analyze(&andersen_config, &tss, tcx);
         let alloc_fns = pre.alloc_fns.clone();
-        let provenances =
-            array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
-
-        let access_order =
-            outparam_replacer::ai::access_order::analyze_access_order(tcx, &FxHashMap::default());
-        let mut out: Vec<_> = detect_snapshot_candidates(&input, &provenances, &access_order)
-            .into_iter()
-            .map(|c| {
-                (
-                    tcx.item_name(c.caller.to_def_id()).to_string(),
-                    tcx.item_name(c.callee.to_def_id()).to_string(),
-                    c.mut_params,
-                    c.imm_params,
-                )
-            })
-            .collect();
+        let flows = pointer_flow_analysis(&input, &alloc_fns);
+        let provenances = array_local_provenance::array_local_provenance_from_flows(&flows);
+        let access_order = AccessOrderAnalysis::analyze(&input, &flows);
+        let mut out: Vec<_> =
+            detect_snapshot_candidates(&input, &provenances, &access_order, false)
+                .into_iter()
+                .map(|c| {
+                    (
+                        tcx.item_name(c.caller.to_def_id()).to_string(),
+                        tcx.item_name(c.callee.to_def_id()).to_string(),
+                        c.mut_params,
+                        c.imm_params,
+                    )
+                })
+                .collect();
         out.sort();
         out
     })
@@ -96,12 +106,11 @@ fn run_planning(code: &str) -> (Vec<(String, String, Vec<String>)>, Vec<String>)
         let pre = andersen::pre_analyze(&andersen_config, &tss, tcx);
         let alloc_fns = pre.alloc_fns.clone();
         let solutions = andersen::analyze(&andersen_config, &pre, &tss, tcx);
-        let provenances =
-            array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
-        let access_order =
-            outparam_replacer::ai::access_order::analyze_access_order(tcx, &FxHashMap::default());
+        let flows = pointer_flow_analysis(&input, &alloc_fns);
+        let provenances = array_local_provenance::array_local_provenance_from_flows(&flows);
+        let access_order = AccessOrderAnalysis::analyze(&input, &flows);
 
-        let candidates = detect_snapshot_candidates(&input, &provenances, &access_order);
+        let candidates = detect_snapshot_candidates(&input, &provenances, &access_order, false);
         let mut extents = ReadExtentAnalysis::new(tcx);
         let gated = gate_candidates(tcx, candidates, &access_order, &mut extents, false);
         let pair_sites = attribute_alias_pairs(tcx, &pre, &solutions);
@@ -134,6 +143,57 @@ fn run_planning(code: &str) -> (Vec<(String, String, Vec<String>)>, Vec<String>)
             .collect();
         selected.sort();
         (gated_out, selected)
+    })
+    .unwrap()
+}
+
+fn named_function(tcx: TyCtxt<'_>, functions: &[LocalDefId], name: &str) -> LocalDefId {
+    functions
+        .iter()
+        .copied()
+        .find(|def_id| tcx.item_name(def_id.to_def_id()).as_str() == name)
+        .unwrap_or_else(|| panic!("missing function {name}"))
+}
+
+fn direct_call_location(tcx: TyCtxt<'_>, caller: LocalDefId, callee: LocalDefId) -> Location {
+    let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+    body.basic_blocks
+        .iter_enumerated()
+        .find_map(|(block, block_data)| {
+            let TerminatorKind::Call { func, .. } = &block_data.terminator().kind else {
+                return None;
+            };
+            let constant = func.constant()?;
+            let ty::TyKind::FnDef(def_id, _) = constant.ty().kind() else {
+                return None;
+            };
+            (*def_id == callee.to_def_id()).then_some(Location {
+                block,
+                statement_index: block_data.statements.len(),
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing direct call to {}",
+                tcx.item_name(callee.to_def_id())
+            )
+        })
+}
+
+fn run_access_order_rejection_evidence(code: &str, caller_name: &str, callee_name: &str) -> String {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let input = collect_input(tcx);
+        let flows = pointer_flow_analysis(&input, &FxHashSet::default());
+        let access_order = AccessOrderAnalysis::analyze(&input, &flows);
+        let caller = named_function(tcx, &input.functions, caller_name);
+        let callee = named_function(tcx, &input.functions, callee_name);
+        let location = direct_call_location(tcx, caller, callee);
+        let call = access_order
+            .at_call(caller, location)
+            .expect("valid local call");
+        let verdict = call.reads_precede_writes(&[0], &[1]);
+        access_order_rejection_evidence(tcx, &verdict)
+            .expect("fixture must produce a rejecting verdict")
     })
     .unwrap()
 }
@@ -214,11 +274,9 @@ fn mismatched_pointee_types_are_rejected() {
 }
 
 #[test]
-fn non_rewriteable_base_is_detected() {
-    // Both arguments share a single non-directly-rewriteable base (an opaque/heap
-    // pointer from an extern allocation). The call site still feeds the callee's
-    // alias cluster, so it must be detected; whether a copy can be planned for it
-    // is decided later from the recorded admissibility.
+fn non_rewriteable_base_is_rejected_when_access_order_is_unknown() {
+    // The opaque external allocation prevents a call-site access-order proof,
+    // so the conservative snapshot detector rejects the otherwise same-base call.
     let candidates = run_detection(
         r#"
         extern "C" {
@@ -236,15 +294,9 @@ fn non_rewriteable_base_is_detected() {
         "#,
     );
 
-    assert_eq!(
-        candidates,
-        vec![(
-            "driver".to_string(),
-            "callee".to_string(),
-            vec![0usize],
-            vec![1usize]
-        )],
-        "non-directly-rewriteable base must still be detected: {candidates:#?}"
+    assert!(
+        candidates.is_empty(),
+        "unknown access-order evidence must reject snapshotting: {candidates:#?}"
     );
 }
 
@@ -298,9 +350,10 @@ fn indirect_calls_are_rejected() {
 }
 
 #[test]
-fn null_initialized_pointer_still_resolves_to_base() {
-    // `p` is null-initialized then assigned the array pointer; the null must be
-    // seen through so `p` resolves to the same base as `q`.
+fn null_initialized_pointer_is_rejected_when_access_order_is_unknown() {
+    // `p` retains a null provenance alternative, so the call-site access-order
+    // analysis cannot prove the snapshot safe even though the alias detector
+    // can find the array base.
     let candidates = run_detection(
         r#"
         pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
@@ -316,15 +369,9 @@ fn null_initialized_pointer_still_resolves_to_base() {
         "#,
     );
 
-    assert_eq!(
-        candidates,
-        vec![(
-            "driver".to_string(),
-            "callee".to_string(),
-            vec![0usize],
-            vec![1usize]
-        )],
-        "null-initialized pointer must still resolve to the array base: {candidates:#?}"
+    assert!(
+        candidates.is_empty(),
+        "unknown access-order evidence must reject snapshotting: {candidates:#?}"
     );
 }
 
@@ -363,7 +410,7 @@ fn mixed_call_sites_keep_only_the_same_base_site() {
 }
 
 #[test]
-fn read_before_write_callee_is_kept() {
+fn snapshot_detection_accepts_only_proven_order() {
     // All reads through `src` happen before the store through `out`.
     let candidates = run_detection(
         r#"
@@ -459,32 +506,55 @@ fn indirect_call_contributes_no_pair() {
 }
 
 #[test]
-fn read_after_write_callee_is_dropped() {
-    // The second store reads through `src` after writing through `out`. A bare
-    // `let _ = *src` is eliminated from MIR for Copy types, so the read is
-    // anchored as the rvalue of a subsequent store to ensure it appears in MIR.
+fn snapshot_detection_rejects_hazard_witness() {
     let candidates = run_detection(
         r#"
-        pub unsafe fn callee(out: *mut i32, src: *const i32) {
-            *out = 5;
-            *out = *src;
+        #[inline(never)]
+        pub unsafe fn callee(out: *mut f64, src: *const f64, len: usize) {
+            let mut i = 0;
+            while i < len {
+                *out.add(i) = *src.add(i) * 2.0;
+                i += 1;
+            }
         }
-        pub unsafe fn driver() {
-            let mut a: [i32; 16] = [0; 16];
-            let p = a.as_mut_ptr();
-            let q = a.as_ptr();
-            callee(p, q);
+        pub unsafe fn driver(len: usize) {
+            let mut a: [f64; 16] = [0.0; 16];
+            callee(a.as_mut_ptr().add(1), a.as_ptr(), len);
         }
         "#,
     );
     assert!(
         candidates.is_empty(),
-        "read-after-write callee must be dropped: {candidates:#?}"
+        "a modeled cross-iteration hazard must reject snapshotting: {candidates:#?}"
     );
 }
 
 #[test]
-fn exact_prefix_planned_for_known_extent() {
+fn snapshot_detection_rejects_unknown_reason() {
+    let candidates = run_detection(
+        r#"
+        #[inline(never)]
+        pub unsafe fn callee(out: *mut f64, src: *const f64, len: usize) {
+            let mut i = 0;
+            while i < len {
+                *out.add(i) = *src.add(i) * 2.0;
+                i += 1;
+            }
+        }
+        pub unsafe fn driver(shift: usize, len: usize) {
+            let mut a: [f64; 16] = [0.0; 16];
+            callee(a.as_mut_ptr().add(shift), a.as_ptr(), len);
+        }
+        "#,
+    );
+    assert!(
+        candidates.is_empty(),
+        "an unknown actual offset must reject snapshotting: {candidates:#?}"
+    );
+}
+
+#[test]
+fn snapshot_gate_accepts_only_never_written() {
     let (gated, selected) = run_planning(
         r#"
         pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
@@ -509,10 +579,135 @@ fn exact_prefix_planned_for_known_extent() {
 }
 
 #[test]
-fn whole_array_planned_when_extent_unknown() {
-    // The memcpy length is a runtime parameter, so no exact prefix exists;
-    // the base is a caller-local array and the callee never observes the
-    // pointer's address, so the whole array is copied instead.
+fn snapshot_gate_rejects_modeled_immutable_write() {
+    let (gated, selected) = run_planning(
+        r#"
+        pub unsafe fn callee(out: *mut i32, src: *const i32) {
+            let value = *src;
+            *(src as *mut i32) = value;
+            *out = value;
+        }
+        pub unsafe fn driver() {
+            let mut a: [i32; 16] = [0; 16];
+            callee(a.as_mut_ptr(), a.as_ptr());
+        }
+        "#,
+    );
+    assert!(
+        gated.is_empty(),
+        "a modeled write through the immutable formal must reject the site: {gated:#?}"
+    );
+    assert!(
+        selected.is_empty(),
+        "a rejected site must not select its callee: {selected:#?}"
+    );
+}
+
+#[test]
+fn snapshot_trace_prints_specific_witness_or_reason() {
+    let hazard = run_access_order_rejection_evidence(
+        r#"
+        #[inline(never)]
+        unsafe fn callee(out: *mut f64, src: *const f64, len: usize) {
+            let mut i = 0;
+            while i < len {
+                *out.add(i) = *src.add(i) * 2.0;
+                i += 1;
+            }
+        }
+        pub unsafe fn driver(base: *mut f64, len: usize) {
+            callee(base.add(1), base, len);
+        }
+        "#,
+        "driver",
+        "callee",
+    );
+    assert!(hazard.contains("hazard"), "missing hazard kind: {hazard}");
+    assert!(
+        hazard.contains("write_location=bb") && hazard.contains("read_location=bb"),
+        "missing stable witness locations: {hazard}"
+    );
+    assert!(
+        hazard.contains("write_offset=") && hazard.contains("read_offset="),
+        "missing substituted offsets: {hazard}"
+    );
+    assert!(
+        hazard.contains("write_call_chain=") && hazard.contains("read_call_chain="),
+        "missing witness call chains: {hazard}"
+    );
+
+    let unknown = run_access_order_rejection_evidence(
+        r#"
+        #[inline(never)]
+        unsafe fn callee(out: *mut f64, src: *const f64, len: usize) {
+            let mut i = 0;
+            while i < len {
+                *out.add(i) = *src.add(i) * 2.0;
+                i += 1;
+            }
+        }
+        pub unsafe fn driver(base: *mut f64, shift: usize, len: usize) {
+            callee(base.add(shift), base, len);
+        }
+        "#,
+        "driver",
+        "callee",
+    );
+    assert_eq!(unknown, "unknown reasons=[UnknownOffset]");
+
+    ::utils::compilation::run_compiler_on_str(
+        "pub unsafe fn caller(base: *mut i32) { let _ = base; }",
+        |tcx| {
+            let input = collect_input(tcx);
+            let caller = named_function(tcx, &input.functions, "caller");
+            let evidence = query_error_evidence(tcx, &QueryError::MissingCallerFlow { caller });
+            assert!(
+                evidence.contains("missing_caller_flow") && evidence.contains("caller=caller"),
+                "missing specific query-error evidence: {evidence}"
+            );
+        },
+    )
+    .unwrap();
+
+    assert!(
+        unknown.contains(&format!("{:?}", AccessUnknownReason::UnknownOffset)),
+        "unknown reason must be named: {unknown}"
+    );
+}
+
+#[test]
+fn same_base_different_offsets_remain_one_candidate_group() {
+    let candidates = run_detection(
+        r#"
+        pub unsafe fn callee(out: *mut i32, left: *const i32, right: *const i32) {
+            let _ = (out, left, right);
+        }
+        pub unsafe fn driver() {
+            let mut a: [i32; 16] = [0; 16];
+            callee(
+                a.as_mut_ptr().add(1),
+                a.as_ptr(),
+                a.as_ptr().add(2),
+            );
+        }
+        "#,
+    );
+    assert_eq!(
+        candidates,
+        vec![(
+            "driver".to_string(),
+            "callee".to_string(),
+            vec![0],
+            vec![1, 2],
+        )],
+        "offsets must not split one provenance base into separate candidate groups"
+    );
+}
+
+#[test]
+fn whole_array_fallback_is_rejected_when_access_order_is_unknown() {
+    // The foreign memcpy effect is not proven by access-order, so the site is
+    // rejected before the existing whole-array copy fallback is considered.
     let (gated, selected) = run_planning(
         r#"
         extern "C" {
@@ -527,15 +722,11 @@ fn whole_array_planned_when_extent_unknown() {
         }
         "#,
     );
-    assert_eq!(
-        gated,
-        vec![(
-            "driver".to_string(),
-            "callee".to_string(),
-            vec!["whole(1, 32)".to_string()],
-        )],
+    assert!(
+        gated.is_empty(),
+        "unknown access-order evidence must reject snapshotting: {gated:#?}"
     );
-    assert_eq!(selected, vec!["callee".to_string()]);
+    assert!(selected.is_empty());
 }
 
 #[test]

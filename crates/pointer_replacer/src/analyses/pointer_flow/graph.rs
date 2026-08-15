@@ -86,6 +86,7 @@ impl Offset {
         if self == other { self } else { Self::Unknown }
     }
 
+    #[allow(dead_code)]
     pub fn as_const(self) -> Option<i64> {
         match self {
             Self::Const(offset) => Some(offset),
@@ -172,6 +173,7 @@ impl ProvenanceResult {
         iter.next().is_none().then_some(unique)
     }
 
+    #[allow(dead_code)]
     pub fn unique_non_null_base_at_const_offset(&self, node: &PfgNode) -> Option<(BaseId, i64)> {
         let base = self.unique_non_null_base(node)?;
         let offset = self.offset_from_base(node, &base)?.as_const()?;

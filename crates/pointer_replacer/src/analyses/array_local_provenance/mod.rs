@@ -149,7 +149,9 @@ impl ArrayLocalProvenance {
         tcx: TyCtxt<'tcx>,
     ) -> Option<OperandBase> {
         let slot = self.slot_table().place_head_slot(place, body, tcx)?;
-        let base = self.provenance().unique_non_null_base(&PfgNode::Slot(slot))?;
+        let base = self
+            .provenance()
+            .unique_non_null_base(&PfgNode::Slot(slot))?;
         let admissibility = self.admissibility_of_base(&base);
         Some(OperandBase {
             slot,
@@ -226,9 +228,16 @@ pub fn array_local_provenance_analysis(
     input: &RustProgram<'_>,
     alloc_fns: &FxHashSet<LocalDefId>,
 ) -> FxHashMap<LocalDefId, ArrayLocalProvenance> {
-    crate::analyses::pointer_flow::pointer_flow_analysis(input, alloc_fns)
-        .into_iter()
-        .map(|(def_id, flow)| (def_id, wrap_flow(flow)))
+    let flows = crate::analyses::pointer_flow::pointer_flow_analysis(input, alloc_fns);
+    array_local_provenance_from_flows(&flows)
+}
+
+pub fn array_local_provenance_from_flows(
+    flows: &FxHashMap<LocalDefId, PointerFlowResult>,
+) -> FxHashMap<LocalDefId, ArrayLocalProvenance> {
+    flows
+        .iter()
+        .map(|(&def_id, flow)| (def_id, wrap_flow(flow.clone())))
         .collect()
 }
 

@@ -18,7 +18,6 @@
 //! emits the copies.
 #![allow(dead_code)]
 
-use outparam_replacer::ai::access_order::AccessOrderSummary;
 use points_to::andersen;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ItemKind, def_id::LocalDefId};
@@ -29,6 +28,9 @@ use rustc_middle::{
 
 use crate::{
     analyses::{
+        access_order::{
+            AccessOrderAnalysis, AccessOrderVerdict, CallFrame, QueryError, WriteVerdict,
+        },
         array_local_provenance::{ArrayLocalProvenance, BaseAdmissibility, BaseId},
         read_extent::{Extent, ReadExtentAnalysis, call_context},
     },
@@ -167,7 +169,8 @@ pub fn attribute_alias_pairs<'tcx>(
 pub fn detect_snapshot_candidates<'tcx>(
     input: &RustProgram<'tcx>,
     provenances: &FxHashMap<LocalDefId, ArrayLocalProvenance>,
-    access_order: &FxHashMap<LocalDefId, outparam_replacer::ai::access_order::AccessOrderSummary>,
+    access_order: &AccessOrderAnalysis<'_, 'tcx>,
+    trace: bool,
 ) -> Vec<SnapshotCandidate> {
     let tcx = input.tcx;
     let mut candidates = vec![];
@@ -197,6 +200,22 @@ pub fn detect_snapshot_candidates<'tcx>(
             let location = Location {
                 block,
                 statement_index: block_data.statements.len(),
+            };
+            let call_access = match access_order.at_call(caller, location) {
+                Ok(call_access) => call_access,
+                Err(error) => {
+                    if trace {
+                        snapshot_skip(
+                            tcx,
+                            "DETECT",
+                            caller,
+                            callee,
+                            location,
+                            &query_error_evidence(tcx, &error),
+                        );
+                    }
+                    continue;
+                }
             };
 
             // Group raw-pointer arguments by their unique non-null base.
@@ -240,12 +259,24 @@ pub fn detect_snapshot_candidates<'tcx>(
                     continue;
                 }
 
-                // Keep the call site only when the callee never reads an
-                // immutable-argument parameter after writing the mutable one.
-                let ordered = access_order
-                    .get(&callee)
-                    .is_some_and(|s| s.reads_precede_writes(&mut_params, &imm_params));
-                if !ordered {
+                // Keep the call site only when the call-site-sensitive analysis
+                // proves that all reads precede potentially aliasing writes.
+                let verdict = call_access.reads_precede_writes(&mut_params, &imm_params);
+                if !matches!(verdict, AccessOrderVerdict::Proven) {
+                    if trace {
+                        let evidence = access_order_rejection_evidence(tcx, &verdict)
+                            .expect("non-proven verdict has rejection evidence");
+                        snapshot_skip(
+                            tcx,
+                            "DETECT",
+                            caller,
+                            callee,
+                            location,
+                            &format!(
+                                "base={base:?} mut={mut_params:?} imm={imm_params:?} {evidence}"
+                            ),
+                        );
+                    }
                     continue;
                 }
 
@@ -308,28 +339,35 @@ pub enum CopyPlan {
 pub fn gate_candidates<'tcx>(
     tcx: TyCtxt<'tcx>,
     candidates: Vec<SnapshotCandidate>,
-    access_order: &FxHashMap<LocalDefId, AccessOrderSummary>,
+    access_order: &AccessOrderAnalysis<'_, 'tcx>,
     extents: &mut ReadExtentAnalysis<'tcx>,
     trace: bool,
 ) -> Vec<GatedCandidate> {
     let gate_skip = |candidate: &SnapshotCandidate, reason: &str| {
         if trace {
             eprintln!(
-                "SNAPSHOT_GATE_SKIP caller={} callee={} reason={reason}",
+                "SNAPSHOT_GATE_SKIP caller={} callee={} call_location={} reason={reason}",
                 tcx.def_path_str(candidate.caller.to_def_id()),
                 tcx.def_path_str(candidate.callee.to_def_id()),
+                location_evidence(candidate.location),
             );
         }
     };
     let mut gated = vec![];
     'candidates: for candidate in candidates {
-        let never_written = access_order
-            .get(&candidate.callee)
-            .is_some_and(|s| s.params_never_written(&candidate.imm_params));
-        if !never_written {
+        let call_access = match access_order.at_call(candidate.caller, candidate.location) {
+            Ok(call_access) => call_access,
+            Err(error) => {
+                gate_skip(&candidate, &query_error_evidence(tcx, &error));
+                continue;
+            }
+        };
+        let verdict = call_access.never_written(&candidate.imm_params);
+        if !matches!(verdict, WriteVerdict::NeverWritten) {
             gate_skip(
                 &candidate,
-                "callee may write through an immutable parameter",
+                &write_rejection_evidence(tcx, &verdict)
+                    .expect("non-never-written verdict has rejection evidence"),
             );
             continue;
         }
@@ -402,6 +440,117 @@ pub fn gate_candidates<'tcx>(
         gated.push(GatedCandidate { candidate, copies });
     }
     gated
+}
+
+fn snapshot_skip(
+    tcx: TyCtxt<'_>,
+    stage: &str,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    location: Location,
+    evidence: &str,
+) {
+    eprintln!(
+        "SNAPSHOT_{stage}_SKIP caller={} callee={} call_location={} reason={evidence}",
+        tcx.def_path_str(caller.to_def_id()),
+        tcx.def_path_str(callee.to_def_id()),
+        location_evidence(location),
+    );
+}
+
+fn location_evidence(location: Location) -> String {
+    format!("{:?}[{}]", location.block, location.statement_index)
+}
+
+fn call_chain_evidence(tcx: TyCtxt<'_>, call_chain: &[CallFrame]) -> String {
+    let frames: Vec<_> = call_chain
+        .iter()
+        .map(|frame| {
+            format!(
+                "{}->{}@{}",
+                tcx.def_path_str(frame.caller.to_def_id()),
+                tcx.def_path_str(frame.callee.to_def_id()),
+                location_evidence(frame.location),
+            )
+        })
+        .collect();
+    format!("[{frames}]", frames = frames.join(","))
+}
+
+fn query_error_evidence(tcx: TyCtxt<'_>, error: &QueryError) -> String {
+    match error {
+        QueryError::MissingCallerFlow { caller } => format!(
+            "query_error=missing_caller_flow caller={}",
+            tcx.def_path_str(caller.to_def_id())
+        ),
+        QueryError::InvalidLocation { caller, location } => format!(
+            "query_error=invalid_location caller={} location={}",
+            tcx.def_path_str(caller.to_def_id()),
+            location_evidence(*location)
+        ),
+        QueryError::NotCall { caller, location } => format!(
+            "query_error=not_call caller={} location={}",
+            tcx.def_path_str(caller.to_def_id()),
+            location_evidence(*location)
+        ),
+        QueryError::IndirectCall { caller, location } => format!(
+            "query_error=indirect_call caller={} location={}",
+            tcx.def_path_str(caller.to_def_id()),
+            location_evidence(*location)
+        ),
+        QueryError::NonLocalCallee {
+            caller,
+            location,
+            callee,
+        } => format!(
+            "query_error=non_local_callee caller={} callee={} location={}",
+            tcx.def_path_str(caller.to_def_id()),
+            tcx.def_path_str(*callee),
+            location_evidence(*location)
+        ),
+        QueryError::MissingCalleeSummary { callee } => format!(
+            "query_error=missing_callee_summary callee={}",
+            tcx.def_path_str(callee.to_def_id())
+        ),
+    }
+}
+
+fn access_order_rejection_evidence(
+    tcx: TyCtxt<'_>,
+    verdict: &AccessOrderVerdict,
+) -> Option<String> {
+    match verdict {
+        AccessOrderVerdict::Proven => None,
+        AccessOrderVerdict::MayReadAfterWrite { witness } => Some(format!(
+            "hazard order={:?} write_location={} read_location={} write_base={:?} \
+             write_offset={:?} read_base={:?} read_offset={:?} write_call_chain={} \
+             read_call_chain={}",
+            witness.order,
+            location_evidence(witness.write_location),
+            location_evidence(witness.read_location),
+            witness.write_address.base,
+            witness.write_address.offset,
+            witness.read_address.base,
+            witness.read_address.offset,
+            call_chain_evidence(tcx, &witness.write_call_chain),
+            call_chain_evidence(tcx, &witness.read_call_chain),
+        )),
+        AccessOrderVerdict::Unknown { reasons } => Some(format!("unknown reasons={reasons:?}")),
+    }
+}
+
+fn write_rejection_evidence(tcx: TyCtxt<'_>, verdict: &WriteVerdict) -> Option<String> {
+    match verdict {
+        WriteVerdict::NeverWritten => None,
+        WriteVerdict::MayBeWritten { witness } => Some(format!(
+            "modeled_write location={} base={:?} offset={:?} call_chain={}",
+            location_evidence(witness.location),
+            witness.address.base,
+            witness.address.offset,
+            call_chain_evidence(tcx, &witness.call_chain),
+        )),
+        WriteVerdict::Unknown { reasons } => Some(format!("unknown reasons={reasons:?}")),
+    }
 }
 
 /// The resolution status of one call site contributing an alias pair.
