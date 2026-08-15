@@ -12,34 +12,6 @@ use rustc_middle::mir::Local;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
 
-/// Parameter access-order tracking, present only when the analyzer is asked to
-/// compute it. Bases are parameter locals (`_1`, `_2`, ...).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AccessOrder {
-    /// Parameter bases that may already have been written on some path to here.
-    pub written_so_far: BTreeSet<Local>,
-    /// `(reader, writer)`: a read through `reader` that may run after a write
-    /// through `writer`.
-    pub pairs: BTreeSet<(Local, Local)>,
-}
-
-impl AccessOrder {
-    fn join(&self, other: &Self) -> Self {
-        Self {
-            written_so_far: self
-                .written_so_far
-                .union(&other.written_so_far)
-                .copied()
-                .collect(),
-            pairs: self.pairs.union(&other.pairs).copied().collect(),
-        }
-    }
-
-    fn ord(&self, other: &Self) -> bool {
-        self.written_so_far.is_subset(&other.written_so_far) && self.pairs.is_subset(&other.pairs)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct AbsState {
     pub local: AbsLocal,
@@ -50,7 +22,6 @@ pub struct AbsState {
     pub writes: MustPathSet,
     pub nulls: AbsNulls,
     pub nonnulls: MustLocalSet,
-    pub access_order: Option<AccessOrder>,
 }
 
 impl AbsState {
@@ -65,7 +36,6 @@ impl AbsState {
             writes: MustPathSet::bot(),
             nulls: AbsNulls::bot(),
             nonnulls: MustLocalSet::bot(),
-            access_order: None,
         }
     }
 
@@ -79,10 +49,6 @@ impl AbsState {
             writes: self.writes.join(&other.writes),
             nulls: self.nulls.join(&other.nulls),
             nonnulls: self.nonnulls.join(&other.nonnulls),
-            access_order: match (&self.access_order, &other.access_order) {
-                (Some(a), Some(b)) => Some(a.join(b)),
-                (a, b) => a.clone().or_else(|| b.clone()),
-            },
         }
     }
 
@@ -96,10 +62,6 @@ impl AbsState {
             writes: self.writes.widen(&other.writes),
             nulls: self.nulls.widen(&other.nulls),
             nonnulls: self.nonnulls.widen(&other.nonnulls),
-            access_order: match (&self.access_order, &other.access_order) {
-                (Some(a), Some(b)) => Some(a.join(b)),
-                (a, b) => a.clone().or_else(|| b.clone()),
-            },
         }
     }
 
@@ -112,11 +74,6 @@ impl AbsState {
             && self.writes.ord(&other.writes)
             && self.nulls.ord(&other.nulls)
             && self.nonnulls.ord(&other.nonnulls)
-            && match (&self.access_order, &other.access_order) {
-                (Some(a), Some(b)) => a.ord(b),
-                (None, _) => true,
-                (Some(_), None) => false,
-            }
     }
 
     pub fn get(&self, base: AbsBase) -> Option<&AbsValue> {
@@ -190,32 +147,6 @@ impl AbsState {
 
     pub fn add_nonnulls<I: Iterator<Item = Local>>(&mut self, locals: I) {
         self.nonnulls.extend(locals);
-    }
-
-    /// Record that these parameter bases may now have been written. No-op unless
-    /// access-order tracking is on.
-    pub fn note_param_writes<I: Iterator<Item = Local>>(&mut self, bases: I) {
-        if let Some(ao) = &mut self.access_order {
-            ao.written_so_far.extend(bases);
-        }
-    }
-
-    /// Record reads through these parameter bases, pairing each with every base
-    /// that may already have been written. No-op unless tracking is on.
-    pub fn note_param_reads<I: Iterator<Item = Local>>(&mut self, bases: I) {
-        if let Some(ao) = &mut self.access_order {
-            let AccessOrder {
-                written_so_far,
-                pairs,
-            } = ao;
-            for r in bases {
-                for w in written_so_far.iter() {
-                    if *w != r {
-                        pairs.insert((r, *w));
-                    }
-                }
-            }
-        }
     }
 }
 

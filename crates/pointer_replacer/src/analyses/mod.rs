@@ -8,7 +8,6 @@ pub mod fn_ptr_rewrite_decision;
 mod lattice;
 mod liveness;
 pub mod loop_recognizer;
-pub mod loop_summary;
 mod mir;
 pub mod mir_variable_grouping;
 pub mod nullity;

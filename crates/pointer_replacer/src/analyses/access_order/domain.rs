@@ -15,6 +15,7 @@ pub enum AccessKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum AccessOrigin {
     Parameter(SymbolicAddress),
     ProvenDisjoint(BaseId),
@@ -46,6 +47,7 @@ pub struct CallFrame {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub struct AccessEvent {
     pub kind: AccessKind,
     pub origins: Vec<AccessOrigin>,
@@ -118,6 +120,7 @@ pub enum AccessUnknownReason {
     InlineAssembly,
     RecursiveCall,
     IncompleteCallee,
+    #[allow(dead_code)]
     RejectedNestedRepetition,
     IncompatibleHazardOrder,
     SolverUnknown,
@@ -151,6 +154,7 @@ impl AccessEffect {
         }
     }
 
+    #[allow(dead_code)]
     pub fn read(read: AccessFootprint) -> Self {
         Self {
             reads: vec![read],
@@ -158,6 +162,7 @@ impl AccessEffect {
         }
     }
 
+    #[allow(dead_code)]
     pub fn write(write: AccessFootprint) -> Self {
         Self {
             writes: vec![write],

@@ -49,7 +49,9 @@ pub enum QueryError {
 }
 
 pub struct CallSiteAccess<'a> {
+    #[allow(dead_code)]
     pub caller: LocalDefId,
+    #[allow(dead_code)]
     pub callee: LocalDefId,
     pub location: Location,
     effect: &'a AccessEffect,

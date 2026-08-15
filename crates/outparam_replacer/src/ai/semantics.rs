@@ -99,23 +99,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let (new_v, reads, cmps) = self.transfer_rvalue(rvalue, state);
             let (mut new_state, writes) = self.assign(place, new_v, state);
             new_state.add_excludes(cmps.into_iter());
-            new_state.add_reads(reads.iter().cloned());
-            if !self.in_summarized_region {
-                new_state.note_param_reads(reads.iter().map(|p| p.base));
-            }
+            new_state.add_reads(reads.into_iter());
             let (writes, nonnulls) = new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
             if !self.is_merged {
                 new_state.add_nonnulls(nonnulls.into_iter());
-            }
-            if new_state.access_order.is_some()
-                && !self.in_summarized_region
-                && place.is_indirect_first_projection()
-            {
-                let ptr = state.local.get(place.local).ptrv.clone();
-                match self.param_write_bases(&ptr) {
-                    Some(bases) => new_state.note_param_writes(bases.into_iter()),
-                    None => self.access_order_unanalyzable = true,
-                }
             }
             (new_state, writes)
         } else {
@@ -136,9 +123,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TerminatorKind::SwitchInt { discr, targets } => {
                 let (v, reads) = self.transfer_operand(discr, state);
                 let mut new_state = state.clone();
-                if !self.in_summarized_region {
-                    new_state.note_param_reads(reads.iter().map(|p| p.base));
-                }
                 new_state.add_reads(reads.into_iter());
                 let locations = if v.intv.is_bot() && v.uintv.is_bot() {
                     v.boolv
@@ -227,9 +211,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .iter()
                         .flat_map(|arg| self.get_read_paths_of_ptr(&arg.ptrv, &[]));
                     reads.extend(reads2);
-                    if !self.in_summarized_region {
-                        new_state.note_param_reads(reads.iter().map(|p| p.base));
-                    }
                     new_state.add_reads(reads.into_iter());
                     let (writes, nonnulls) =
                         new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
@@ -238,15 +219,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     }
                     for arg in &args {
                         self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
-                    }
-                    if new_state.access_order.is_some()
-                        && !self.in_summarized_region
-                        && args.iter().any(|arg| {
-                            self.param_write_bases(&arg.ptrv)
-                                .is_some_and(|b| !b.is_empty())
-                        })
-                    {
-                        self.access_order_unanalyzable = true;
                     }
                     (vec![new_state], writes, vec![CallKind::TOP])
                 };
@@ -264,9 +236,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TerminatorKind::Assert { cond, target, .. } => {
                 let (_, reads) = self.transfer_operand(cond, state);
                 let mut new_state = state.clone();
-                if !self.in_summarized_region {
-                    new_state.note_param_reads(reads.iter().map(|p| p.base));
-                }
                 new_state.add_reads(reads.into_iter());
                 TransferedTerminator::state_location(new_state, target.start_location())
             }
@@ -326,9 +295,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             .map(|v| {
                 let (mut new_state, writes_ret) = self.assign(dst, v, &state);
                 new_state.add_excludes(offsets.iter().cloned());
-                if !self.in_summarized_region {
-                    new_state.note_param_reads(reads.iter().map(|p| p.base));
-                }
                 new_state.add_reads(reads.iter().cloned());
                 let (writes, nonnulls) = new_state.add_writes(
                     writes.iter().cloned().chain(writes_ret),
@@ -355,76 +321,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         }
 
         let writes = writess.into_iter().flatten().collect();
-        // Update access-order state based on what kind of call this is.
-        if !self.in_summarized_region
-            && new_states.first().is_some_and(|s| s.access_order.is_some())
-        {
-            match &call_kind {
-                // Pure Rust intrinsics (e.g. ptr::offset) do not write through
-                // their arguments; nothing to do.
-                CallKind::RustPure => {}
-                // Rust intrinsics with known write targets (write_volatile,
-                // memcpy, memset): feed the parameter bases they write into
-                // written_so_far, or mark unanalyzable if a target is Heap.
-                CallKind::RustEffect(Some(bases)) => {
-                    let param_locals: Vec<_> = bases
-                        .iter()
-                        .filter_map(|base| match base {
-                            AbsBase::Arg(a) => Some(self.ptr_params[*a]),
-                            AbsBase::Heap => {
-                                self.access_order_unanalyzable = true;
-                                None
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    for st in &mut new_states {
-                        st.note_param_writes(param_locals.iter().copied());
-                    }
-                }
-                // memcpy/memmove/memset copy into their first pointer argument and
-                // read the others; the source read is already recorded above, so
-                // only the destination needs to be treated as a write. Modeling
-                // this avoids giving up whenever a parameter pointer is copied.
-                _ if matches!(
-                    name.rsplit("::").next(),
-                    Some("memcpy") | Some("memmove") | Some("memset")
-                ) =>
-                {
-                    match args.first().map(|a| &a.ptrv) {
-                        Some(AbsPtr::Set(ptrs)) => {
-                            let dest: Vec<_> = ptrs
-                                .iter()
-                                .filter_map(|p| match p.base {
-                                    AbsBase::Arg(a) => Some(self.ptr_params[a]),
-                                    _ => None,
-                                })
-                                .collect();
-                            for st in &mut new_states {
-                                st.note_param_writes(dest.iter().copied());
-                            }
-                        }
-                        // An unresolved destination is not attributable to any
-                        // parameter, so no write is recorded for it. This mirrors
-                        // how get_write_paths_of_ptr treats Top elsewhere in this
-                        // module, rather than giving up on the whole function.
-                        Some(AbsPtr::Top) => {}
-                        None => {}
-                    }
-                }
-                // All other calls (unknown effects, extern, method, function
-                // pointer): if any argument is a parameter-derived pointer the
-                // callee's accesses cannot be bounded.
-                _ => {
-                    if args.iter().any(|arg| {
-                        self.param_write_bases(&arg.ptrv)
-                            .is_some_and(|b| !b.is_empty())
-                    }) {
-                        self.access_order_unanalyzable = true;
-                    }
-                }
-            }
-        }
         (new_states, writes, call_kind)
     }
 
@@ -517,10 +413,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             state.add_excludes(callee_excludes.into_iter());
             state.add_null_excludes(callee_null_excludes.into_iter());
-            if !self.in_summarized_region {
-                state.note_param_reads(reads.iter().map(|p| p.base));
-                state.note_param_reads(callee_reads.iter().map(|p| p.base));
-            }
             state.add_reads(reads.clone().into_iter());
             state.add_reads(callee_reads.into_iter());
 
@@ -531,39 +423,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             if !self.is_merged {
                 state.add_nonnulls(nonnulls.into_iter());
                 state.add_nonnulls(callee_nonnull_cands.intersection(&callee_nonnulls).cloned());
-            }
-
-            if state.access_order.is_some()
-                && !self.in_summarized_region
-                && let Some(callee_ao) = &return_state.access_order
-            {
-                // A read-after-write that happens entirely inside the callee,
-                // lifted onto this function's matching arguments.
-                for (r, w) in &callee_ao.pairs {
-                    let (Some(readers), Some(writers)) = (
-                        self.map_callee_base(*r, args),
-                        self.map_callee_base(*w, args),
-                    ) else {
-                        self.access_order_unanalyzable = true;
-                        continue;
-                    };
-                    let ao = state.access_order.as_mut().unwrap();
-                    for rc in &readers {
-                        for wc in &writers {
-                            if rc != wc {
-                                ao.pairs.insert((*rc, *wc));
-                            }
-                        }
-                    }
-                }
-                // Parameters the callee may write become writes on the matching
-                // arguments.
-                for wb in &callee_ao.written_so_far {
-                    match self.map_callee_base(*wb, args) {
-                        Some(bases) => state.note_param_writes(bases.into_iter()),
-                        None => self.access_order_unanalyzable = true,
-                    }
-                }
             }
 
             ret_writes.extend(callee_writes.into_iter().chain(writes));
@@ -705,9 +564,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     // Collapsing Arg bases to Top would make every offset write
                     // unanalyzable; the access-order run only needs parameter-
                     // granularity attribution, not precise indices, so keep the base.
-                    if ptrs.iter().any(|ptr| matches!(ptr.base, AbsBase::Arg(_)))
-                        && !self.config.track_access_order
-                    {
+                    if ptrs.iter().any(|ptr| matches!(ptr.base, AbsBase::Arg(_))) {
                         AbsPtr::top()
                     } else {
                         AbsPtr::alphas(
@@ -1448,16 +1305,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         vec![]
     }
 
-    fn get_write_bases_of_ptr(&self, ptr: &AbsPtr) -> Option<Vec<AbsBase>> {
-        if let AbsPtr::Set(ptrs) = ptr
-            && ptrs.len() == 1
-        {
-            let ptr = ptrs.first().unwrap().clone();
-            return Some(vec![ptr.base]);
-        }
-        None
-    }
-
     fn update_value(
         &self,
         new_v: AbsValue,
@@ -1587,37 +1434,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 Some(path)
             })
             .collect::<Vec<_>>()
-    }
-
-    /// Parameter bases a store through `ptr` may write. Returns `None` when the
-    /// destination is unknown (`AbsPtr::Top`), which the caller treats as
-    /// something it cannot bound.
-    fn param_write_bases(&self, ptr: &AbsPtr) -> Option<Vec<Local>> {
-        let AbsPtr::Set(ptrs) = ptr else {
-            return None;
-        };
-        // A Heap base means the pointer could be anything; we cannot bound the
-        // write target, so the caller must treat it as unanalyzable.
-        if ptrs.iter().any(|p| matches!(p.base, AbsBase::Heap)) {
-            return None;
-        }
-        Some(
-            ptrs.iter()
-                .filter_map(|p| match p.base {
-                    AbsBase::Arg(a) => Some(self.ptr_params[a]),
-                    _ => None,
-                })
-                .collect(),
-        )
-    }
-
-    /// Translate a callee parameter base (`_1`, `_2`, ...) to the parameter bases
-    /// of this function that the matching call argument may point to. `None` when
-    /// the argument is an unknown pointer, which cannot be bounded.
-    fn map_callee_base(&self, callee_base: Local, args: &[AbsValue]) -> Option<Vec<Local>> {
-        let idx = callee_base.index() - 1;
-        let arg = args.get(idx)?;
-        self.param_write_bases(&arg.ptrv)
     }
 }
 
