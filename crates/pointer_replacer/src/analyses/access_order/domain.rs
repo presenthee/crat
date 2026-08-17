@@ -46,12 +46,25 @@ pub struct CallFrame {
     pub location: Location,
 }
 
+/// Byte width of an access. `Linear` means `scale * param + offset` where
+/// `param` is an integer parameter of the summarized function; the invariant
+/// `scale >= 1` holds (a zero scale is normalized to `Const`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WidthExpr {
+    Const(u64),
+    Linear {
+        param: ParamIdx,
+        scale: u64,
+        offset: u64,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub struct AccessEvent {
     pub kind: AccessKind,
     pub origins: Vec<AccessOrigin>,
-    pub width: Option<u64>,
+    pub width: Option<WidthExpr>,
     pub location: Location,
     pub call_chain: Vec<CallFrame>,
 }
@@ -59,7 +72,7 @@ pub struct AccessEvent {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AccessFootprint {
     pub address: SymbolicAddress,
-    pub width: u64,
+    pub width: WidthExpr,
     pub location: Location,
     pub call_chain: Vec<CallFrame>,
 }
@@ -124,7 +137,16 @@ pub enum AccessUnknownReason {
     RejectedNestedRepetition,
     IncompatibleHazardOrder,
     SolverUnknown,
+    UnresolvedSymbolicWidth,
+    SummaryBudgetExceeded,
 }
+
+/// Upper bound on the number of footprints, hazards, and invalidations a
+/// single effect or function summary may hold before the analysis degrades it
+/// to one conservative all-parameter invalidation. Substituted callee
+/// summaries multiply through call sites, so unbounded composition can exhaust
+/// memory on large translated programs.
+pub(crate) const ACCESS_SUMMARY_BUDGET: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Invalidation {
@@ -175,6 +197,10 @@ impl AccessEffect {
         deduplicate(&mut self.writes);
         deduplicate(&mut self.hazards);
         deduplicate(&mut self.invalidations);
+    }
+
+    pub(crate) fn element_count(&self) -> usize {
+        self.reads.len() + self.writes.len() + self.hazards.len() + self.invalidations.len()
     }
 
     pub fn then(self, next: AccessEffect) -> AccessEffect {

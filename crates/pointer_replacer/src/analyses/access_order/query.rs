@@ -11,7 +11,7 @@ use z3::{SatResult, Solver, ast::Int};
 use super::{
     AccessEffect, AccessFootprint, AccessOrderAnalysis, AccessOrderVerdict, AccessUnknownReason,
     CallFrame, HazardOrder, HazardWitness, Invalidation, OffsetExpr, ParamIdx, ParamScope,
-    SubstitutedAddress, WriteVerdict, WriteWitness, extractor::resolve_call_operand,
+    SubstitutedAddress, WidthExpr, WriteVerdict, WriteWitness, extractor::resolve_call_operand,
 };
 use crate::analyses::pointer_flow::graph::{BaseId, Offset, PfgNode, UnknownReason};
 
@@ -187,6 +187,12 @@ impl CallSiteAccess<'_> {
                 push_reason(&mut reasons, AccessUnknownReason::UnresolvedOrigin);
                 continue;
             }
+            let (WidthExpr::Const(write_width), WidthExpr::Const(read_width)) =
+                (hazard.write.width, hazard.read.width)
+            else {
+                push_reason(&mut reasons, AccessUnknownReason::UnresolvedSymbolicWidth);
+                continue;
+            };
 
             for write_actual in write_actuals {
                 for read_actual in read_actuals {
@@ -212,9 +218,9 @@ impl CallSiteAccess<'_> {
 
                     match overlap_feasibility(
                         &write_offset,
-                        hazard.write.width,
+                        write_width,
                         &read_offset,
-                        hazard.read.width,
+                        read_width,
                         hazard.order,
                     ) {
                         Feasibility::Feasible if witness.is_none() => {

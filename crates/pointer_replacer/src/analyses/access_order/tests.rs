@@ -6,6 +6,7 @@ mod domain {
     use super::super::{
         AccessEffect, AccessEvent, AccessFootprint, AccessKind, AccessOrigin, AccessUnknownReason,
         HazardOrder, Invalidation, OffsetExpr, ParamScope, PotentialHazard, SymbolicAddress,
+        WidthExpr,
     };
 
     fn location(statement_index: usize) -> Location {
@@ -21,7 +22,7 @@ mod domain {
                 origin,
                 offset: OffsetExpr::Const(offset),
             },
-            width: 4,
+            width: WidthExpr::Const(4),
             location: location(statement_index),
             call_chain: vec![],
         }
@@ -120,7 +121,7 @@ mod domain {
                 AccessOrigin::Parameter(address.clone()),
                 AccessOrigin::MayAliasParameters,
             ],
-            width: Some(4),
+            width: Some(WidthExpr::Const(4)),
             location: location(0),
             call_chain: vec![],
         };
@@ -184,10 +185,11 @@ mod reachable_cycles {
 #[cfg(test)]
 mod ordinary {
     use rustc_hash::FxHashSet;
-    use rustc_middle::mir::Location;
+    use rustc_middle::mir::{Location, START_BLOCK};
 
     use super::super::{
-        AccessEffect, AccessFootprint, AccessUnknownReason, HazardOrder, OffsetExpr, ParamScope,
+        ACCESS_SUMMARY_BUDGET, AccessEffect, AccessFootprint, AccessUnknownReason, HazardOrder,
+        OffsetExpr, ParamScope, SymbolicAddress, WidthExpr,
         extractor::{LocationEffect, extract_body_effects},
         solver::solve_body,
     };
@@ -241,6 +243,67 @@ mod ordinary {
             effects
         })
         .unwrap()
+    }
+
+    #[test]
+    fn over_budget_solving_degrades_to_all_parameter_invalidation() {
+        let effect = ::utils::compilation::run_compiler_on_str(
+            r#"
+            pub unsafe fn target(out: *mut i32, src: *const i32) {
+                *out = *src;
+            }
+            "#,
+            |tcx| {
+                let input = collect_input(tcx);
+                let flows = pointer_flow_analysis(&input, &FxHashSet::default());
+                let def_id = input
+                    .functions
+                    .iter()
+                    .copied()
+                    .find(|def_id| tcx.item_name(def_id.to_def_id()).as_str() == "target")
+                    .expect("missing function target");
+                let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+                let mut effects = extract_body_effects(tcx, def_id, &body, &flows[&def_id]);
+                let oversized = AccessEffect {
+                    reads: (0..=ACCESS_SUMMARY_BUDGET as i64)
+                        .map(|offset| AccessFootprint {
+                            address: SymbolicAddress {
+                                origin: 1,
+                                offset: OffsetExpr::Const(offset),
+                            },
+                            width: WidthExpr::Const(1),
+                            location: Location {
+                                block: START_BLOCK,
+                                statement_index: 0,
+                            },
+                            call_chain: vec![],
+                        })
+                        .collect(),
+                    ..AccessEffect::empty()
+                };
+                effects.insert(
+                    Location {
+                        block: START_BLOCK,
+                        statement_index: 0,
+                    },
+                    LocationEffect::Effect(oversized),
+                );
+
+                solve_body(&body, &effects, &[]).effect
+            },
+        )
+        .unwrap();
+
+        assert!(effect.reads.is_empty());
+        assert!(effect.writes.is_empty());
+        assert!(effect.hazards.is_empty());
+        assert!(effect.contains_repetition);
+        assert_eq!(effect.invalidations.len(), 1);
+        assert_eq!(effect.invalidations[0].scope, ParamScope::All);
+        assert_eq!(
+            effect.invalidations[0].reason,
+            AccessUnknownReason::SummaryBudgetExceeded
+        );
     }
 
     #[test]
@@ -337,7 +400,7 @@ mod ordinary {
         assert_eq!(effect.reads.len(), 1);
         assert_eq!(effect.reads[0].address.origin, 0);
         assert_eq!(effect.reads[0].address.offset, OffsetExpr::Const(0));
-        assert_eq!(effect.reads[0].width, 4);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(4));
         assert!(effect.writes.is_empty());
         assert!(effect.invalidations.is_empty());
     }
@@ -480,7 +543,7 @@ mod ordinary {
         assert_eq!(effect.reads.len(), 1);
         assert_eq!(effect.reads[0].address.origin, 0);
         assert_eq!(effect.reads[0].address.offset, OffsetExpr::Const(4));
-        assert_eq!(effect.reads[0].width, 4);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(4));
         assert!(effect.invalidations.is_empty());
     }
 
@@ -499,7 +562,7 @@ mod ordinary {
         assert_eq!(effect.reads.len(), 1);
         assert_eq!(effect.reads[0].address.origin, 0);
         assert_eq!(effect.reads[0].address.offset, OffsetExpr::Const(4));
-        assert_eq!(effect.reads[0].width, 2);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(2));
         assert!(effect.invalidations.is_empty());
     }
 
@@ -540,9 +603,9 @@ mod ordinary {
 
         assert_eq!(reads.len(), 2);
         assert_eq!(reads[0].address.origin, 0);
-        assert_eq!(reads[0].width, 8);
+        assert_eq!(reads[0].width, WidthExpr::Const(8));
         assert_eq!(reads[1].address.origin, 0);
-        assert_eq!(reads[1].width, 4);
+        assert_eq!(reads[1].width, WidthExpr::Const(4));
     }
 
     #[test]
@@ -599,7 +662,7 @@ mod interprocedural {
     use rustc_hash::FxHashSet;
 
     use super::super::{
-        AccessEffect, AccessOrderAnalysis, AccessUnknownReason, OffsetExpr, ParamScope,
+        AccessEffect, AccessOrderAnalysis, AccessUnknownReason, OffsetExpr, ParamScope, WidthExpr,
     };
     use crate::{analyses::pointer_flow::pointer_flow_analysis, rewriter::collect_input};
 
@@ -848,10 +911,10 @@ mod interprocedural {
 
         assert_eq!(effect.reads.len(), 1);
         assert_eq!(effect.reads[0].address.origin, 1);
-        assert_eq!(effect.reads[0].width, 12);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(12));
         assert_eq!(effect.writes.len(), 1);
         assert_eq!(effect.writes[0].address.origin, 0);
-        assert_eq!(effect.writes[0].width, 12);
+        assert_eq!(effect.writes[0].width, WidthExpr::Const(12));
         assert!(effect.hazards.is_empty());
         assert!(effect.invalidations.is_empty());
     }
@@ -870,7 +933,7 @@ mod interprocedural {
         assert!(effect.reads.is_empty());
         assert_eq!(effect.writes.len(), 1);
         assert_eq!(effect.writes[0].address.origin, 0);
-        assert_eq!(effect.writes[0].width, 8);
+        assert_eq!(effect.writes[0].width, WidthExpr::Const(8));
         assert!(effect.invalidations.is_empty());
     }
 
@@ -1101,10 +1164,10 @@ mod interprocedural {
 
         assert_eq!(effect.reads.len(), 1);
         assert_eq!(effect.reads[0].address.origin, 1);
-        assert_eq!(effect.reads[0].width, 4);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(4));
         assert_eq!(effect.writes.len(), 1);
         assert_eq!(effect.writes[0].address.origin, 0);
-        assert_eq!(effect.writes[0].width, 4);
+        assert_eq!(effect.writes[0].width, WidthExpr::Const(4));
         assert!(effect.invalidations.is_empty());
     }
 
@@ -1129,10 +1192,10 @@ mod interprocedural {
 
         assert_eq!(effect.reads.len(), 1);
         assert_eq!(effect.reads[0].address.origin, 1);
-        assert_eq!(effect.reads[0].width, 7);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(7));
         assert_eq!(effect.writes.len(), 1);
         assert_eq!(effect.writes[0].address.origin, 0);
-        assert_eq!(effect.writes[0].width, 7);
+        assert_eq!(effect.writes[0].width, WidthExpr::Const(7));
         assert!(effect.hazards.is_empty());
         assert!(effect.invalidations.is_empty());
     }
@@ -1155,7 +1218,7 @@ mod interprocedural {
         assert!(effect.reads.is_empty());
         assert_eq!(effect.writes.len(), 1);
         assert_eq!(effect.writes[0].address.origin, 0);
-        assert_eq!(effect.writes[0].width, 9);
+        assert_eq!(effect.writes[0].width, WidthExpr::Const(9));
         assert!(effect.invalidations.is_empty());
     }
 
@@ -1183,7 +1246,12 @@ mod interprocedural {
                 .collect::<FxHashSet<_>>(),
             FxHashSet::from_iter([0, 1])
         );
-        assert!(effect.reads.iter().all(|read| read.width == 11));
+        assert!(
+            effect
+                .reads
+                .iter()
+                .all(|read| read.width == WidthExpr::Const(11))
+        );
         assert!(effect.writes.is_empty());
         assert!(effect.invalidations.is_empty());
     }
@@ -1311,7 +1379,7 @@ mod interprocedural {
     }
 
     #[test]
-    fn dynamic_foreign_copy_width_invalidates_both_origins() {
+    fn foreign_memcpy_parameter_count_yields_linear_width() {
         let effect = analyze(
             r#"
             unsafe extern "C" {
@@ -1333,12 +1401,284 @@ mod interprocedural {
             "target",
         );
 
-        assert!(effect.reads.is_empty());
+        let width = WidthExpr::Linear {
+            param: 2,
+            scale: 1,
+            offset: 0,
+        };
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].address.origin, 1);
+        assert_eq!(effect.reads[0].width, width);
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].address.origin, 0);
+        assert_eq!(effect.writes[0].width, width);
+        assert!(effect.invalidations.is_empty());
+    }
+
+    #[test]
+    fn foreign_memcpy_wrapping_mul_count_scales_linear_width() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8, blocks: u32) {
+                let _ = memcpy(destination, source, blocks.wrapping_mul(16) as usize);
+            }
+            "#,
+            "target",
+        );
+
+        let width = WidthExpr::Linear {
+            param: 2,
+            scale: 16,
+            offset: 0,
+        };
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].width, width);
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].width, width);
+        assert!(effect.invalidations.is_empty());
+    }
+
+    #[test]
+    fn foreign_memcpy_wrapping_add_count_offsets_linear_width() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8, count: usize) {
+                let _ = memcpy(destination, source, count.wrapping_add(8));
+            }
+            "#,
+            "target",
+        );
+
+        let width = WidthExpr::Linear {
+            param: 2,
+            scale: 1,
+            offset: 8,
+        };
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].width, width);
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].width, width);
+        assert!(effect.invalidations.is_empty());
+    }
+
+    #[test]
+    fn foreign_memcpy_literal_cast_count_folds_to_constant() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8) {
+                let _ = memcpy(destination, source, 16i32 as usize);
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(16));
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].width, WidthExpr::Const(16));
+        assert!(effect.invalidations.is_empty());
+    }
+
+    #[test]
+    fn loaded_foreign_copy_count_still_invalidates_both_origins() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            pub unsafe fn target(
+                destination: *mut u8,
+                source: *const u8,
+                count: *const usize,
+            ) {
+                let _ = memcpy(destination, source, *count);
+            }
+            "#,
+            "target",
+        );
+
         assert!(effect.writes.is_empty());
         assert!(effect.invalidations.iter().any(|invalidation| {
             invalidation.reason == AccessUnknownReason::UnknownWidth
                 && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0, 1]))
         }));
+    }
+
+    #[test]
+    fn two_parameter_foreign_copy_count_invalidates_both_origins() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            pub unsafe fn target(
+                destination: *mut u8,
+                source: *const u8,
+                a: usize,
+                b: usize,
+            ) {
+                let _ = memcpy(destination, source, a.wrapping_mul(b));
+            }
+            "#,
+            "target",
+        );
+
+        assert!(effect.writes.is_empty());
+        assert!(effect.invalidations.iter().any(|invalidation| {
+            invalidation.reason == AccessUnknownReason::UnknownWidth
+                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0, 1]))
+        }));
+    }
+
+    #[test]
+    fn call_result_foreign_copy_count_invalidates_both_origins() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            fn opaque() -> usize {
+                4
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8) {
+                let _ = memcpy(destination, source, opaque());
+            }
+            "#,
+            "target",
+        );
+
+        assert!(effect.writes.is_empty());
+        assert!(effect.invalidations.iter().any(|invalidation| {
+            invalidation.reason == AccessUnknownReason::UnknownWidth
+                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0, 1]))
+        }));
+    }
+
+    #[test]
+    fn reassigned_parameter_foreign_copy_count_invalidates_both_origins() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            pub unsafe fn target(
+                destination: *mut u8,
+                source: *const u8,
+                mut count: usize,
+            ) {
+                count = count.wrapping_add(1);
+                let _ = memcpy(destination, source, count);
+            }
+            "#,
+            "target",
+        );
+
+        assert!(effect.writes.is_empty());
+        assert!(effect.invalidations.iter().any(|invalidation| {
+            invalidation.reason == AccessUnknownReason::UnknownWidth
+                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0, 1]))
+        }));
+    }
+
+    #[test]
+    fn foreign_memset_parameter_count_yields_linear_width() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memset(destination: *mut u8, value: i32, count: usize) -> *mut u8;
+            }
+
+            pub unsafe fn target(destination: *mut u8, count: usize) {
+                let _ = memset(destination, 0, count);
+            }
+            "#,
+            "target",
+        );
+
+        assert!(effect.reads.is_empty());
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(
+            effect.writes[0].width,
+            WidthExpr::Linear {
+                param: 1,
+                scale: 1,
+                offset: 0,
+            }
+        );
+        assert!(effect.invalidations.is_empty());
+    }
+
+    #[test]
+    fn foreign_memcmp_parameter_count_yields_linear_widths() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcmp(left: *const u8, right: *const u8, count: usize) -> i32;
+            }
+
+            pub unsafe fn target(left: *const u8, right: *const u8, count: usize) -> i32 {
+                memcmp(left, right, count)
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.reads.len(), 2);
+        assert!(effect.reads.iter().all(|read| {
+            read.width
+                == WidthExpr::Linear {
+                    param: 2,
+                    scale: 1,
+                    offset: 0,
+                }
+        }));
+        assert!(effect.writes.is_empty());
+        assert!(effect.invalidations.is_empty());
     }
 
     #[test]
@@ -1519,14 +1859,14 @@ mod interprocedural {
             effect
                 .reads
                 .iter()
-                .all(|read| read.address.origin == 1 && read.width == 4)
+                .all(|read| read.address.origin == 1 && read.width == WidthExpr::Const(4))
         );
         assert_eq!(effect.writes.len(), 3);
         assert!(
             effect
                 .writes
                 .iter()
-                .all(|write| write.address.origin == 0 && write.width == 4)
+                .all(|write| write.address.origin == 0 && write.width == WidthExpr::Const(4))
         );
         assert!(effect.invalidations.is_empty());
     }
@@ -1547,10 +1887,10 @@ mod interprocedural {
 
         assert_eq!(effect.reads.len(), 1);
         assert_eq!(effect.reads[0].address.origin, 1);
-        assert_eq!(effect.reads[0].width, 12);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(12));
         assert_eq!(effect.writes.len(), 1);
         assert_eq!(effect.writes[0].address.origin, 0);
-        assert_eq!(effect.writes[0].width, 12);
+        assert_eq!(effect.writes[0].width, WidthExpr::Const(12));
         assert!(effect.hazards.is_empty());
         assert!(effect.invalidations.is_empty());
     }
@@ -1896,10 +2236,10 @@ mod interprocedural {
 
         assert_eq!(effect.reads.len(), 1);
         assert_eq!(effect.reads[0].address.origin, 1);
-        assert_eq!(effect.reads[0].width, 4);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(4));
         assert_eq!(effect.writes.len(), 1);
         assert_eq!(effect.writes[0].address.origin, 0);
-        assert_eq!(effect.writes[0].width, 4);
+        assert_eq!(effect.writes[0].width, WidthExpr::Const(4));
         assert!(effect.invalidations.is_empty());
     }
 
@@ -2014,6 +2354,147 @@ mod interprocedural {
                 .iter()
                 .any(|invalidation| invalidation.reason == AccessUnknownReason::ForeignCall)
         );
+    }
+
+    #[test]
+    fn substitution_folds_linear_width_with_constant_actual() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            unsafe fn helper(destination: *mut u8, source: *const u8, blocks: usize) {
+                let _ = memcpy(destination, source, blocks.wrapping_mul(4));
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8) {
+                helper(destination, source, 3);
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].address.origin, 1);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(12));
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].address.origin, 0);
+        assert_eq!(effect.writes[0].width, WidthExpr::Const(12));
+        assert!(effect.invalidations.is_empty());
+    }
+
+    #[test]
+    fn substitution_composes_linear_width_with_linear_actual() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            unsafe fn helper(destination: *mut u8, source: *const u8, blocks: usize) {
+                let _ = memcpy(destination, source, blocks.wrapping_mul(4));
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8, blocks: usize) {
+                helper(destination, source, blocks.wrapping_add(2));
+            }
+            "#,
+            "target",
+        );
+
+        let width = WidthExpr::Linear {
+            param: 2,
+            scale: 4,
+            offset: 8,
+        };
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].width, width);
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].width, width);
+        assert!(effect.invalidations.is_empty());
+    }
+
+    #[test]
+    fn substitution_with_unresolvable_actual_count_invalidates() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            fn opaque() -> usize {
+                3
+            }
+
+            unsafe fn helper(destination: *mut u8, source: *const u8, blocks: usize) {
+                let _ = memcpy(destination, source, blocks.wrapping_mul(4));
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8) {
+                helper(destination, source, opaque());
+            }
+            "#,
+            "target",
+        );
+
+        assert!(effect.reads.is_empty());
+        assert!(effect.writes.is_empty());
+        assert!(effect.invalidations.iter().any(|invalidation| {
+            invalidation.reason == AccessUnknownReason::UnknownWidth
+                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0]))
+        }));
+        assert!(effect.invalidations.iter().any(|invalidation| {
+            invalidation.reason == AccessUnknownReason::UnknownWidth
+                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([1]))
+        }));
+    }
+
+    #[test]
+    fn substitution_overflow_during_fold_invalidates() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            unsafe fn helper(destination: *mut u8, source: *const u8, blocks: usize) {
+                let _ = memcpy(destination, source, blocks.wrapping_mul(0x8000_0000_0000_0000));
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8) {
+                helper(destination, source, 3);
+            }
+            "#,
+            "target",
+        );
+
+        assert!(effect.reads.is_empty());
+        assert!(effect.writes.is_empty());
+        assert!(effect.invalidations.iter().any(|invalidation| {
+            invalidation.reason == AccessUnknownReason::UnknownWidth
+                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0]))
+        }));
+        assert!(effect.invalidations.iter().any(|invalidation| {
+            invalidation.reason == AccessUnknownReason::UnknownWidth
+                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([1]))
+        }));
     }
 }
 
@@ -2455,6 +2936,69 @@ mod query {
         assert!(matches!(witness.order, HazardOrder::LaterIteration(_)));
         assert_eq!(witness.write_address.offset, OffsetExpr::Const(0));
         assert_eq!(witness.read_address.offset, OffsetExpr::Const(0));
+    }
+
+    #[test]
+    fn folded_memcpy_width_proves_unrelated_parameter_never_written() {
+        let verdict = never_written(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(
+                    destination: *mut u8,
+                    source: *const u8,
+                    count: usize,
+                ) -> *mut u8;
+            }
+
+            unsafe fn helper(
+                destination: *mut u8,
+                source: *const u8,
+                out: *mut u8,
+                blocks: usize,
+            ) {
+                let _ = memcpy(destination, source, blocks.wrapping_mul(4));
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8, out: *mut u8) {
+                helper(destination, source, out, 2);
+            }
+            "#,
+            "target",
+            "helper",
+            &[2],
+        );
+
+        assert!(matches!(verdict, WriteVerdict::NeverWritten));
+    }
+
+    #[test]
+    fn symbolic_width_hazard_yields_unresolved_symbolic_width_reason() {
+        let verdict = reads_precede_writes(
+            r#"
+            unsafe extern "C" {
+                fn memset(destination: *mut u8, value: i32, count: usize) -> *mut u8;
+                fn memcmp(left: *const u8, right: *const u8, count: usize) -> i32;
+            }
+
+            unsafe fn helper(buffer: *mut u8, other: *const u8, count: usize) {
+                let _ = memset(buffer, 0, count);
+                let _ = memcmp(buffer, other, count);
+            }
+
+            pub unsafe fn target(buffer: *mut u8, other: *const u8, count: usize) {
+                helper(buffer, other, count);
+            }
+            "#,
+            "target",
+            "helper",
+            &[0],
+            &[0],
+        );
+
+        let AccessOrderVerdict::Unknown { reasons } = verdict else {
+            panic!("expected unknown verdict, got {verdict:?}");
+        };
+        assert!(reasons.contains(&AccessUnknownReason::UnresolvedSymbolicWidth));
     }
 }
 
@@ -3288,7 +3832,55 @@ mod loops {
         );
         assert!(!effect.reads.is_empty());
         assert!(!effect.writes.is_empty());
-        assert!(has_cleanup_invalidation);
+        // Drop terminators deliberately contribute no effect: Crat's input
+        // domain is C2Rust output, which has no user `Drop` impls, so drop
+        // glue only frees the droppee's own allocation. This waives the
+        // hostile case that `Guard` models here — a user `Drop` writing
+        // through a raw-pointer field. See
+        // docs/superpowers/specs/2026-08-17-drop-terminator-narrowing-design.md.
+        assert!(!has_cleanup_invalidation);
+    }
+
+    #[test]
+    fn vec_local_drop_does_not_invalidate_parameters() {
+        let effect = ::utils::compilation::run_compiler_on_str(
+            r#"
+                pub unsafe fn target(out: *mut i32, input: *const i32) {
+                    let scratch: Vec<u8> = ::std::vec::from_elem(0u8, 16);
+                    *out = *input + scratch.len() as i32;
+                }
+                "#,
+            |tcx| {
+                let input = collect_input(tcx);
+                let flows = pointer_flow_analysis(&input, &FxHashSet::default());
+                let analysis = AccessOrderAnalysis::analyze(&input, &flows);
+                let target = input
+                    .functions
+                    .iter()
+                    .copied()
+                    .find(|def_id| tcx.item_name(def_id.to_def_id()).as_str() == "target")
+                    .unwrap();
+                analysis.summary(target).unwrap().effect.clone()
+            },
+        )
+        .unwrap();
+
+        // The `Vec<u8>` local produces a MIR Drop terminator. Before the
+        // Drop-terminator narrowing this emitted a `ParamScope::All`
+        // invalidation that poisoned the entire summary. `std::vec::from_elem`
+        // and `Vec::len` still produce `UnsupportedCall` invalidations, which
+        // is a known, separate blocker out of scope for this change.
+        assert!(
+            !effect
+                .invalidations
+                .iter()
+                .any(|invalidation| invalidation.reason
+                    == AccessUnknownReason::UnsupportedTerminator),
+            "expected no Drop-terminator invalidation, got {:?}",
+            effect.invalidations
+        );
+        assert!(!effect.reads.is_empty());
+        assert!(!effect.writes.is_empty());
     }
 
     #[test]
