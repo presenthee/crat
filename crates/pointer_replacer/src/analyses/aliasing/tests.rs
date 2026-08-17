@@ -705,9 +705,12 @@ fn same_base_different_offsets_remain_one_candidate_group() {
 }
 
 #[test]
-fn whole_array_fallback_is_rejected_when_access_order_is_unknown() {
-    // The foreign memcpy effect is not proven by access-order, so the site is
-    // rejected before the existing whole-array copy fallback is considered.
+fn whole_array_fallback_is_selected_when_count_is_a_linear_parameter() {
+    // The foreign memcpy count `n` is linear in a callee parameter, so
+    // access-order now proves the effect instead of invalidating it; the
+    // whole-array copy fallback applies since the exact count isn't known
+    // to `ReadExtentAnalysis` and the callee never observes the pointer's
+    // address.
     let (gated, selected) = run_planning(
         r#"
         extern "C" {
@@ -722,11 +725,15 @@ fn whole_array_fallback_is_rejected_when_access_order_is_unknown() {
         }
         "#,
     );
-    assert!(
-        gated.is_empty(),
-        "unknown access-order evidence must reject snapshotting: {gated:#?}"
+    assert_eq!(
+        gated,
+        vec![(
+            "driver".to_string(),
+            "callee".to_string(),
+            vec!["whole(1, 32)".to_string()],
+        )]
     );
-    assert!(selected.is_empty());
+    assert_eq!(selected, vec!["callee".to_string()]);
 }
 
 #[test]
