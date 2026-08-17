@@ -9,8 +9,8 @@ use rustc_middle::{
 };
 
 use super::{
-    AccessEffect, AccessFootprint, AccessKind, CallFrame, FunctionAccessSummary, HazardOrder,
-    OffsetExpr, PotentialHazard, SymbolicAddress,
+    ACCESS_SUMMARY_BUDGET, AccessEffect, AccessFootprint, AccessKind, CallFrame,
+    FunctionAccessSummary, HazardOrder, OffsetExpr, PotentialHazard, SymbolicAddress, WidthExpr,
     extractor::{
         ResolvedPointerOrigins, constant_usize, raw_pointer_pointee, resolve_pointer_operand,
     },
@@ -264,6 +264,9 @@ pub(crate) fn build_loop_effect<'tcx>(
         contains_repetition: true,
     };
     effect.normalize();
+    if effect.element_count() > ACCESS_SUMMARY_BUDGET {
+        return None;
+    }
     Some(AtomicLoopEffect {
         recognized: recognized.clone(),
         effect,
@@ -472,7 +475,7 @@ impl<'tcx> LoopTracer<'_, 'tcx> {
             raw.kind,
             AccessFootprint {
                 address,
-                width,
+                width: WidthExpr::Const(width),
                 location,
                 call_chain: vec![],
             },
@@ -525,7 +528,7 @@ impl<'tcx> LoopTracer<'_, 'tcx> {
             kind,
             footprint: AccessFootprint {
                 address: self.symbolic_address(pointer),
-                width,
+                width: WidthExpr::Const(width),
                 location,
                 call_chain: vec![],
             },
@@ -598,7 +601,7 @@ impl<'tcx> LoopTracer<'_, 'tcx> {
         }
         let result = (|| {
             if self.body.args_iter().any(|argument| argument == local) {
-                if !self.local_definitions(local).is_empty() {
+                if !local_definitions(self.body, local).is_empty() {
                     return None;
                 }
                 return Some(AffinePointer {
@@ -608,7 +611,7 @@ impl<'tcx> LoopTracer<'_, 'tcx> {
                 });
             }
 
-            let definitions = self.local_definitions(local);
+            let definitions = local_definitions(self.body, local);
             let [definition] = definitions.as_slice() else {
                 return None;
             };
@@ -674,7 +677,7 @@ impl<'tcx> LoopTracer<'_, 'tcx> {
                     return None;
                 }
                 let result = (|| {
-                    let definitions = self.local_definitions(local);
+                    let definitions = local_definitions(self.body, local);
                     let [LocalDefinition::Statement(rvalue)] = definitions.as_slice() else {
                         return None;
                     };
@@ -741,30 +744,6 @@ impl<'tcx> LoopTracer<'_, 'tcx> {
                 result
             }
         }
-    }
-
-    fn local_definitions(&self, local: Local) -> Vec<LocalDefinition<'_, 'tcx>> {
-        let mut definitions = vec![];
-        for block_data in self.body.basic_blocks.iter() {
-            for statement in &block_data.statements {
-                if let StatementKind::Assign(box (place, rvalue)) = &statement.kind
-                    && place.as_local() == Some(local)
-                {
-                    definitions.push(LocalDefinition::Statement(rvalue));
-                }
-            }
-            if let TerminatorKind::Call {
-                func,
-                args,
-                destination,
-                ..
-            } = &block_data.terminator().kind
-                && destination.as_local() == Some(local)
-            {
-                definitions.push(LocalDefinition::Call { func, args });
-            }
-        }
-        definitions
     }
 
     fn pointer_arithmetic_scale(&self, path: &str, receiver_ty: Ty<'tcx>) -> Option<i64> {
@@ -908,7 +887,7 @@ fn integer_type<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, ty: Ty<'tcx>) -> Op
     Some(IntegerType { signed, bits })
 }
 
-fn value_preserving_integer_cast<'tcx>(
+pub(crate) fn value_preserving_integer_cast<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     source: Ty<'tcx>,
@@ -924,7 +903,7 @@ fn value_preserving_integer_cast<'tcx>(
         || !source.signed && target.signed && source.bits < target.bits
 }
 
-fn cast_literal_integer<'tcx>(
+pub(crate) fn cast_literal_integer<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     operand: &Operand<'tcx>,
@@ -1010,12 +989,39 @@ fn literal_integer(operand: &Operand<'_>) -> Option<i64> {
     i64::try_from(value).ok()
 }
 
-enum LocalDefinition<'a, 'tcx> {
+pub(crate) enum LocalDefinition<'a, 'tcx> {
     Statement(&'a Rvalue<'tcx>),
     Call {
         func: &'a Operand<'tcx>,
         args: &'a [rustc_span::source_map::Spanned<Operand<'tcx>>],
     },
+}
+
+pub(crate) fn local_definitions<'a, 'tcx>(
+    body: &'a Body<'tcx>,
+    local: Local,
+) -> Vec<LocalDefinition<'a, 'tcx>> {
+    let mut definitions = vec![];
+    for block_data in body.basic_blocks.iter() {
+        for statement in &block_data.statements {
+            if let StatementKind::Assign(box (place, rvalue)) = &statement.kind
+                && place.as_local() == Some(local)
+            {
+                definitions.push(LocalDefinition::Statement(rvalue));
+            }
+        }
+        if let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &block_data.terminator().kind
+            && destination.as_local() == Some(local)
+        {
+            definitions.push(LocalDefinition::Call { func, args });
+        }
+    }
+    definitions
 }
 
 fn unique_parameter_origin(origins: &ResolvedPointerOrigins) -> Option<usize> {

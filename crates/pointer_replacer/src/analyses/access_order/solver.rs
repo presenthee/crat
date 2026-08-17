@@ -4,8 +4,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::mir::{Body, Location, START_BLOCK};
 
 use super::{
-    AccessEffect, AccessFootprint, AccessUnknownReason, AtomicLoopEffect, FunctionAccessSummary,
-    HazardOrder, Invalidation, ParamScope, PotentialHazard, extractor::LocationEffect,
+    ACCESS_SUMMARY_BUDGET, AccessEffect, AccessFootprint, AccessUnknownReason, AtomicLoopEffect,
+    FunctionAccessSummary, HazardOrder, Invalidation, ParamScope, PotentialHazard,
+    extractor::LocationEffect, summary::budget_exceeded_summary,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -37,14 +38,16 @@ pub(crate) fn solve_body(
     while let Some(block) = worklist.pop_front() {
         let mut state = entries[&block].clone();
         if let Some(atomic) = atomic_loops.get(&block) {
-            apply_effect(
+            if !apply_effect(
                 &mut state,
                 &atomic.effect,
                 &mut reads,
                 &mut writes,
                 &mut hazards,
                 &mut invalidations,
-            );
+            ) {
+                return budget_exceeded_summary();
+            }
             contains_repetition = true;
             let [exit] = atomic.recognized.exits[..] else {
                 unreachable!("certified loops have one normal exit");
@@ -63,14 +66,16 @@ pub(crate) fn solve_body(
             };
             match location_effect {
                 LocationEffect::Effect(effect) => {
-                    apply_effect(
+                    if !apply_effect(
                         &mut state,
                         effect,
                         &mut reads,
                         &mut writes,
                         &mut hazards,
                         &mut invalidations,
-                    );
+                    ) {
+                        return budget_exceeded_summary();
+                    }
                     contains_repetition |= effect.contains_repetition;
                 }
                 LocationEffect::Call(_) => {
@@ -174,7 +179,16 @@ fn apply_effect(
     summary_writes: &mut FxHashSet<AccessFootprint>,
     summary_hazards: &mut FxHashSet<PotentialHazard>,
     summary_invalidations: &mut FxHashSet<Invalidation>,
-) {
+) -> bool {
+    let projected = summary_reads.len()
+        + summary_writes.len()
+        + summary_hazards.len()
+        + summary_invalidations.len()
+        + effect.element_count()
+        + state.prior_writes.len() * effect.reads.len();
+    if projected > ACCESS_SUMMARY_BUDGET {
+        return false;
+    }
     summary_reads.extend(effect.reads.iter().cloned());
     summary_writes.extend(effect.writes.iter().cloned());
     state.hazards.extend(effect.hazards.iter().cloned());
@@ -194,6 +208,7 @@ fn apply_effect(
 
     summary_hazards.extend(state.hazards.iter().cloned());
     summary_invalidations.extend(state.invalidations.iter().cloned());
+    true
 }
 
 fn join_state(target: &mut AccessState, incoming: &AccessState) -> bool {

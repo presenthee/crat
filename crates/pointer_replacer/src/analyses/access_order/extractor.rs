@@ -11,7 +11,7 @@ use rustc_span::source_map::Spanned;
 
 use super::{
     AccessEffect, AccessFootprint, AccessKind, AccessUnknownReason, Invalidation, OffsetExpr,
-    ParamScope, SymbolicAddress,
+    ParamScope, SymbolicAddress, WidthExpr,
 };
 use crate::analyses::pointer_flow::{
     PointerFlowResult,
@@ -130,17 +130,24 @@ impl<'tcx> Extractor<'_, 'tcx> {
                 func: func.clone(),
                 args: args.to_vec(),
             })),
-            TerminatorKind::Drop { .. }
-            | TerminatorKind::Yield { .. }
-            | TerminatorKind::CoroutineDrop => Some(LocationEffect::Effect(invalidation_effect(
-                AccessUnknownReason::UnsupportedTerminator,
-                location,
-            ))),
+            TerminatorKind::Yield { .. } | TerminatorKind::CoroutineDrop => {
+                Some(LocationEffect::Effect(invalidation_effect(
+                    AccessUnknownReason::UnsupportedTerminator,
+                    location,
+                )))
+            }
             TerminatorKind::InlineAsm { .. } => Some(LocationEffect::Effect(invalidation_effect(
                 AccessUnknownReason::InlineAssembly,
                 location,
             ))),
-            TerminatorKind::Goto { .. }
+            // Drop contributes no access effect. Crat's input domain is C2Rust
+            // output, which contains no user `Drop` impls, so drop glue only
+            // frees the droppee's own allocation and never touches caller
+            // memory. Treating it as an all-parameter invalidation poisoned
+            // every summary containing a `Vec`/`Box` local. See
+            // docs/superpowers/specs/2026-08-17-drop-terminator-narrowing-design.md.
+            TerminatorKind::Drop { .. }
+            | TerminatorKind::Goto { .. }
             | TerminatorKind::Return
             | TerminatorKind::UnwindResume
             | TerminatorKind::UnwindTerminate(..)
@@ -302,7 +309,7 @@ impl<'tcx> Extractor<'_, 'tcx> {
             return effect_for_unknown_width(origins, location);
         };
 
-        effect_for_resolved_origins(origins, width, kind, location)
+        effect_for_resolved_origins(origins, WidthExpr::Const(width), kind, location)
     }
 
     fn pointer_operand_effect(
@@ -313,7 +320,7 @@ impl<'tcx> Extractor<'_, 'tcx> {
         location: Location,
     ) -> AccessEffect {
         let origins = self.resolve_pointer_operand(operand);
-        effect_for_resolved_origins(origins, width, kind, location)
+        effect_for_resolved_origins(origins, WidthExpr::Const(width), kind, location)
     }
 
     fn relevant_invalidation<'op>(
@@ -629,11 +636,11 @@ pub(crate) fn resolve_call_operand<'tcx>(
 
 pub(crate) fn effect_for_resolved_origins(
     origins: ResolvedPointerOrigins,
-    width: u64,
+    width: WidthExpr,
     kind: AccessKind,
     location: Location,
 ) -> AccessEffect {
-    if width == 0 || origins.addresses.is_empty() && !origins.unresolved {
+    if width == WidthExpr::Const(0) || origins.addresses.is_empty() && !origins.unresolved {
         return AccessEffect::empty();
     }
     let parameter_scope = known_scope(&origins.addresses);
