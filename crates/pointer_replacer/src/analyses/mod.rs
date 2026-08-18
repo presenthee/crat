@@ -2,6 +2,7 @@ pub mod access_order;
 pub mod aliasing;
 pub mod array_local_provenance;
 pub mod borrow;
+pub mod const_eval;
 mod encoding;
 pub mod fn_ptr_groups;
 pub mod fn_ptr_rewrite_decision;

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::mir::{Local, Location};
+use rustc_span::def_id::DefId;
 
 use crate::analyses::pointer_flow::slots::{SlotIdx, SlotTable};
 
@@ -50,6 +51,9 @@ pub enum BaseId {
     },
     IntToPtr {
         location: Location,
+    },
+    Static {
+        def_id: DefId,
     },
     Unknown {
         location: Location,

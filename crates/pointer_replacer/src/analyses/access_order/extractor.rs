@@ -15,7 +15,7 @@ use super::{
 };
 use crate::analyses::pointer_flow::{
     PointerFlowResult,
-    graph::{BaseId, Offset, PfgNode},
+    graph::{BaseId, Offset, PfgNode, UnknownReason},
 };
 
 #[derive(Clone, Debug)]
@@ -194,13 +194,6 @@ impl<'tcx> Extractor<'_, 'tcx> {
         match intrinsic {
             NonDivergingIntrinsic::Assume(operand) => self.operand_effect(operand, location),
             NonDivergingIntrinsic::CopyNonOverlapping(copy) => {
-                let Some(count) = constant_usize(&copy.count, self.tcx) else {
-                    return self.relevant_invalidation(
-                        [&copy.src, &copy.dst],
-                        AccessUnknownReason::UnknownWidth,
-                        location,
-                    );
-                };
                 let Some(element_ty) = raw_pointer_pointee(copy.src.ty(self.body, self.tcx)) else {
                     return self.relevant_invalidation(
                         [&copy.src, &copy.dst],
@@ -208,22 +201,13 @@ impl<'tcx> Extractor<'_, 'tcx> {
                         location,
                     );
                 };
-                let Some(element_size) = self.layout(element_ty).map(|layout| layout.size.bytes())
-                else {
-                    return self.relevant_invalidation(
-                        [&copy.src, &copy.dst],
-                        AccessUnknownReason::UnknownWidth,
-                        location,
-                    );
-                };
-                let Some(width) = element_size.checked_mul(count) else {
-                    return self.relevant_invalidation(
-                        [&copy.src, &copy.dst],
-                        AccessUnknownReason::UnknownWidth,
-                        location,
-                    );
-                };
-                if width == 0 {
+                let width = constant_usize(&copy.count, self.tcx)
+                    .and_then(|count| {
+                        let element_size = self.layout(element_ty)?.size.bytes();
+                        element_size.checked_mul(count)
+                    })
+                    .map_or(WidthExpr::Unknown, WidthExpr::Const);
+                if width == WidthExpr::Const(0) {
                     return AccessEffect::empty();
                 }
 
@@ -301,12 +285,12 @@ impl<'tcx> Extractor<'_, 'tcx> {
         kind: AccessKind,
         location: Location,
     ) -> AccessEffect {
-        let origins = self.resolve_pointer_place(pointer_place, projected_offset);
+        let origins = self.resolve_pointer_place(pointer_place, projected_offset, 0);
         if origins.addresses.is_empty() && !origins.unresolved {
             return AccessEffect::empty();
         }
         let Some(width) = self.access_width(accessed_ty) else {
-            return effect_for_unknown_width(origins, location);
+            return effect_for_resolved_origins(origins, WidthExpr::Unknown, kind, location);
         };
 
         effect_for_resolved_origins(origins, WidthExpr::Const(width), kind, location)
@@ -315,12 +299,12 @@ impl<'tcx> Extractor<'_, 'tcx> {
     fn pointer_operand_effect(
         &self,
         operand: &Operand<'tcx>,
-        width: u64,
+        width: WidthExpr,
         kind: AccessKind,
         location: Location,
     ) -> AccessEffect {
         let origins = self.resolve_pointer_operand(operand);
-        effect_for_resolved_origins(origins, WidthExpr::Const(width), kind, location)
+        effect_for_resolved_origins(origins, width, kind, location)
     }
 
     fn relevant_invalidation<'op>(
@@ -364,7 +348,7 @@ impl<'tcx> Extractor<'_, 'tcx> {
                 ..ResolvedPointerOrigins::default()
             };
         };
-        self.resolve_pointer_place(place, ProjectedOffset::Const(0))
+        self.resolve_pointer_place(place, ProjectedOffset::Const(0), 0)
     }
 
     fn resolve_call_operand(&self, operand: &Operand<'tcx>) -> ResolvedPointerOrigins {
@@ -388,7 +372,7 @@ impl<'tcx> Extractor<'_, 'tcx> {
             };
         };
         let has_slots = !slots.is_empty();
-        let mut origins = self.resolve_pointer_slots(slots, ProjectedOffset::Const(0));
+        let mut origins = self.resolve_pointer_slots(slots, ProjectedOffset::Const(0), 0);
         origins.unresolved |=
             pointer_shape.unrepresented || pointer_shape.represented && !has_slots;
         origins
@@ -398,6 +382,7 @@ impl<'tcx> Extractor<'_, 'tcx> {
         &self,
         pointer_place: Place<'tcx>,
         projected_offset: ProjectedOffset,
+        depth: usize,
     ) -> ResolvedPointerOrigins {
         let Some(slot) = self
             .flow
@@ -410,13 +395,14 @@ impl<'tcx> Extractor<'_, 'tcx> {
                 ..ResolvedPointerOrigins::default()
             };
         };
-        self.resolve_pointer_slots(std::iter::once(slot), projected_offset)
+        self.resolve_pointer_slots(std::iter::once(slot), projected_offset, depth)
     }
 
     fn resolve_pointer_slots(
         &self,
         slots: impl IntoIterator<Item = usize>,
         projected_offset: ProjectedOffset,
+        depth: usize,
     ) -> ResolvedPointerOrigins {
         let mut result = ResolvedPointerOrigins::default();
         for slot in slots {
@@ -456,20 +442,51 @@ impl<'tcx> Extractor<'_, 'tcx> {
                         result.addresses.push(SymbolicAddress { origin, offset });
                     }
                     BaseId::LocalArray { local } if self.is_direct_local_array(*local) => {}
+                    BaseId::LocalArray { local } => {
+                        self.resolve_local_array_base(
+                            &node,
+                            base,
+                            *local,
+                            projected_offset,
+                            depth,
+                            &mut result,
+                        );
+                    }
                     BaseId::RawBorrow {
                         target: Some(_),
                         location,
                     } if self.is_direct_local_raw_borrow(*location) => {}
+                    BaseId::RawBorrow { location, .. } => {
+                        self.resolve_raw_borrow_base(
+                            &node,
+                            base,
+                            *location,
+                            projected_offset,
+                            depth,
+                            &mut result,
+                        );
+                    }
+                    // Statics are resolved origins that contribute no
+                    // parameter addresses: within the crate, a static's
+                    // address reaches another frame's parameter only through a
+                    // call actual, and there the query compares actual bases,
+                    // where two mentions of the same static compare equal.
+                    // Aliasing injected from outside the crate (an exported
+                    // static passed back into an exposed function) is not
+                    // modeled, matching the analysis-wide assumption that
+                    // external callers respect the original C contracts.
+                    // Null pointer sentinels cannot be dereferenced, so they
+                    // contribute no parameter addresses either.
                     BaseId::LocalVec { .. }
                     | BaseId::LocalScalar { .. }
-                    | BaseId::HeapAlloc { .. } => {}
-                    BaseId::LocalArray { .. }
-                    | BaseId::RawBorrow {
-                        target: Some(_), ..
-                    }
-                    | BaseId::OpaqueReturn { .. }
+                    | BaseId::HeapAlloc { .. }
+                    | BaseId::Static { .. }
+                    | BaseId::Unknown {
+                        reason: UnknownReason::NullLike,
+                        ..
+                    } => {}
+                    BaseId::OpaqueReturn { .. }
                     | BaseId::IntToPtr { .. }
-                    | BaseId::RawBorrow { target: None, .. }
                     | BaseId::Unknown { .. } => result.unresolved = true,
                 }
             }
@@ -478,6 +495,132 @@ impl<'tcx> Extractor<'_, 'tcx> {
         result.addresses.sort_by_key(|address| address.origin);
         result.addresses.dedup();
         result
+    }
+
+    /// Resolves a raw borrow of a pointee place, e.g. `&raw const (*s).buf`:
+    /// the borrowed place is split at its last `Deref`, the projection past
+    /// the `Deref` becomes a displacement, and the pointer place before it is
+    /// resolved recursively. A borrow this cannot decompose stays unresolved,
+    /// as before.
+    fn resolve_raw_borrow_base(
+        &self,
+        node: &PfgNode,
+        base: &BaseId,
+        location: Location,
+        projected_offset: ProjectedOffset,
+        depth: usize,
+        result: &mut ResolvedPointerOrigins,
+    ) {
+        if depth >= DATA_POINTER_RECURSION_LIMIT {
+            result.unresolved = true;
+            return;
+        }
+        let Some(statement) = self.body.basic_blocks[location.block]
+            .statements
+            .get(location.statement_index)
+        else {
+            result.unresolved = true;
+            return;
+        };
+        let StatementKind::Assign(box (
+            _,
+            Rvalue::RawPtr(_, borrowed) | Rvalue::Ref(_, _, borrowed),
+        )) = &statement.kind
+        else {
+            result.unresolved = true;
+            return;
+        };
+        if !self.resolve_borrowed_place(node, base, *borrowed, projected_offset, depth, result) {
+            result.unresolved = true;
+        }
+    }
+
+    /// A `LocalArray` base whose local is not itself an array names an array
+    /// reached through that local, e.g. `(*s).buf.as_ptr()`. The base does
+    /// not keep the borrowed place, so every borrow rooted at the local is
+    /// resolved and their union over-approximates the base; borrows without
+    /// a `Deref` are borrows of local storage and contribute no addresses.
+    /// A local with no borrow statement stays unresolved, as before.
+    fn resolve_local_array_base(
+        &self,
+        node: &PfgNode,
+        base: &BaseId,
+        local: rustc_middle::mir::Local,
+        projected_offset: ProjectedOffset,
+        depth: usize,
+        result: &mut ResolvedPointerOrigins,
+    ) {
+        if depth >= DATA_POINTER_RECURSION_LIMIT {
+            result.unresolved = true;
+            return;
+        }
+        let mut found = false;
+        for block in self.body.basic_blocks.iter() {
+            for statement in &block.statements {
+                let StatementKind::Assign(box (
+                    _,
+                    Rvalue::RawPtr(_, borrowed) | Rvalue::Ref(_, _, borrowed),
+                )) = &statement.kind
+                else {
+                    continue;
+                };
+                if borrowed.local != local {
+                    continue;
+                }
+                found = true;
+                self.resolve_borrowed_place(node, base, *borrowed, projected_offset, depth, result);
+            }
+        }
+        if !found {
+            result.unresolved = true;
+        }
+    }
+
+    /// Splits a borrowed place at its last `Deref`: the projection past the
+    /// `Deref` becomes a displacement, and the pointer place before it is
+    /// resolved recursively into `result`. Returns false when the place has
+    /// no `Deref` (the borrow is of local storage).
+    fn resolve_borrowed_place(
+        &self,
+        node: &PfgNode,
+        base: &BaseId,
+        borrowed: Place<'tcx>,
+        projected_offset: ProjectedOffset,
+        depth: usize,
+        result: &mut ResolvedPointerOrigins,
+    ) -> bool {
+        let Some(deref_index) = borrowed
+            .projection
+            .iter()
+            .rposition(|projection| matches!(projection, ProjectionElem::Deref))
+        else {
+            return false;
+        };
+        let suffix_offset =
+            self.post_deref_offset(borrowed, deref_index + 1, borrowed.projection.len());
+        let base_offset = self
+            .flow
+            .provenance
+            .offset_from_base(node, base)
+            .unwrap_or(Offset::Unknown);
+        let composed = match (suffix_offset, base_offset, projected_offset) {
+            (
+                ProjectedOffset::Const(suffix),
+                Offset::Const(displacement),
+                ProjectedOffset::Const(projected),
+            ) => suffix
+                .checked_add(displacement)
+                .and_then(|sum| sum.checked_add(projected))
+                .map_or(ProjectedOffset::Unknown, ProjectedOffset::Const),
+            _ => ProjectedOffset::Unknown,
+        };
+        let pointer_place = Place::from(borrowed.local)
+            .project_deeper(&borrowed.projection[..deref_index], self.tcx);
+        let origins = self.resolve_pointer_place(pointer_place, composed, depth + 1);
+        result.addresses.extend(origins.addresses);
+        result.unresolved |= origins.unresolved;
+        result.unknown_offset |= origins.unknown_offset;
+        true
     }
 
     fn post_deref_offset(&self, place: Place<'tcx>, start: usize, end: usize) -> ProjectedOffset {
@@ -643,7 +786,6 @@ pub(crate) fn effect_for_resolved_origins(
     if width == WidthExpr::Const(0) || origins.addresses.is_empty() && !origins.unresolved {
         return AccessEffect::empty();
     }
-    let parameter_scope = known_scope(&origins.addresses);
     let mut effect = AccessEffect::empty();
     let footprints = origins
         .addresses
@@ -659,16 +801,6 @@ pub(crate) fn effect_for_resolved_origins(
         AccessKind::Read => effect.reads = footprints,
         AccessKind::Write => effect.writes = footprints,
     }
-    if origins.unknown_offset
-        && let Some(scope) = parameter_scope
-    {
-        effect.invalidations.push(Invalidation {
-            scope,
-            reason: AccessUnknownReason::UnknownOffset,
-            location,
-            call_chain: vec![],
-        });
-    }
     if origins.unresolved {
         effect.invalidations.push(Invalidation {
             scope: ParamScope::All,
@@ -679,40 +811,6 @@ pub(crate) fn effect_for_resolved_origins(
     }
     effect.normalize();
     effect
-}
-
-fn effect_for_unknown_width(origins: ResolvedPointerOrigins, location: Location) -> AccessEffect {
-    let mut invalidations = vec![];
-    if origins.unknown_offset
-        && let Some(scope) = known_scope(&origins.addresses)
-    {
-        invalidations.push(Invalidation {
-            scope,
-            reason: AccessUnknownReason::UnknownOffset,
-            location,
-            call_chain: vec![],
-        });
-    }
-    if let Some(scope) = known_scope(&origins.addresses) {
-        invalidations.push(Invalidation {
-            scope,
-            reason: AccessUnknownReason::UnknownWidth,
-            location,
-            call_chain: vec![],
-        });
-    }
-    if origins.unresolved {
-        invalidations.push(Invalidation {
-            scope: ParamScope::All,
-            reason: AccessUnknownReason::UnresolvedOrigin,
-            location,
-            call_chain: vec![],
-        });
-    }
-    AccessEffect {
-        invalidations,
-        ..AccessEffect::empty()
-    }
 }
 
 pub(crate) fn constant_usize<'tcx>(operand: &Operand<'tcx>, tcx: TyCtxt<'tcx>) -> Option<u64> {
@@ -839,11 +937,6 @@ fn classify_data_pointers<'tcx>(
 enum ProjectedOffset {
     Const(i64),
     Unknown,
-}
-
-fn known_scope(addresses: &[SymbolicAddress]) -> Option<ParamScope> {
-    let scope: FxHashSet<_> = addresses.iter().map(|address| address.origin).collect();
-    (!scope.is_empty()).then_some(ParamScope::Known(scope))
 }
 
 fn invalidation_effect(reason: AccessUnknownReason, location: Location) -> AccessEffect {

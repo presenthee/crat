@@ -7,8 +7,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{
     mir::{
-        self, AggregateKind, BasicBlock, Body, CastKind, Local, Location, Operand, Place,
-        ProjectionElem, Rvalue, StatementKind, TerminatorKind,
+        self, AggregateKind, BasicBlock, Body, CastKind, Const, ConstValue, Local, Location,
+        Operand, Place, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
+        interpret::{GlobalAlloc, Scalar},
     },
     ty::{self, Ty, TyCtxt},
 };
@@ -16,6 +17,7 @@ use rustc_span::{def_id::DefId, source_map::Spanned};
 
 use crate::{
     analyses::{
+        const_eval::{Ctx, EvalCx, MAX_EVAL_DEPTH, collect_defs},
         mir::CallGraphPostOrder,
         pointer_flow::{
             PointerFlowResult,
@@ -873,14 +875,24 @@ impl<'tcx> Collector<'_, 'tcx> {
                 if is_empty_array_ref_ty(operand.ty(self.body, self.tcx), self.tcx) {
                     return;
                 }
-                self.graph.add_base_edge(
-                    BaseId::Unknown {
-                        location,
-                        reason: constant_pointer_reason(operand, self.tcx),
-                    },
-                    dst,
-                );
+                let base = self.constant_base(operand, location);
+                self.graph.add_base_edge(base, dst);
             }
+        }
+    }
+
+    /// A constant pointer to a static gets a resolved `Static` base; every
+    /// other constant pointer stays `Unknown`.
+    fn constant_base(&self, operand: &Operand<'tcx>, location: Location) -> BaseId {
+        if let Some(constant) = operand.constant()
+            && let Const::Val(ConstValue::Scalar(Scalar::Ptr(ptr, _)), _) = constant.const_
+            && let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance.alloc_id())
+        {
+            return BaseId::Static { def_id };
+        }
+        BaseId::Unknown {
+            location,
+            reason: constant_pointer_reason(operand, self.tcx),
         }
     }
 
@@ -929,13 +941,8 @@ impl<'tcx> Collector<'_, 'tcx> {
                 if is_empty_array_ref_ty(operand.ty(self.body, self.tcx), self.tcx) {
                     return;
                 }
-                self.graph.add_base_edge(
-                    BaseId::Unknown {
-                        location,
-                        reason: constant_pointer_reason(operand, self.tcx),
-                    },
-                    dst,
-                );
+                let base = self.constant_base(operand, location);
+                self.graph.add_base_edge(base, dst);
             }
         }
     }
@@ -965,25 +972,30 @@ impl<'tcx> Collector<'_, 'tcx> {
                 if is_empty_array_ref_ty(operand.ty(self.body, self.tcx), self.tcx) {
                     return;
                 }
-                self.graph.add_base_edge(
-                    BaseId::Unknown {
-                        location,
-                        reason: constant_pointer_reason(operand, self.tcx),
-                    },
-                    dst,
-                );
+                let base = self.constant_base(operand, location);
+                self.graph.add_base_edge(base, dst);
             }
         }
     }
 
+    /// A constant integer operand, folded backward through single-def chains:
+    /// debug MIR routes `c1 + c2` through overflow-checked tuples that a plain
+    /// constant check cannot see through.
     fn literal_integer(&self, operand: &Operand<'tcx>) -> Option<i128> {
-        let constant = operand.constant()?;
-        let scalar = constant.const_.try_to_scalar()?;
-        let int = scalar.try_to_scalar_int().ok()?;
-        let bits = int.to_bits(int.size());
-        match constant.const_.ty().kind() {
-            ty::TyKind::Int(_) => Some(int.size().sign_extend(bits)),
-            ty::TyKind::Uint(_) => i128::try_from(bits).ok(),
+        let defs = collect_defs(self.body);
+        let ctx = Ctx::new();
+        let eval = EvalCx {
+            tcx: self.tcx,
+            body: self.body,
+            defs: &defs,
+            ctx: &ctx,
+            typing_env: ty::TypingEnv::post_analysis(self.tcx, self.body.source.def_id()),
+        };
+        let v = eval.operand(operand, MAX_EVAL_DEPTH)?;
+        let size = eval.int_size(v.ty)?;
+        match v.ty.kind() {
+            ty::TyKind::Int(_) => Some(size.sign_extend(v.bits)),
+            ty::TyKind::Uint(_) => i128::try_from(v.bits).ok(),
             _ => None,
         }
     }
