@@ -350,10 +350,10 @@ fn indirect_calls_are_rejected() {
 }
 
 #[test]
-fn null_initialized_pointer_is_rejected_when_access_order_is_unknown() {
-    // `p` retains a null provenance alternative, so the call-site access-order
-    // analysis cannot prove the snapshot safe even though the alias detector
-    // can find the array base.
+fn null_initialized_pointer_still_resolves_to_its_array_base() {
+    // `p` retains a null provenance alternative, but a null pointer cannot be
+    // dereferenced, so it does not obscure the array base the access-order
+    // analysis needs.
     let candidates = run_detection(
         r#"
         pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
@@ -369,9 +369,15 @@ fn null_initialized_pointer_is_rejected_when_access_order_is_unknown() {
         "#,
     );
 
-    assert!(
-        candidates.is_empty(),
-        "unknown access-order evidence must reject snapshotting: {candidates:#?}"
+    assert_eq!(
+        candidates,
+        vec![(
+            "driver".to_string(),
+            "callee".to_string(),
+            vec![0usize],
+            vec![1usize]
+        )],
+        "the null alternative must not reject the snapshot candidate: {candidates:#?}"
     );
 }
 

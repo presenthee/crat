@@ -48,7 +48,9 @@ pub struct CallFrame {
 
 /// Byte width of an access. `Linear` means `scale * param + offset` where
 /// `param` is an integer parameter of the summarized function; the invariant
-/// `scale >= 1` holds (a zero scale is normalized to `Const`).
+/// `scale >= 1` holds (a zero scale is normalized to `Const`). `Unknown`
+/// means the access starts at the footprint's address but its extent could
+/// not be modeled; queries can still reason about which base it touches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WidthExpr {
     Const(u64),
@@ -57,6 +59,7 @@ pub enum WidthExpr {
         scale: u64,
         offset: u64,
     },
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -146,7 +149,7 @@ pub enum AccessUnknownReason {
 /// to one conservative all-parameter invalidation. Substituted callee
 /// summaries multiply through call sites, so unbounded composition can exhaust
 /// memory on large translated programs.
-pub(crate) const ACCESS_SUMMARY_BUDGET: usize = 10_000;
+pub(crate) const ACCESS_SUMMARY_BUDGET: usize = 100_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Invalidation {

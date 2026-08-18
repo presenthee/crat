@@ -1602,6 +1602,10 @@ fn classify_base(base: &BaseId) -> BaseClassification {
             BaseAdmissibility::Reject,
             "integer-to-pointer cast has no known safe Rust allocation object",
         ),
+        BaseId::Static { .. } => (
+            BaseAdmissibility::Reject,
+            "static memory is outside the local rewrite scope",
+        ),
         BaseId::Unknown { reason, .. } => (
             BaseAdmissibility::Reject,
             match reason {

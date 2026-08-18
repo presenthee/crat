@@ -11979,12 +11979,14 @@ pub unsafe fn driver() -> i32 {
 
 #[test]
 fn snapshot_whole_array_is_rejected_when_access_order_is_unknown() {
-    // Dynamic parameter offsets make the call-site access-order query unknown,
-    // so snapshotting is rejected before the whole-array fallback.
+    // A write at a dynamic parameter offset precedes the reads, so the
+    // call-site access-order query stays unknown and snapshotting is
+    // rejected before the whole-array fallback.
     let code = r#"
 pub unsafe fn callee(out: *mut u8, a: *const u8, b: *const u8, n: usize) {
+    *out.offset(n as isize) = 0;
     let v = *a.offset(n as isize) ^ *b.offset(n as isize);
-    *out = v;
+    *out.offset(n as isize) = v;
 }
 pub unsafe fn driver(n: usize) {
     let mut arr: [u8; 16] = [0; 16];
