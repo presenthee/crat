@@ -93,6 +93,16 @@ pub(crate) fn is_vec_as_ptr(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool 
         && matches!(name.rsplit("::").next(), Some("as_ptr" | "as_mut_ptr"))
 }
 
+pub(crate) fn is_vec_from_elem(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
+    let crate_name = tcx.crate_name(def_id.krate);
+    crate_name.as_str() == "alloc" && name.contains("::vec::") && name.ends_with("::from_elem")
+}
+
+pub(crate) fn is_size_of(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
+    let crate_name = tcx.crate_name(def_id.krate);
+    matches!(crate_name.as_str(), "core" | "std") && name.ends_with("::mem::size_of")
+}
+
 pub(crate) fn is_vec_ty<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
     matches!(ty.kind(), ty::TyKind::Adt(adt, _) if tcx.is_diagnostic_item(sym::Vec, adt.did()))
 }

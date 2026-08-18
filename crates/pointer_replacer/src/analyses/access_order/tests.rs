@@ -183,6 +183,86 @@ mod reachable_cycles {
 }
 
 #[cfg(test)]
+mod budget {
+    use rustc_hash::FxHashSet;
+    use rustc_middle::mir::{BasicBlock, Location};
+
+    use super::super::{
+        ACCESS_SUMMARY_BUDGET, AccessEffect, AccessFootprint, OffsetExpr, SymbolicAddress,
+        WidthExpr,
+        solver::{AccessState, apply_effect},
+    };
+
+    fn footprint(offset: i64) -> AccessFootprint {
+        AccessFootprint {
+            address: SymbolicAddress {
+                origin: 0,
+                offset: OffsetExpr::Const(offset),
+            },
+            width: WidthExpr::Const(1),
+            location: Location {
+                block: BasicBlock::from_u32(0),
+                statement_index: 0,
+            },
+            call_chain: vec![],
+        }
+    }
+
+    #[test]
+    fn replayed_effect_dedupes_within_budget() {
+        let write_count = ACCESS_SUMMARY_BUDGET * 3 / 10;
+        let writes = AccessEffect {
+            writes: (0..write_count).map(|i| footprint(i as i64)).collect(),
+            ..AccessEffect::empty()
+        };
+        let reads = AccessEffect {
+            reads: vec![footprint(0), footprint(1)],
+            ..AccessEffect::empty()
+        };
+
+        let mut state = AccessState::default();
+        let mut summary_reads = FxHashSet::default();
+        let mut summary_writes = FxHashSet::default();
+        let mut summary_hazards = FxHashSet::default();
+        let mut summary_invalidations = FxHashSet::default();
+
+        assert!(apply_effect(
+            &mut state,
+            &writes,
+            &mut summary_reads,
+            &mut summary_writes,
+            &mut summary_hazards,
+            &mut summary_invalidations,
+        ));
+        assert!(apply_effect(
+            &mut state,
+            &reads,
+            &mut summary_reads,
+            &mut summary_writes,
+            &mut summary_hazards,
+            &mut summary_invalidations,
+        ));
+        // A CFG revisit replays the same effect against the same prior
+        // writes: every hazard pair dedupes into the existing sets, so the
+        // summary stays within budget and must survive.
+        assert!(
+            apply_effect(
+                &mut state,
+                &reads,
+                &mut summary_reads,
+                &mut summary_writes,
+                &mut summary_hazards,
+                &mut summary_invalidations,
+            ),
+            "deduplicated re-application must not exceed the budget"
+        );
+        assert_eq!(summary_hazards.len(), 2 * write_count);
+        assert_eq!(summary_writes.len(), write_count);
+        assert_eq!(summary_reads.len(), 2);
+    }
+}
+
+#[cfg(test)]
 mod ordinary {
     use rustc_hash::FxHashSet;
     use rustc_middle::mir::{Location, START_BLOCK};
@@ -303,6 +383,53 @@ mod ordinary {
         assert_eq!(
             effect.invalidations[0].reason,
             AccessUnknownReason::SummaryBudgetExceeded
+        );
+    }
+
+    #[test]
+    fn escaped_static_access_contributes_no_parameter_addresses() {
+        let effect = analyze(
+            r#"
+            static mut TABLE: [i32; 4] = [1, 2, 3, 4];
+            pub unsafe fn target(out: *mut i32, sink: *mut *const i32) {
+                *sink = &raw const TABLE as *const i32;
+                *out = TABLE[0];
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(
+            footprint_origins(&effect.writes),
+            FxHashSet::from_iter([0, 1])
+        );
+        assert!(
+            effect.invalidations.is_empty(),
+            "the escaped static read must stay a resolved non-parameter origin: {:?}",
+            effect.invalidations
+        );
+    }
+
+    #[test]
+    fn null_initialized_pointer_resolves_to_parameter_origin() {
+        let effect = analyze(
+            r#"
+            pub unsafe fn target(p: *mut i32, flag: bool) {
+                let mut q: *mut i32 = 0 as *mut i32;
+                if flag {
+                    q = p;
+                }
+                *q = 1;
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(footprint_origins(&effect.writes), FxHashSet::from_iter([0]));
+        assert!(
+            effect.invalidations.is_empty(),
+            "null def must not make the origin unresolved: {:?}",
+            effect.invalidations
         );
     }
 
@@ -567,7 +694,7 @@ mod ordinary {
     }
 
     #[test]
-    fn dynamic_post_deref_index_invalidates_parameter_offset() {
+    fn dynamic_post_deref_index_keeps_unknown_offset_footprint() {
         let effect = analyze(
             r#"
             pub unsafe fn target(array: *const [u16; 4], index: usize) -> u16 {
@@ -577,13 +704,27 @@ mod ordinary {
             "target",
         );
 
-        assert!(effect.reads.iter().all(|read| {
-            read.address.origin != 0 || read.address.offset == OffsetExpr::Unknown
+        assert!(effect.reads.iter().any(|read| {
+            read.address.origin == 0 && read.address.offset == OffsetExpr::Unknown
         }));
-        assert!(effect.invalidations.iter().any(|invalidation| {
-            invalidation.reason == AccessUnknownReason::UnknownOffset
-                && invalidation.scope.intersects(&[0])
+        assert!(effect.invalidations.is_empty());
+    }
+
+    #[test]
+    fn unknown_offset_write_keeps_footprint_without_invalidation() {
+        let effect = analyze(
+            r#"
+            pub unsafe fn target(array: *mut [i32; 4], index: usize) {
+                (*array)[index] = 1;
+            }
+            "#,
+            "target",
+        );
+
+        assert!(effect.writes.iter().any(|write| {
+            write.address.origin == 0 && write.address.offset == OffsetExpr::Unknown
         }));
+        assert!(effect.invalidations.is_empty());
     }
 
     #[test]
@@ -707,6 +848,37 @@ mod interprocedural {
         assert_eq!(effect.writes.len(), 1);
         assert_eq!(effect.writes[0].address.origin, 0);
         assert!(effect.invalidations.is_empty());
+    }
+
+    #[test]
+    fn escaped_static_call_argument_substitutes_without_invalidation() {
+        let effect = analyze(
+            r#"
+            static mut PADDING: [i32; 4] = [0; 4];
+
+            unsafe fn helper(dst: *mut i32, src: *const i32) {
+                *dst = *src;
+            }
+
+            pub unsafe fn target(out: *mut i32) {
+                helper(out, PADDING.as_ptr());
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].address.origin, 0);
+        assert!(
+            effect.reads.is_empty(),
+            "reads through the static touch no caller parameter: {:?}",
+            effect.reads
+        );
+        assert!(
+            effect.invalidations.is_empty(),
+            "the static actual must not invalidate the call: {:?}",
+            effect.invalidations
+        );
     }
 
     #[test]
@@ -1504,7 +1676,7 @@ mod interprocedural {
     }
 
     #[test]
-    fn loaded_foreign_copy_count_still_invalidates_both_origins() {
+    fn loaded_foreign_copy_count_keeps_unknown_width_footprints() {
         let effect = analyze(
             r#"
             unsafe extern "C" {
@@ -1526,15 +1698,23 @@ mod interprocedural {
             "target",
         );
 
-        assert!(effect.writes.is_empty());
-        assert!(effect.invalidations.iter().any(|invalidation| {
-            invalidation.reason == AccessUnknownReason::UnknownWidth
-                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0, 1]))
-        }));
+        assert!(
+            effect
+                .reads
+                .iter()
+                .any(|read| read.address.origin == 1 && read.width == WidthExpr::Unknown)
+        );
+        assert!(
+            effect
+                .writes
+                .iter()
+                .any(|write| write.address.origin == 0 && write.width == WidthExpr::Unknown)
+        );
+        assert!(effect.invalidations.is_empty());
     }
 
     #[test]
-    fn two_parameter_foreign_copy_count_invalidates_both_origins() {
+    fn two_parameter_foreign_copy_count_keeps_unknown_width_footprints() {
         let effect = analyze(
             r#"
             unsafe extern "C" {
@@ -1557,15 +1737,23 @@ mod interprocedural {
             "target",
         );
 
-        assert!(effect.writes.is_empty());
-        assert!(effect.invalidations.iter().any(|invalidation| {
-            invalidation.reason == AccessUnknownReason::UnknownWidth
-                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0, 1]))
-        }));
+        assert!(
+            effect
+                .reads
+                .iter()
+                .any(|read| read.address.origin == 1 && read.width == WidthExpr::Unknown)
+        );
+        assert!(
+            effect
+                .writes
+                .iter()
+                .any(|write| write.address.origin == 0 && write.width == WidthExpr::Unknown)
+        );
+        assert!(effect.invalidations.is_empty());
     }
 
     #[test]
-    fn call_result_foreign_copy_count_invalidates_both_origins() {
+    fn call_result_foreign_copy_count_keeps_unknown_width_footprints() {
         let effect = analyze(
             r#"
             unsafe extern "C" {
@@ -1587,15 +1775,23 @@ mod interprocedural {
             "target",
         );
 
-        assert!(effect.writes.is_empty());
-        assert!(effect.invalidations.iter().any(|invalidation| {
-            invalidation.reason == AccessUnknownReason::UnknownWidth
-                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0, 1]))
-        }));
+        assert!(
+            effect
+                .reads
+                .iter()
+                .any(|read| read.address.origin == 1 && read.width == WidthExpr::Unknown)
+        );
+        assert!(
+            effect
+                .writes
+                .iter()
+                .any(|write| write.address.origin == 0 && write.width == WidthExpr::Unknown)
+        );
+        assert!(effect.invalidations.is_empty());
     }
 
     #[test]
-    fn reassigned_parameter_foreign_copy_count_invalidates_both_origins() {
+    fn reassigned_parameter_foreign_copy_count_keeps_unknown_width_footprints() {
         let effect = analyze(
             r#"
             unsafe extern "C" {
@@ -1618,11 +1814,19 @@ mod interprocedural {
             "target",
         );
 
-        assert!(effect.writes.is_empty());
-        assert!(effect.invalidations.iter().any(|invalidation| {
-            invalidation.reason == AccessUnknownReason::UnknownWidth
-                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0, 1]))
-        }));
+        assert!(
+            effect
+                .reads
+                .iter()
+                .any(|read| read.address.origin == 1 && read.width == WidthExpr::Unknown)
+        );
+        assert!(
+            effect
+                .writes
+                .iter()
+                .any(|write| write.address.origin == 0 && write.width == WidthExpr::Unknown)
+        );
+        assert!(effect.invalidations.is_empty());
     }
 
     #[test]
@@ -1679,6 +1883,333 @@ mod interprocedural {
         }));
         assert!(effect.writes.is_empty());
         assert!(effect.invalidations.is_empty());
+    }
+
+    #[test]
+    fn offset_count_through_const_arith_chain_yields_const_offset() {
+        let effect = analyze(
+            r#"
+            pub unsafe fn target(out: *mut i32, src: *const i32) {
+                let low = 2i32;
+                let high = 3i32;
+                *out = *src.offset((low + high) as isize);
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].address.origin, 1);
+        assert_eq!(effect.reads[0].address.offset, OffsetExpr::Const(20));
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+    }
+
+    #[test]
+    fn foreign_memcpy_count_through_cast_chain_yields_const_width() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(destination: *mut u8, source: *const u8, count: usize) -> *mut u8;
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8) {
+                let count = 4i32;
+                let _ = memcpy(destination, source, count as usize);
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].width, WidthExpr::Const(4));
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].width, WidthExpr::Const(4));
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+    }
+
+    #[test]
+    fn foreign_memcpy_scaled_parameter_count_yields_linear_width() {
+        let effect = analyze(
+            r#"
+            unsafe extern "C" {
+                fn memcpy(destination: *mut u8, source: *const u8, count: usize) -> *mut u8;
+            }
+
+            pub unsafe fn target(destination: *mut u8, source: *const u8, blocks: usize) {
+                let scale = 16i32;
+                let _ = memcpy(destination, source, blocks.wrapping_mul(scale as usize));
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(
+            effect.reads[0].width,
+            WidthExpr::Linear {
+                param: 2,
+                scale: 16,
+                offset: 0,
+            }
+        );
+        assert_eq!(effect.writes.len(), 1);
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+    }
+
+    #[test]
+    fn non_escaping_static_read_does_not_invalidate() {
+        let effect = analyze(
+            r#"
+            static mut TABLE: [u32; 4] = [1, 2, 3, 4];
+
+            pub unsafe fn target(out: *mut u32, i: usize) {
+                *out = TABLE[i];
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.writes.len(), 1);
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+    }
+
+    #[test]
+    fn escaping_static_read_does_not_invalidate() {
+        // The leak makes the static reachable from foreign code, but the
+        // analysis assumes external callers do not feed it back into a
+        // parameter, so the read stays a resolved non-parameter origin.
+        let effect = analyze(
+            r#"
+            static mut TABLE: [u32; 4] = [1, 2, 3, 4];
+
+            unsafe extern "C" {
+                fn sink(pointer: *mut u32);
+            }
+
+            pub unsafe fn leak() {
+                sink(&raw mut TABLE as *mut u32);
+            }
+
+            pub unsafe fn target(out: *mut u32, i: usize) {
+                *out = TABLE[i];
+            }
+            "#,
+            "target",
+        );
+
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+    }
+
+    #[test]
+    fn non_escaping_static_write_does_not_invalidate() {
+        let effect = analyze(
+            r#"
+            static mut TABLE: [u32; 4] = [1, 2, 3, 4];
+
+            pub unsafe fn target(out: *mut u32, value: u32) {
+                TABLE[0] = value;
+                *out = 1;
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.writes.len(), 1);
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+    }
+
+    #[test]
+    fn raw_borrow_of_param_field_resolves_composed_offset() {
+        let effect = analyze(
+            r#"
+            #[repr(C)]
+            pub struct S {
+                pad: i32,
+                buf: [i32; 4],
+            }
+
+            unsafe fn helper(out: *mut i32, src: *const i32) {
+                *out = *src;
+            }
+
+            pub unsafe fn target(s: *mut S, out: *mut i32) {
+                helper(out, &raw const (*s).buf as *const i32);
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].address.origin, 0);
+        assert_eq!(effect.reads[0].address.offset, OffsetExpr::Const(4));
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].address.origin, 1);
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+    }
+
+    #[test]
+    fn as_ptr_of_param_field_resolves_composed_offset() {
+        let effect = analyze(
+            r#"
+            #[repr(C)]
+            pub struct S {
+                pad: i32,
+                buf: [i32; 4],
+            }
+
+            unsafe fn helper(out: *mut i32, src: *const i32) {
+                *out = *src;
+            }
+
+            pub unsafe fn target(s: *mut S, out: *mut i32) {
+                helper(out, (*s).buf.as_ptr());
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].address.origin, 0);
+        assert_eq!(effect.reads[0].address.offset, OffsetExpr::Const(4));
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].address.origin, 1);
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+    }
+
+    #[test]
+    fn vec_from_elem_and_as_ptr_calls_have_no_effect() {
+        let effect = analyze(
+            r#"
+            pub unsafe fn target(out: *mut u8, input: *const u8) {
+                let mut buf: Vec<u8> = ::std::vec::from_elem(0u8, 32);
+                ::core::ptr::copy_nonoverlapping(input, buf.as_mut_ptr(), 16);
+                *out = *buf.as_ptr();
+            }
+            "#,
+            "target",
+        );
+
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].address.origin, 1);
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].address.origin, 0);
+    }
+
+    #[test]
+    fn wrapping_arithmetic_and_size_of_have_no_effect() {
+        let effect = analyze(
+            r#"
+            pub unsafe fn target(out: *mut u32, a: u32, b: u32) {
+                let x = a.wrapping_sub(b);
+                let y = x.wrapping_rem(3);
+                let z = y.wrapping_div(2);
+                *out = z.wrapping_add(::std::mem::size_of::<u32>() as u32);
+            }
+            "#,
+            "target",
+        );
+
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].address.origin, 0);
+    }
+
+    #[test]
+    fn raw_borrow_through_local_pointer_resolves_via_recursion() {
+        let effect = analyze(
+            r#"
+            #[repr(C)]
+            pub struct S {
+                pad: i32,
+                buf: [i32; 4],
+            }
+
+            unsafe fn helper(out: *mut i32, src: *const i32) {
+                *out = *src;
+            }
+
+            pub unsafe fn target(s: *mut S, out: *mut i32) {
+                let p: *mut S = s;
+                helper(out, &raw const (*p).buf as *const i32);
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.reads.len(), 1);
+        assert_eq!(effect.reads[0].address.origin, 0);
+        assert_eq!(effect.reads[0].address.offset, OffsetExpr::Const(4));
+        assert!(
+            effect.invalidations.is_empty(),
+            "{:?}",
+            effect.invalidations
+        );
+    }
+
+    #[test]
+    fn cyclic_raw_borrows_terminate() {
+        let effect = analyze(
+            r#"
+            #[repr(C)]
+            pub struct S {
+                a: i32,
+            }
+
+            pub unsafe fn target(s: *mut S, out: *mut i32) {
+                let mut x: *mut S = s;
+                let mut y: *mut S = s;
+                x = &raw mut (*y).a as *mut S;
+                y = &raw mut (*x).a as *mut S;
+                *out = (*x).a;
+            }
+            "#,
+            "target",
+        );
+
+        assert_eq!(effect.writes.len(), 1);
+        assert_eq!(effect.writes[0].address.origin, 1);
+        assert!(!effect.invalidations.is_empty());
     }
 
     #[test]
@@ -1756,24 +2287,23 @@ mod interprocedural {
                 let middle = named("middle");
                 let leaf = named("leaf");
                 let effect = &analysis.summary(target).unwrap().effect;
-                let invalidations: Vec<_> = effect
-                    .invalidations
+                let writes: Vec<_> = effect
+                    .writes
                     .iter()
-                    .filter(|invalidation| {
-                        invalidation.reason == AccessUnknownReason::UnknownOffset
-                            && invalidation
-                                .call_chain
-                                .first()
-                                .is_some_and(|frame| frame.caller == target)
-                    })
+                    .filter(|write| write.address.offset == OffsetExpr::Unknown)
                     .collect();
 
-                assert!(!invalidations.is_empty());
-                assert!(invalidations.iter().all(|invalidation| {
-                    invalidation.call_chain.len() == 2
-                        && invalidation.call_chain[0].callee == middle
-                        && invalidation.call_chain[1].caller == middle
-                        && invalidation.call_chain[1].callee == leaf
+                assert!(!writes.is_empty());
+                assert!(writes.iter().all(|write| {
+                    write.address.origin == 0
+                        && write.call_chain.len() == 2
+                        && write.call_chain[0].caller == target
+                        && write.call_chain[0].callee == middle
+                        && write.call_chain[1].caller == middle
+                        && write.call_chain[1].callee == leaf
+                }));
+                assert!(!effect.invalidations.iter().any(|invalidation| {
+                    invalidation.reason == AccessUnknownReason::UnknownOffset
                 }));
             },
         )
@@ -2424,7 +2954,7 @@ mod interprocedural {
     }
 
     #[test]
-    fn substitution_with_unresolvable_actual_count_invalidates() {
+    fn substitution_with_unresolvable_actual_count_keeps_unknown_width_footprints() {
         let effect = analyze(
             r#"
             unsafe extern "C" {
@@ -2450,20 +2980,23 @@ mod interprocedural {
             "target",
         );
 
-        assert!(effect.reads.is_empty());
-        assert!(effect.writes.is_empty());
-        assert!(effect.invalidations.iter().any(|invalidation| {
-            invalidation.reason == AccessUnknownReason::UnknownWidth
-                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0]))
-        }));
-        assert!(effect.invalidations.iter().any(|invalidation| {
-            invalidation.reason == AccessUnknownReason::UnknownWidth
-                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([1]))
-        }));
+        assert!(
+            effect
+                .reads
+                .iter()
+                .any(|read| read.address.origin == 1 && read.width == WidthExpr::Unknown)
+        );
+        assert!(
+            effect
+                .writes
+                .iter()
+                .any(|write| write.address.origin == 0 && write.width == WidthExpr::Unknown)
+        );
+        assert!(effect.invalidations.is_empty());
     }
 
     #[test]
-    fn substitution_overflow_during_fold_invalidates() {
+    fn substitution_overflow_during_fold_keeps_unknown_width_footprints() {
         let effect = analyze(
             r#"
             unsafe extern "C" {
@@ -2485,16 +3018,19 @@ mod interprocedural {
             "target",
         );
 
-        assert!(effect.reads.is_empty());
-        assert!(effect.writes.is_empty());
-        assert!(effect.invalidations.iter().any(|invalidation| {
-            invalidation.reason == AccessUnknownReason::UnknownWidth
-                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([0]))
-        }));
-        assert!(effect.invalidations.iter().any(|invalidation| {
-            invalidation.reason == AccessUnknownReason::UnknownWidth
-                && invalidation.scope == ParamScope::Known(FxHashSet::from_iter([1]))
-        }));
+        assert!(
+            effect
+                .reads
+                .iter()
+                .any(|read| read.address.origin == 1 && read.width == WidthExpr::Unknown)
+        );
+        assert!(
+            effect
+                .writes
+                .iter()
+                .any(|write| write.address.origin == 0 && write.width == WidthExpr::Unknown)
+        );
+        assert!(effect.invalidations.is_empty());
     }
 }
 

@@ -131,19 +131,6 @@ impl AccessOrderAnalysis<'_, '_> {
                     frame,
                 );
             }
-            if resolved.unknown_offset
-                || addresses
-                    .iter()
-                    .any(|address| address.offset == Offset::Unknown)
-            {
-                push_substitution_invalidation(
-                    &mut substitution_invalidations,
-                    formal,
-                    AccessUnknownReason::UnknownOffset,
-                    location,
-                    frame,
-                );
-            }
             actual_args.insert(formal, addresses);
         }
 
@@ -187,18 +174,24 @@ impl CallSiteAccess<'_> {
                 push_reason(&mut reasons, AccessUnknownReason::UnresolvedOrigin);
                 continue;
             }
-            let (WidthExpr::Const(write_width), WidthExpr::Const(read_width)) =
-                (hazard.write.width, hazard.read.width)
-            else {
-                push_reason(&mut reasons, AccessUnknownReason::UnresolvedSymbolicWidth);
-                continue;
-            };
-
             for write_actual in write_actuals {
                 for read_actual in read_actuals {
                     if write_actual.base != read_actual.base {
                         continue;
                     }
+                    let (WidthExpr::Const(write_width), WidthExpr::Const(read_width)) =
+                        (hazard.write.width, hazard.read.width)
+                    else {
+                        let reason = if hazard.write.width == WidthExpr::Unknown
+                            || hazard.read.width == WidthExpr::Unknown
+                        {
+                            AccessUnknownReason::UnknownWidth
+                        } else {
+                            AccessUnknownReason::UnresolvedSymbolicWidth
+                        };
+                        push_reason(&mut reasons, reason);
+                        continue;
+                    };
                     let write_offset =
                         match compose_offset(write_actual.offset, &hazard.write.address.offset) {
                             Ok(offset) => offset,
@@ -561,6 +554,9 @@ fn compare_base(left: &BaseId, right: &BaseId) -> Ordering {
                     location: right_location,
                 },
             ) => compare_location(*left_location, *right_location),
+            (BaseId::Static { def_id: left }, BaseId::Static { def_id: right }) => {
+                (left.krate, left.index).cmp(&(right.krate, right.index))
+            }
             (
                 BaseId::Unknown {
                     location: left_location,
@@ -586,7 +582,8 @@ fn base_rank(base: &BaseId) -> u8 {
         BaseId::HeapAlloc { .. } => 5,
         BaseId::OpaqueReturn { .. } => 6,
         BaseId::IntToPtr { .. } => 7,
-        BaseId::Unknown { .. } => 8,
+        BaseId::Static { .. } => 8,
+        BaseId::Unknown { .. } => 9,
     }
 }
 

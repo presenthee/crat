@@ -21,8 +21,14 @@ use super::{
 };
 use crate::{
     analyses::{
+        const_eval::{Ctx, EvalCx, MAX_EVAL_DEPTH, collect_defs},
         mir::CallGraphPostOrder,
-        pointer_flow::{PointerFlowResult, builtin::is_pointer_arithmetic},
+        pointer_flow::{
+            PointerFlowResult,
+            builtin::{
+                is_as_ptr, is_pointer_arithmetic, is_size_of, is_vec_as_ptr, is_vec_from_elem,
+            },
+        },
     },
     utils::rustc::RustProgram,
 };
@@ -177,6 +183,15 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
             return AccessEffect::empty();
         }
         if is_integer_wrapping_arithmetic(self.tcx, callee) {
+            return AccessEffect::empty();
+        }
+        // Pure pointer/length extraction and fresh allocation: none of these
+        // read or write memory reachable from the caller's parameters.
+        if is_as_ptr(self.tcx, callee, &path)
+            || is_vec_as_ptr(self.tcx, callee, &path)
+            || is_vec_from_elem(self.tcx, callee, &path)
+            || is_size_of(self.tcx, callee, &path)
+        {
             return AccessEffect::empty();
         }
         if let Some(effect) =
@@ -463,15 +478,8 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
             }
             "memcmp" => {
                 let [left, right, count] = exact_args::<3>(args)?;
-                let Some(width) = count_width(self.tcx, caller, body, count) else {
-                    return Some(self.unknown_width_effect(
-                        caller,
-                        body,
-                        flow,
-                        [left, right],
-                        location,
-                    ));
-                };
+                let width =
+                    count_width(self.tcx, caller, body, count).unwrap_or(WidthExpr::Unknown);
                 if raw_pointer_pointee(left.ty(body, self.tcx)).is_none()
                     || raw_pointer_pointee(right.ty(body, self.tcx)).is_none()
                 {
@@ -515,22 +523,20 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         element_ty: Ty<'tcx>,
         location: Location,
     ) -> AccessEffect {
-        let Some(element_size) = self.type_size(caller, element_ty) else {
-            return self.unknown_width_effect(caller, body, flow, [source, destination], location);
-        };
-        let Some(count) = constant_usize(count, self.tcx) else {
-            return self.unknown_width_effect(caller, body, flow, [source, destination], location);
-        };
-        let Some(width) = element_size.checked_mul(count) else {
-            return self.unknown_width_effect(caller, body, flow, [source, destination], location);
-        };
+        let width = self
+            .type_size(caller, element_ty)
+            .and_then(|element_size| {
+                let count = constant_usize(count, self.tcx)?;
+                element_size.checked_mul(count)
+            })
+            .map_or(WidthExpr::Unknown, WidthExpr::Const);
 
         self.pointer_access_effect(
             caller,
             body,
             flow,
             source,
-            WidthExpr::Const(width),
+            width,
             AccessKind::Read,
             location,
         )
@@ -539,7 +545,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
             body,
             flow,
             destination,
-            WidthExpr::Const(width),
+            width,
             AccessKind::Write,
             location,
         ))
@@ -556,9 +562,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         count: &Operand<'tcx>,
         location: Location,
     ) -> AccessEffect {
-        let Some(width) = count_width(self.tcx, caller, body, count) else {
-            return self.unknown_width_effect(caller, body, flow, [source, destination], location);
-        };
+        let width = count_width(self.tcx, caller, body, count).unwrap_or(WidthExpr::Unknown);
         if raw_pointer_pointee(source.ty(body, self.tcx)).is_none()
             || mutable_raw_pointer_pointee(destination.ty(body, self.tcx)).is_none()
         {
@@ -597,24 +601,14 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         kind: AccessKind,
         location: Location,
     ) -> AccessEffect {
-        let Some(element_size) = self.type_size(caller, element_ty) else {
-            return self.unknown_width_effect(caller, body, flow, [pointer], location);
-        };
-        let Some(count) = constant_usize(count, self.tcx) else {
-            return self.unknown_width_effect(caller, body, flow, [pointer], location);
-        };
-        let Some(width) = element_size.checked_mul(count) else {
-            return self.unknown_width_effect(caller, body, flow, [pointer], location);
-        };
-        self.pointer_access_effect(
-            caller,
-            body,
-            flow,
-            pointer,
-            WidthExpr::Const(width),
-            kind,
-            location,
-        )
+        let width = self
+            .type_size(caller, element_ty)
+            .and_then(|element_size| {
+                let count = constant_usize(count, self.tcx)?;
+                element_size.checked_mul(count)
+            })
+            .map_or(WidthExpr::Unknown, WidthExpr::Const);
+        self.pointer_access_effect(caller, body, flow, pointer, width, kind, location)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -628,9 +622,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         kind: AccessKind,
         location: Location,
     ) -> AccessEffect {
-        let Some(width) = count_width(self.tcx, caller, body, count) else {
-            return self.unknown_width_effect(caller, body, flow, [pointer], location);
-        };
+        let width = count_width(self.tcx, caller, body, count).unwrap_or(WidthExpr::Unknown);
         if raw_pointer_pointee(pointer.ty(body, self.tcx)).is_none() {
             return self.invalid_builtin_signature(caller, body, flow, &[], location);
         }
@@ -648,18 +640,10 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         kind: AccessKind,
         location: Location,
     ) -> AccessEffect {
-        let Some(width) = self.type_size(caller, pointee) else {
-            return self.unknown_width_effect(caller, body, flow, [pointer], location);
-        };
-        self.pointer_access_effect(
-            caller,
-            body,
-            flow,
-            pointer,
-            WidthExpr::Const(width),
-            kind,
-            location,
-        )
+        let width = self
+            .type_size(caller, pointee)
+            .map_or(WidthExpr::Unknown, WidthExpr::Const);
+        self.pointer_access_effect(caller, body, flow, pointer, width, kind, location)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -675,34 +659,6 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
     ) -> AccessEffect {
         let origins = resolve_pointer_operand(self.tcx, caller, body, flow, pointer);
         effect_for_resolved_origins(origins, width, kind, location)
-    }
-
-    fn unknown_width_effect<'op>(
-        &self,
-        caller: LocalDefId,
-        body: &Body<'tcx>,
-        flow: &PointerFlowResult,
-        pointers: impl IntoIterator<Item = &'op Operand<'tcx>>,
-        location: Location,
-    ) -> AccessEffect
-    where
-        'tcx: 'op,
-    {
-        match self.head_pointer_scope(caller, body, flow, pointers) {
-            ReachableScope::Known(scope) => invalidation_effect(
-                ParamScope::Known(scope),
-                AccessUnknownReason::UnknownWidth,
-                location,
-                vec![],
-            ),
-            ReachableScope::Unbounded => invalidation_effect(
-                ParamScope::All,
-                AccessUnknownReason::UnknownWidth,
-                location,
-                vec![],
-            ),
-            ReachableScope::Disjoint => AccessEffect::empty(),
-        }
     }
 
     fn invalid_builtin_signature(
@@ -762,32 +718,6 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
         let mut unresolved = false;
         for operand in operands {
             let origins = resolve_call_operand(self.tcx, caller, body, flow, operand);
-            scope.extend(origins.addresses.into_iter().map(|address| address.origin));
-            unresolved |= origins.unresolved;
-        }
-        if unresolved {
-            ReachableScope::Unbounded
-        } else if scope.is_empty() {
-            ReachableScope::Disjoint
-        } else {
-            ReachableScope::Known(scope)
-        }
-    }
-
-    fn head_pointer_scope<'op>(
-        &self,
-        caller: LocalDefId,
-        body: &Body<'tcx>,
-        flow: &PointerFlowResult,
-        operands: impl IntoIterator<Item = &'op Operand<'tcx>>,
-    ) -> ReachableScope
-    where
-        'tcx: 'op,
-    {
-        let mut scope = FxHashSet::default();
-        let mut unresolved = false;
-        for operand in operands {
-            let origins = resolve_pointer_operand(self.tcx, caller, body, flow, operand);
             scope.extend(origins.addresses.into_iter().map(|address| address.origin));
             unresolved |= origins.unresolved;
         }
@@ -871,6 +801,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
                         offset: composed_offset,
                     })
                 }
+                WidthExpr::Unknown => Some(WidthExpr::Unknown),
             }
         };
 
@@ -879,21 +810,21 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
             ..AccessEffect::empty()
         };
         for read in &callee_effect.reads {
-            let width = substitute_width(read.width);
+            let width = substitute_width(read.width).unwrap_or(WidthExpr::Unknown);
             let (reads, invalidations) =
                 substitute_footprint(read, width, resolve(read.address.origin), frame, location);
             result.reads.extend(reads);
             result.invalidations.extend(invalidations);
         }
         for write in &callee_effect.writes {
-            let width = substitute_width(write.width);
+            let width = substitute_width(write.width).unwrap_or(WidthExpr::Unknown);
             let (writes, invalidations) =
                 substitute_footprint(write, width, resolve(write.address.origin), frame, location);
             result.writes.extend(writes);
             result.invalidations.extend(invalidations);
         }
         for hazard in &callee_effect.hazards {
-            let write_width = substitute_width(hazard.write.width);
+            let write_width = substitute_width(hazard.write.width).unwrap_or(WidthExpr::Unknown);
             let (writes, write_invalidations) = substitute_footprint(
                 &hazard.write,
                 write_width,
@@ -901,7 +832,7 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
                 frame,
                 location,
             );
-            let read_width = substitute_width(hazard.read.width);
+            let read_width = substitute_width(hazard.read.width).unwrap_or(WidthExpr::Unknown);
             let (reads, read_invalidations) = substitute_footprint(
                 &hazard.read,
                 read_width,
@@ -989,7 +920,7 @@ fn is_integer_wrapping_arithmetic(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     matches!(tcx.crate_name(def_id.krate).as_str(), "core" | "std")
         && matches!(
             tcx.item_name(def_id).as_str(),
-            "wrapping_mul" | "wrapping_add"
+            "wrapping_mul" | "wrapping_add" | "wrapping_sub" | "wrapping_rem" | "wrapping_div"
         )
 }
 
@@ -1304,6 +1235,9 @@ fn resolve_count_operand<'tcx>(
     if let Some(value) = unsigned_constant(operand) {
         return Some(WidthExpr::Const(value));
     }
+    if let Some(value) = const_eval_count(tcx, def_id, body, operand) {
+        return Some(WidthExpr::Const(value));
+    }
     let place = match operand {
         Operand::Copy(place) | Operand::Move(place) => place,
         Operand::Constant(_) => return None,
@@ -1383,6 +1317,34 @@ fn resolve_count_operand<'tcx>(
     result
 }
 
+/// Folds a count operand to a constant through single-def chains: debug MIR
+/// routes casts and checked arithmetic through intermediate locals and
+/// overflow tuples that the structural walk in `resolve_count_operand`
+/// cannot always follow.
+fn const_eval_count<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    body: &Body<'tcx>,
+    operand: &Operand<'tcx>,
+) -> Option<u64> {
+    let defs = collect_defs(body);
+    let ctx = Ctx::new();
+    let eval = EvalCx {
+        tcx,
+        body,
+        defs: &defs,
+        ctx: &ctx,
+        typing_env: ty::TypingEnv::post_analysis(tcx, def_id),
+    };
+    let v = eval.operand(operand, MAX_EVAL_DEPTH)?;
+    let size = eval.int_size(v.ty)?;
+    match v.ty.kind() {
+        ty::TyKind::Int(_) => u64::try_from(size.sign_extend(v.bits)).ok(),
+        ty::TyKind::Uint(_) => u64::try_from(v.bits).ok(),
+        _ => None,
+    }
+}
+
 fn combine_widths(op: BinOp, left: WidthExpr, right: WidthExpr) -> Option<WidthExpr> {
     match (op, left, right) {
         (BinOp::Add, WidthExpr::Const(left), WidthExpr::Const(right)) => {
@@ -1457,46 +1419,17 @@ fn unsigned_constant<'tcx>(operand: &Operand<'tcx>) -> Option<u64> {
 
 fn substitute_footprint(
     footprint: &AccessFootprint,
-    width: Option<WidthExpr>,
+    width: WidthExpr,
     origins: ResolvedPointerOrigins,
     frame: CallFrame,
     call_location: Location,
 ) -> (Vec<AccessFootprint>, Vec<Invalidation>) {
     let mut footprints = vec![];
     let mut invalidations = vec![];
-    let mut unknown_offset = origins.unknown_offset;
-    let caller_scope: FxHashSet<_> = origins
-        .addresses
-        .iter()
-        .map(|address| address.origin)
-        .collect();
     let mut invalidation_call_chain = footprint.call_chain.clone();
     invalidation_call_chain.insert(0, frame);
-    let Some(width) = width else {
-        // The callee width is linear in a parameter whose actual could not be
-        // folded in this caller: keep no footprint and conservatively
-        // invalidate every caller parameter the pointer may reach.
-        if !caller_scope.is_empty() {
-            invalidations.push(Invalidation {
-                scope: ParamScope::Known(caller_scope),
-                reason: AccessUnknownReason::UnknownWidth,
-                location: call_location,
-                call_chain: invalidation_call_chain.clone(),
-            });
-        }
-        if origins.unresolved {
-            invalidations.push(Invalidation {
-                scope: ParamScope::All,
-                reason: AccessUnknownReason::UnresolvedOrigin,
-                location: call_location,
-                call_chain: invalidation_call_chain,
-            });
-        }
-        return (footprints, invalidations);
-    };
     for address in origins.addresses {
         let offset = compose_offsets(address.offset, footprint.address.offset.clone());
-        unknown_offset |= matches!(offset, OffsetExpr::Unknown);
         let mut call_chain = footprint.call_chain.clone();
         call_chain.insert(0, frame);
         footprints.push(AccessFootprint {
@@ -1507,14 +1440,6 @@ fn substitute_footprint(
             width,
             location: footprint.location,
             call_chain,
-        });
-    }
-    if unknown_offset && !caller_scope.is_empty() {
-        invalidations.push(Invalidation {
-            scope: ParamScope::Known(caller_scope),
-            reason: AccessUnknownReason::UnknownOffset,
-            location: call_location,
-            call_chain: invalidation_call_chain.clone(),
         });
     }
     if origins.unresolved {

@@ -172,7 +172,7 @@ fn enqueue_state(
     }
 }
 
-fn apply_effect(
+pub(crate) fn apply_effect(
     state: &mut AccessState,
     effect: &AccessEffect,
     summary_reads: &mut FxHashSet<AccessFootprint>,
@@ -180,27 +180,25 @@ fn apply_effect(
     summary_hazards: &mut FxHashSet<PotentialHazard>,
     summary_invalidations: &mut FxHashSet<Invalidation>,
 ) -> bool {
-    let projected = summary_reads.len()
-        + summary_writes.len()
-        + summary_hazards.len()
-        + summary_invalidations.len()
-        + effect.element_count()
-        + state.prior_writes.len() * effect.reads.len();
-    if projected > ACCESS_SUMMARY_BUDGET {
-        return false;
-    }
+    // The budget is enforced on the actual (deduplicated) set sizes rather
+    // than a projected worst-case product: hazard pairs replayed on CFG
+    // revisits collapse into the existing sets. Bailing out mid-extension is
+    // fine — the caller discards the whole summary when this returns false.
     summary_reads.extend(effect.reads.iter().cloned());
     summary_writes.extend(effect.writes.iter().cloned());
     state.hazards.extend(effect.hazards.iter().cloned());
-    state
-        .hazards
-        .extend(state.prior_writes.iter().flat_map(|write| {
-            effect.reads.iter().map(|read| PotentialHazard {
+    for write in &state.prior_writes {
+        for read in &effect.reads {
+            state.hazards.insert(PotentialHazard {
                 write: write.clone(),
                 read: read.clone(),
                 order: HazardOrder::Sequential,
-            })
-        }));
+            });
+        }
+        if state.hazards.len() > ACCESS_SUMMARY_BUDGET {
+            return false;
+        }
+    }
     state.prior_writes.extend(effect.writes.iter().cloned());
     state
         .invalidations
@@ -208,7 +206,8 @@ fn apply_effect(
 
     summary_hazards.extend(state.hazards.iter().cloned());
     summary_invalidations.extend(state.invalidations.iter().cloned());
-    true
+    summary_reads.len() + summary_writes.len() + summary_hazards.len() + summary_invalidations.len()
+        <= ACCESS_SUMMARY_BUDGET
 }
 
 fn join_state(target: &mut AccessState, incoming: &AccessState) -> bool {
