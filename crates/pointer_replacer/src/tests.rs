@@ -12014,3 +12014,167 @@ pub unsafe fn driver() {
     assert!(!changed);
     assert!(!s.contains("__crat_snap"), "no snapshot expected in:\n{s}");
 }
+
+const RUNTIME_SNAPSHOT_FMA: &str = r#"
+pub unsafe fn fma_array(
+    out: *mut i32,
+    mul1: *const i32,
+    mul2: *const i32,
+    add: *const i32,
+    len: i32,
+) {
+    let mut i = 0i32;
+    while i < len {
+        *out.offset(i as isize) = *mul1.offset(i as isize)
+            * *mul2.offset(i as isize)
+            + *add.offset(i as isize);
+        i += 1;
+    }
+}
+pub unsafe fn driver(out: *mut i32, len: i32) {
+    fma_array(out, out, out, out, len);
+}
+pub unsafe fn root(len: i32) {
+    let mut values = [0i32; 16];
+    driver(values.as_mut_ptr(), len);
+}
+"#;
+
+#[test]
+fn snapshot_runtime_prefix_captures_once_and_emits_three_vecs() {
+    // Assumes CRAT_SNAPSHOT_VALIDATE is unset; hold the lock so a
+    // concurrently running SnapshotValidateEnv user can't flip it mid-test.
+    let _guard = SNAPSHOT_VALIDATE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (rewritten, changed) =
+        rewrite_aliasing_with_config(RUNTIME_SNAPSHOT_FMA, &Config::default());
+    assert!(changed);
+    assert_eq!(
+        rewritten.matches("let __crat_snap_len_").count(),
+        1,
+        "{rewritten}"
+    );
+    assert_eq!(rewritten.matches("Vec<i32>").count(), 3, "{rewritten}");
+    assert_eq!(rewritten.matches(".to_vec()").count(), 3, "{rewritten}");
+    assert_eq!(
+        rewritten.matches("if __crat_snap_len_0 > 0").count(),
+        3,
+        "{rewritten}"
+    );
+    assert_eq!(
+        rewritten.matches("__crat_snap_len_0 as usize").count(),
+        3,
+        "{rewritten}",
+    );
+    let compact: String = rewritten.split_whitespace().collect();
+    assert!(compact.contains(
+        "fma_array(out,__crat_snap_1.as_ptr(),__crat_snap_2.as_ptr(),__crat_snap_3.as_ptr(),__crat_snap_len_0);"
+    ), "{rewritten}");
+    ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+}
+
+#[test]
+fn snapshot_runtime_prefix_rejects_any_non_plain_call_argument() {
+    let code = RUNTIME_SNAPSHOT_FMA.replace(
+        "fma_array(out, out, out, out, len);",
+        "fma_array(out, out.offset(0), out, out, len);",
+    );
+    let (rewritten, changed) = rewrite_aliasing_with_config(&code, &Config::default());
+    assert!(!changed);
+    assert!(!rewritten.contains("__crat_snap"), "{rewritten}");
+}
+
+#[test]
+fn snapshot_runtime_prefix_rejects_non_parameter_length_path() {
+    let code = RUNTIME_SNAPSHOT_FMA.replace(
+        "fma_array(out, out, out, out, len);",
+        "let count = len; fma_array(out, out, out, out, count);",
+    );
+    let (rewritten, changed) = rewrite_aliasing_with_config(&code, &Config::default());
+    assert!(!changed);
+    assert!(!rewritten.contains("__crat_snap"), "{rewritten}");
+}
+
+#[test]
+fn snapshot_runtime_prefix_accepts_parenthesized_plain_arguments() {
+    let code = RUNTIME_SNAPSHOT_FMA.replace(
+        "fma_array(out, out, out, out, len);",
+        "fma_array((out), (out), (out), (out), (len));",
+    );
+    let (rewritten, changed) = rewrite_aliasing_with_config(&code, &Config::default());
+    assert!(changed);
+    assert_eq!(rewritten.matches("Vec<i32>").count(), 3, "{rewritten}");
+    ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+}
+
+#[test]
+fn snapshot_runtime_prefix_in_safe_fn_wraps_raw_read() {
+    let code = RUNTIME_SNAPSHOT_FMA.replace(
+        "pub unsafe fn driver(out: *mut i32, len: i32) {\n    fma_array(out, out, out, out, len);\n}",
+        "pub fn driver(out: *mut i32, len: i32) { unsafe { fma_array(out, out, out, out, len); } }",
+    );
+    let (rewritten, changed) = rewrite_aliasing_with_config(&code, &Config::default());
+    assert!(changed);
+    let compact: String = rewritten.split_whitespace().collect();
+    assert!(
+        compact.contains("unsafe{std::slice::from_raw_parts"),
+        "{rewritten}"
+    );
+    ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+}
+
+// `rewrite_aliasing` reads `CRAT_SNAPSHOT_VALIDATE` from the process
+// environment, which every test in this binary shares. Any test that
+// depends on the variable's value (set or unset) must hold this lock for
+// the duration of its rewrite, or it can race with a concurrently running
+// test that flips the variable out from under it.
+static SNAPSHOT_VALIDATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct SnapshotValidateEnv<'a> {
+    previous: Option<std::ffi::OsString>,
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl SnapshotValidateEnv<'_> {
+    fn enable() -> Self {
+        let guard = SNAPSHOT_VALIDATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("CRAT_SNAPSHOT_VALIDATE");
+        unsafe { std::env::set_var("CRAT_SNAPSHOT_VALIDATE", "1") };
+        Self {
+            previous,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for SnapshotValidateEnv<'_> {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var("CRAT_SNAPSHOT_VALIDATE", value) },
+            None => unsafe { std::env::remove_var("CRAT_SNAPSHOT_VALIDATE") },
+        }
+    }
+}
+
+#[test]
+fn snapshot_runtime_prefix_validation_uses_captured_length() {
+    let _env = SnapshotValidateEnv::enable();
+    let (rewritten, changed) =
+        rewrite_aliasing_with_config(RUNTIME_SNAPSHOT_FMA, &Config::default());
+    assert!(changed);
+    assert_eq!(
+        rewritten.matches("debug_assert_eq!").count(),
+        3,
+        "{rewritten}"
+    );
+    assert_eq!(
+        rewritten.matches("__crat_snap_len_0 as usize").count(),
+        6,
+        "three initializers plus three validation reads: {rewritten}",
+    );
+    assert!(!rewritten.contains("len as usize"), "{rewritten}");
+    ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+}
