@@ -25,6 +25,7 @@ use rustc_middle::{
     mir::{Body, CastKind, Const, Local, Location, Operand, Rvalue, StatementKind, TerminatorKind},
     ty::{self, Ty, TyCtxt, adjustment::PointerCoercion},
 };
+use rustc_span::source_map::Spanned;
 
 use crate::{
     analyses::{
@@ -326,6 +327,10 @@ pub enum CopyPlan {
         base_local: Local,
         len: u64,
     },
+    /// Copy `count(len)` elements of the immutable argument's pointee type
+    /// into a fresh Vec. `len_param` is both the callee parameter that
+    /// controls the extent and its argument position at this call.
+    RuntimePrefix { arg_index: usize, len_param: usize },
 }
 
 /// Applies the per-site gates and plans the copies. Detection already
@@ -382,8 +387,12 @@ pub fn gate_candidates<'tcx>(
         };
         let ctx = call_context(tcx, candidate.caller, candidate.location);
         let typing_env = ty::TypingEnv::post_analysis(tcx, candidate.caller);
+        let callee_body = tcx
+            .mir_drops_elaborated_and_const_checked(candidate.callee)
+            .borrow();
 
         let mut copies = vec![];
+        let mut runtime_len_param: Option<usize> = None;
         for &imm in &candidate.imm_params {
             let Some(arg) = args.get(imm) else {
                 continue 'candidates;
@@ -392,14 +401,14 @@ pub fn gate_candidates<'tcx>(
             let ty::TyKind::RawPtr(pointee, _) = arg_ty.kind() else {
                 continue 'candidates;
             };
+            let elem_size = tcx
+                .layout_of(typing_env.as_query_input(*pointee))
+                .ok()
+                .map(|l| l.size.bytes());
             // Exact prefix first: it copies the fewest bytes and needs no
             // knowledge of the base.
             let extent = extents.extent(candidate.callee, imm, &ctx);
             if let Extent::Const(bytes) = extent {
-                let elem_size = tcx
-                    .layout_of(typing_env.as_query_input(*pointee))
-                    .ok()
-                    .map(|l| l.size.bytes());
                 if let Some(size) = elem_size
                     && size > 0
                     && bytes % size == 0
@@ -428,6 +437,30 @@ pub fn gate_candidates<'tcx>(
                 });
                 continue;
             }
+            // Runtime-prefix last resort: the extent must be a direct,
+            // stable runtime parameter, the pointee must be `Copy` with
+            // nonzero size, and the call's length argument at that
+            // parameter position must be the caller's own unprojected
+            // integer parameter of the same type.
+            if let Extent::RuntimeParam { param } = extent
+                && elem_size.is_some_and(|size| size > 0)
+                && tcx.type_is_copy_modulo_regions(typing_env, *pointee)
+                && direct_caller_parameter(&body, &callee_body, args, param).is_some()
+            {
+                if runtime_len_param.is_some_and(|existing| existing != param) {
+                    gate_skip(
+                        &candidate,
+                        "runtime copy plans use different length parameters",
+                    );
+                    continue 'candidates;
+                }
+                runtime_len_param = Some(param);
+                copies.push(CopyPlan::RuntimePrefix {
+                    arg_index: imm,
+                    len_param: param,
+                });
+                continue;
+            }
             gate_skip(
                 &candidate,
                 &format!(
@@ -440,6 +473,109 @@ pub fn gate_candidates<'tcx>(
         gated.push(GatedCandidate { candidate, copies });
     }
     gated
+}
+
+/// Bounds the walk in `skip_anonymous_copies` so a pathological chain (or a
+/// same-local cycle) cannot loop forever.
+const MAX_ANONYMOUS_COPY_DEPTH: usize = 32;
+
+/// Walks back through anonymous (no source name) unprojected `Rvalue::Use`
+/// copies — the compiler's own call-argument temporaries — to the local they
+/// ultimately copy. A named local (one with `var_debug_info`, e.g. from a
+/// user `let`) is returned as-is without walking through it, so a caller
+/// local stays a caller local rather than resolving further back.
+///
+/// Walking through a local requires it to have exactly one definition in the
+/// whole body, and that definition must be an unprojected `Rvalue::Use`
+/// assignment. A local written more than once (e.g. a compiler-inserted join
+/// temp fed by two branches of an `if`) or written by anything other than a
+/// plain `Use` assignment (e.g. a call destination) is control-flow-sensitive
+/// or otherwise not a transparent pass-through, so the walk stops and
+/// returns it as-is; the caller then rejects it, since a branch-merged or
+/// call-produced value is not a direct caller parameter.
+fn skip_anonymous_copies<'tcx>(body: &Body<'tcx>, mut local: Local) -> Local {
+    let has_debug_name = |local: Local| {
+        body.var_debug_info.iter().any(|info| {
+            matches!(&info.value, rustc_middle::mir::VarDebugInfoContents::Place(place)
+                if place.local == local && place.projection.is_empty())
+        })
+    };
+    let definitions_of = |local: Local| {
+        let mut sources = vec![];
+        let mut other_definitions = false;
+        for block in body.basic_blocks.iter() {
+            for statement in &block.statements {
+                match &statement.kind {
+                    StatementKind::Assign(box (place, Rvalue::Use(operand)))
+                        if place.as_local() == Some(local) =>
+                    {
+                        match operand {
+                            Operand::Copy(source) | Operand::Move(source)
+                                if source.projection.is_empty() =>
+                            {
+                                sources.push(source.local);
+                            }
+                            _ => other_definitions = true,
+                        }
+                    }
+                    StatementKind::Assign(box (place, _)) if place.as_local() == Some(local) => {
+                        other_definitions = true;
+                    }
+                    _ => {}
+                }
+            }
+            if let TerminatorKind::Call { destination, .. } = &block.terminator().kind
+                && destination.as_local() == Some(local)
+            {
+                other_definitions = true;
+            }
+        }
+        (sources, other_definitions)
+    };
+    for _ in 0..MAX_ANONYMOUS_COPY_DEPTH {
+        if has_debug_name(local) {
+            return local;
+        }
+        let (sources, other_definitions) = definitions_of(local);
+        if other_definitions || sources.len() != 1 {
+            return local;
+        }
+        let source = sources[0];
+        if source == local {
+            return local;
+        }
+        local = source;
+    }
+    local
+}
+
+/// Whether call argument `param` is an unprojected caller parameter of the
+/// same integer type as callee parameter `param`, suitable as the runtime
+/// length for `CopyPlan::RuntimePrefix`. Compiler-inserted call-argument
+/// temporaries are transparent; a named local (a user-written `let`) is not
+/// resolved further and fails the runtime plan.
+fn direct_caller_parameter<'tcx>(
+    caller_body: &Body<'tcx>,
+    callee_body: &Body<'tcx>,
+    args: &[Spanned<Operand<'tcx>>],
+    param: usize,
+) -> Option<Local> {
+    let argument = args.get(param)?;
+    let (Operand::Copy(place) | Operand::Move(place)) = &argument.node else {
+        return None;
+    };
+    if !place.projection.is_empty() {
+        return None;
+    }
+    let local = skip_anonymous_copies(caller_body, place.local);
+    let index = local.as_usize();
+    if index == 0 || index > caller_body.arg_count || param >= callee_body.arg_count {
+        return None;
+    }
+    let caller_ty = caller_body.local_decls[local].ty;
+    let callee_ty = callee_body.local_decls[Local::from_usize(param + 1)].ty;
+    (matches!(caller_ty.kind(), ty::TyKind::Int(_) | ty::TyKind::Uint(_)) && caller_ty == callee_ty)
+        .then_some(local)
 }
 
 fn snapshot_skip(

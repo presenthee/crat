@@ -91,8 +91,8 @@ fn run_attribution(code: &str) -> Vec<(String, (usize, usize), Vec<String>)> {
 
 /// Runs detection, gating, and selection. Returns the gated candidates as
 /// (caller_name, callee_name, plan summaries) and the sorted names of the
-/// selected callees. Plans render as `prefix(<arg>, <elems>)` and
-/// `whole(<arg>, <len>)`.
+/// selected callees. Plans render as `prefix(<arg>, <elems>)`,
+/// `whole(<arg>, <len>)`, and `runtime(<arg>, <len_param>)`.
 #[expect(clippy::type_complexity)]
 fn run_planning(code: &str) -> (Vec<(String, String, Vec<String>)>, Vec<String>) {
     ::utils::compilation::run_compiler_on_str(code, move |tcx| {
@@ -131,6 +131,10 @@ fn run_planning(code: &str) -> (Vec<(String, String, Vec<String>)>, Vec<String>)
                             CopyPlan::WholeArray { arg_index, len, .. } => {
                                 format!("whole({arg_index}, {len})")
                             }
+                            CopyPlan::RuntimePrefix {
+                                arg_index,
+                                len_param,
+                            } => format!("runtime({arg_index}, {len_param})"),
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -848,4 +852,209 @@ fn callee_with_one_ungated_site_selects_nothing() {
         selected.is_empty(),
         "one unresolved site must block selection: {selected:#?}"
     );
+}
+
+const RUNTIME_FMA: &str = r#"
+pub unsafe fn fma_array(
+    out: *mut i32,
+    mul1: *const i32,
+    mul2: *const i32,
+    add: *const i32,
+    len: i32,
+) {
+    let mut i = 0i32;
+    while i < len {
+        *out.offset(i as isize) = *mul1.offset(i as isize)
+            * *mul2.offset(i as isize)
+            + *add.offset(i as isize);
+        i += 1;
+    }
+}
+pub unsafe fn driver(out: *mut i32, len: i32) {
+    fma_array(out, out, out, out, len);
+}
+pub unsafe fn root(len: i32) {
+    let mut values = [0i32; 16];
+    driver(values.as_mut_ptr(), len);
+}
+"#;
+
+#[test]
+fn runtime_prefix_is_selected_for_direct_caller_parameter() {
+    let (gated, selected) = run_planning(RUNTIME_FMA);
+    assert_eq!(
+        gated,
+        vec![(
+            "driver".to_string(),
+            "fma_array".to_string(),
+            vec![
+                "runtime(1, 4)".to_string(),
+                "runtime(2, 4)".to_string(),
+                "runtime(3, 4)".to_string(),
+            ],
+        )],
+    );
+    assert_eq!(selected, vec!["fma_array".to_string()]);
+}
+
+#[test]
+fn runtime_extent_still_prefers_whole_array() {
+    let code = RUNTIME_FMA.replace(
+        "pub unsafe fn driver(out: *mut i32, len: i32) {\n    fma_array(out, out, out, out, len);\n}",
+        "pub unsafe fn driver(_out: *mut i32, len: i32) { let mut values = [0i32; 16]; fma_array(values.as_mut_ptr(), values.as_ptr(), values.as_ptr(), values.as_ptr(), len); }",
+    );
+    let (gated, _) = run_planning(&code);
+    assert_eq!(
+        gated[0].2,
+        vec![
+            "whole(1, 16)".to_string(),
+            "whole(2, 16)".to_string(),
+            "whole(3, 16)".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn constant_length_keeps_exact_prefix() {
+    let code = RUNTIME_FMA.replace(
+        "fma_array(out, out, out, out, len);",
+        "fma_array(out, out, out, out, 4);",
+    );
+    let (gated, _) = run_planning(&code);
+    assert_eq!(
+        gated[0].2,
+        vec![
+            "prefix(1, 4)".to_string(),
+            "prefix(2, 4)".to_string(),
+            "prefix(3, 4)".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn runtime_length_must_be_a_direct_caller_parameter() {
+    for replacement in [
+        "let count = len; fma_array(out, out, out, out, count);",
+        "fma_array(out, out, out, out, len.wrapping_add(0));",
+    ] {
+        let code = RUNTIME_FMA.replace("fma_array(out, out, out, out, len);", replacement);
+        let (gated, selected) = run_planning(&code);
+        assert!(
+            gated.is_empty(),
+            "unexpected runtime plan for: {replacement}"
+        );
+        assert!(
+            selected.is_empty(),
+            "unexpected selected callee for: {replacement}"
+        );
+    }
+
+    let cast = RUNTIME_FMA
+        .replace(
+            "pub unsafe fn driver(out: *mut i32, len: i32)",
+            "pub unsafe fn driver(out: *mut i32, len: i64)",
+        )
+        .replace(
+            "fma_array(out, out, out, out, len);",
+            "fma_array(out, out, out, out, len as i32);",
+        )
+        .replace(
+            "pub unsafe fn root(len: i32)",
+            "pub unsafe fn root(len: i64)",
+        );
+    let (gated, selected) = run_planning(&cast);
+    assert!(gated.is_empty());
+    assert!(selected.is_empty());
+}
+
+#[test]
+fn runtime_length_from_branching_temp_is_rejected() {
+    // The length argument is an inline two-armed conditional over two
+    // different caller parameters, so the compiler lowers it to an
+    // anonymous (no `debug` entry) join temp with two definitions, one per
+    // arm. `skip_anonymous_copies` must not walk through a temp with more
+    // than one definition: doing so would silently pick whichever arm's
+    // assignment happens to appear first in block order, regardless of
+    // `flag`, and could plan a copy of the wrong length.
+    let code = RUNTIME_FMA
+        .replace(
+            "pub unsafe fn driver(out: *mut i32, len: i32) {\n    fma_array(out, out, out, out, len);\n}",
+            "pub unsafe fn driver(out: *mut i32, n: i32, m: i32, flag: i32) {\n    fma_array(out, out, out, out, if flag != 0 { n } else { m });\n}",
+        )
+        .replace(
+            "pub unsafe fn root(len: i32) {\n    let mut values = [0i32; 16];\n    driver(values.as_mut_ptr(), len);\n}",
+            "pub unsafe fn root(n: i32, m: i32, flag: i32) {\n    let mut values = [0i32; 16];\n    driver(values.as_mut_ptr(), n, m, flag);\n}",
+        );
+    let (gated, selected) = run_planning(&code);
+    assert!(gated.is_empty(), "unexpected runtime plan: {gated:#?}");
+    assert!(
+        selected.is_empty(),
+        "unexpected selected callee: {selected:#?}"
+    );
+}
+
+#[test]
+fn runtime_prefix_rejects_non_copy_pointee() {
+    let code = r#"
+#[repr(C)]
+pub struct NonCopy { value: i32 }
+pub unsafe fn callee(out: *mut NonCopy, src: *const NonCopy, n: i32) {
+    let mut i = 0i32;
+    while i < n {
+        (*out.offset(i as isize)).value = (*src.offset(i as isize)).value;
+        i += 1;
+    }
+}
+pub unsafe fn driver(base: *mut NonCopy, n: i32) { callee(base, base, n); }
+pub unsafe fn root(n: i32) {
+    let mut values = [NonCopy { value: 0 }, NonCopy { value: 0 }];
+    driver(values.as_mut_ptr(), n);
+}
+"#;
+    let (gated, selected) = run_planning(code);
+    assert!(gated.is_empty());
+    assert!(selected.is_empty());
+}
+
+#[test]
+fn runtime_prefix_rejects_zero_sized_pointee() {
+    let code = r#"
+#[derive(Clone, Copy)]
+pub struct Z;
+pub unsafe fn callee(out: *mut Z, src: *const Z, n: i32) {
+    let mut i = 0i32;
+    while i < n {
+        *out.offset(i as isize) = *src.offset(i as isize);
+        i += 1;
+    }
+}
+pub unsafe fn driver(base: *mut Z, n: i32) { callee(base, base, n); }
+pub unsafe fn root(n: i32) { let mut value = Z; driver(&mut value, n); }
+"#;
+    let (gated, selected) = run_planning(code);
+    assert!(gated.is_empty());
+    assert!(selected.is_empty());
+}
+
+#[test]
+fn runtime_prefix_rejects_two_length_parameters_at_one_site() {
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, left: *const i32, right: *const i32, a: i32, b: i32) {
+    let mut left_sum = 0i32;
+    let mut i = 0i32;
+    while i < a { left_sum = left_sum.wrapping_add(*left.offset(i as isize)); i += 1; }
+    let mut right_sum = 0i32;
+    let mut j = 0i32;
+    while j < b { right_sum = right_sum.wrapping_add(*right.offset(j as isize)); j += 1; }
+    *out = left_sum.wrapping_add(right_sum);
+}
+pub unsafe fn driver(base: *mut i32, a: i32, b: i32) { callee(base, base, base, a, b); }
+pub unsafe fn root(a: i32, b: i32) {
+    let mut values = [0i32; 16];
+    driver(values.as_mut_ptr(), a, b);
+}
+"#;
+    let (gated, selected) = run_planning(code);
+    assert!(gated.is_empty());
+    assert!(selected.is_empty());
 }

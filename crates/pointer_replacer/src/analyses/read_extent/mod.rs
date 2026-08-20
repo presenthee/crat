@@ -62,6 +62,14 @@ pub enum Extent {
     /// prefix from offset 0, on every execution that does not abort the
     /// process.
     Const(u64),
+    /// Exactly `count(v)` values of the queried raw pointer's pointee type
+    /// are read as a contiguous prefix on every complete execution, where
+    /// `v` is the entry value of integer parameter `param` (0-based), and
+    /// `count(v)` is `max(v, 0)` for signed parameters and `v` for unsigned
+    /// parameters.
+    RuntimeParam {
+        param: usize,
+    },
     Unknown,
 }
 
@@ -147,7 +155,7 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
             self.walk(def_id, param, ctx)
         };
         let result = match result {
-            Some((bytes, total)) => (Extent::Const(bytes), total),
+            Some((extent, total)) => (extent, total),
             None => (Extent::Unknown, false),
         };
         self.in_progress.remove(&(def_id, param));
@@ -155,7 +163,7 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
         result
     }
 
-    fn walk(&mut self, def_id: LocalDefId, param: usize, ctx: &Ctx) -> Option<(u64, bool)> {
+    fn walk(&mut self, def_id: LocalDefId, param: usize, ctx: &Ctx) -> Option<(Extent, bool)> {
         let tcx = self.tcx;
         if tcx.generics_of(def_id.to_def_id()).count() > 0 {
             return None;
@@ -166,12 +174,10 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
             return None;
         }
         let param_local = Local::from_usize(param + 1);
-        if !matches!(
-            body.local_decls[param_local].ty.kind(),
-            ty::TyKind::RawPtr(..)
-        ) {
+        let ty::TyKind::RawPtr(queried_pointee, _) = body.local_decls[param_local].ty.kind() else {
             return None;
-        }
+        };
+        let queried_pointee = *queried_pointee;
         let typing_env = ty::TypingEnv::post_analysis(tcx, def_id);
         let defs = collect_defs(body);
 
@@ -218,7 +224,7 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
         // would silently drop reads. Calls are only collected here; they are
         // classified after loop matching, which decides which call blocks a
         // loop consumes.
-        let mut contributions: Vec<(BasicBlock, Interval)> = vec![];
+        let mut contributions: Vec<(BasicBlock, Contribution)> = vec![];
         let mut exits: FxHashSet<BasicBlock> = FxHashSet::default();
         let mut allowed_call_blocks: FxHashSet<BasicBlock> = FxHashSet::default();
         let mut call_blocks: Vec<BasicBlock> = vec![];
@@ -284,6 +290,7 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
             &eval,
             &derived,
             param_local,
+            queried_pointee,
             param_reassigned,
             &reachable,
             &successors,
@@ -322,7 +329,7 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
             };
             let call = self.classify_call(&eval, &derived, func, args, destination)?;
             for read in call.reads {
-                contributions.push((bb, read));
+                contributions.push((bb, read.into()));
             }
             if call.mentions_allowed {
                 allowed_call_blocks.insert(bb);
@@ -356,7 +363,7 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
                 if !loads.is_empty() {
                     allowed_statements.insert((bb, i));
                     for load in loads {
-                        contributions.push((bb, load));
+                        contributions.push((bb, load.into()));
                     }
                 }
             }
@@ -394,19 +401,41 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
 
         // The union of certified reads must be a contiguous prefix starting at
         // offset 0; overlaps are fine, gaps are not. An empty footprint is not
-        // useful evidence, so it gets no answer.
-        let mut intervals = must;
-        intervals.sort_unstable();
-        let mut end = 0u64;
-        for iv in &intervals {
-            if iv.start > end {
+        // useful evidence, so it gets no answer. Runtime-parameter
+        // contributions may coexist only when they all name the same
+        // parameter, and never alongside a constant contribution: the union
+        // of a fixed byte count and a symbolic count is not expressible in
+        // this domain.
+        let mut intervals = vec![];
+        let mut runtime_param = None;
+        for contribution in must {
+            match contribution {
+                Contribution::Const(interval) => intervals.push(interval),
+                Contribution::RuntimeParam { param } => match runtime_param {
+                    Some(existing) if existing != param => return None,
+                    _ => runtime_param = Some(param),
+                },
+            }
+        }
+        let extent = if let Some(param) = runtime_param {
+            if !intervals.is_empty() {
                 return None;
             }
-            end = end.max(iv.end);
-        }
-        if end == 0 {
-            return None;
-        }
+            Extent::RuntimeParam { param }
+        } else {
+            intervals.sort_unstable();
+            let mut end = 0u64;
+            for iv in &intervals {
+                if iv.start > end {
+                    return None;
+                }
+                end = end.max(iv.end);
+            }
+            if end == 0 {
+                return None;
+            }
+            Extent::Const(end)
+        };
         // The function always comes back when its only remaining ways out
         // are plain returns; consumed in-loop calls were required to be
         // total themselves, and curated calls return or abort the process.
@@ -416,7 +445,7 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
                 TerminatorKind::Return
             )
         });
-        Some((end, total))
+        Some((extent, total))
     }
 
     /// Classifies one reachable call terminator. Returns `None` (failing the
@@ -622,6 +651,29 @@ struct Interval {
     end: u64,
 }
 
+/// One certified contribution to a function's read footprint: either a
+/// constant byte interval, as today, or a claim that the queried pointer's
+/// pointee is read `count(v)` times for runtime parameter `v`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Contribution {
+    Const(Interval),
+    RuntimeParam { param: usize },
+}
+
+impl From<Interval> for Contribution {
+    fn from(interval: Interval) -> Self {
+        Self::Const(interval)
+    }
+}
+
+/// The bound of a matched indexed loop: either a constant, as today, or a
+/// direct stable integer parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexedBound {
+    Const(u64),
+    RuntimeParam { param: usize },
+}
+
 /// What one call terminator does with the queried pointer.
 struct CallReads {
     reads: Vec<Interval>,
@@ -651,8 +703,8 @@ fn certify_contributions(
     successors: &FxHashMap<BasicBlock, Vec<BasicBlock>>,
     exits: &FxHashSet<BasicBlock>,
     idom: &FxHashMap<BasicBlock, BasicBlock>,
-    contributions: Vec<(BasicBlock, Interval)>,
-) -> Option<Vec<Interval>> {
+    contributions: Vec<(BasicBlock, Contribution)>,
+) -> Option<Vec<Contribution>> {
     // Arm blocks of branches the context did not resolve, mapped to their
     // branch block. An arm shared by two branches cannot anchor a grouping,
     // which the `None` sentinel encodes.
@@ -685,7 +737,7 @@ fn certify_contributions(
     };
 
     let mut pending = contributions;
-    let mut must: Vec<Interval> = vec![];
+    let mut must: Vec<Contribution> = vec![];
     loop {
         let mut regroup = vec![];
         for (bb, iv) in pending {
@@ -738,8 +790,8 @@ fn certify_contributions(
         let mut progressed = false;
         pending = vec![];
         for (branch, by_arm) in groups {
-            let multiset = |arm: BasicBlock| -> Vec<Interval> {
-                let mut ivs: Vec<Interval> = by_arm
+            let multiset = |arm: BasicBlock| -> Vec<Contribution> {
+                let mut ivs: Vec<Contribution> = by_arm
                     .get(&arm)
                     .map(|g| g.iter().map(|&(_, iv)| iv).collect())
                     .unwrap_or_default();
@@ -763,7 +815,7 @@ fn certify_contributions(
     }
 }
 
-type ArmGroups = FxHashMap<BasicBlock, Vec<(BasicBlock, Interval)>>;
+type ArmGroups = FxHashMap<BasicBlock, Vec<(BasicBlock, Contribution)>>;
 
 /// True when `a` dominates `b` in the pruned CFG (`a == b` included).
 fn dominates(idom: &FxHashMap<BasicBlock, BasicBlock>, a: BasicBlock, mut b: BasicBlock) -> bool {
@@ -834,7 +886,7 @@ struct LoopReads {
     /// A reassigned queried pointer whose sole reassignment is a consumed
     /// cursor step, likewise exempted.
     exempt_cursor_params: FxHashSet<Local>,
-    contributions: Vec<(BasicBlock, Interval)>,
+    contributions: Vec<(BasicBlock, Contribution)>,
 }
 
 impl LoopReads {
@@ -855,6 +907,7 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
         eval: &EvalCx<'_, 'tcx>,
         derived: &Derived,
         param_local: Local,
+        queried_pointee: Ty<'tcx>,
         param_reassigned: bool,
         reachable: &FxHashSet<BasicBlock>,
         successors: &FxHashMap<BasicBlock, Vec<BasicBlock>>,
@@ -901,6 +954,7 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
             let one = match_one_indexed_loop(
                 eval,
                 derived,
+                queried_pointee,
                 reachable,
                 successors,
                 early_exits,
@@ -936,6 +990,7 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
 fn match_one_indexed_loop<'tcx>(
     eval: &EvalCx<'_, 'tcx>,
     derived: &Derived,
+    queried_pointee: Ty<'tcx>,
     reachable: &FxHashSet<BasicBlock>,
     successors: &FxHashMap<BasicBlock, Vec<BasicBlock>>,
     early_exits: &FxHashSet<BasicBlock>,
@@ -973,13 +1028,21 @@ fn match_one_indexed_loop<'tcx>(
     let (induction, _) = resolve_copy_chain(eval, lhs, false)?;
     let induction_ty = body.local_decls[induction].ty;
     let size = eval.int_size(induction_ty)?;
-    let bound = eval.operand(rhs, MAX_EVAL_DEPTH)?;
-    // The comparison follows the operands' signedness; a negative bound
-    // means the loop never runs, which this schema does not claim.
-    let bound = if induction_ty.is_signed() {
-        u64::try_from(size.sign_extend(bound.bits)).ok()?
+    // Const-first: only when the bound does not const-evaluate under the
+    // context is a direct runtime parameter bound considered.
+    let bound = if let Some(value) = eval.operand(rhs, MAX_EVAL_DEPTH) {
+        // The comparison follows the operands' signedness; a negative bound
+        // means the loop never runs, which this schema does not claim.
+        let value = if induction_ty.is_signed() {
+            u64::try_from(size.sign_extend(value.bits)).ok()?
+        } else {
+            u64::try_from(value.bits).ok()?
+        };
+        IndexedBound::Const(value)
     } else {
-        u64::try_from(bound.bits).ok()?
+        IndexedBound::RuntimeParam {
+            param: resolve_runtime_bound_param(eval, rhs)?,
+        }
     };
 
     // The induction variable has one in-loop increment by one; every other
@@ -1076,19 +1139,28 @@ fn match_one_indexed_loop<'tcx>(
         if index_root != induction {
             return None;
         }
-        // Every type the index passes through must represent B - 1.
-        if bound > 0 {
-            for cast_ty in casts {
-                let cast_size = eval.int_size(cast_ty)?;
-                let max_positive = if cast_ty.is_signed() {
-                    (1u128 << (cast_size.bits() - 1)) - 1
-                } else {
-                    cast_size.unsigned_int_max()
-                };
-                if u128::from(bound - 1) > max_positive {
-                    return None;
+        // For a constant bound, every type the index passes through must
+        // represent B - 1, as before. For a runtime bound, every cast target
+        // must represent the induction type's full nonnegative range: this
+        // keeps a widening cast such as `i32/u32 as isize` valid while
+        // rejecting a narrowing one, without knowing the runtime value.
+        match bound {
+            IndexedBound::Const(bound) if bound > 0 => {
+                for cast_ty in &casts {
+                    if u128::from(bound - 1) > max_nonnegative_int(eval, *cast_ty)? {
+                        return None;
+                    }
                 }
             }
+            IndexedBound::RuntimeParam { .. } => {
+                let source_max = max_nonnegative_int(eval, induction_ty)?;
+                for cast_ty in &casts {
+                    if source_max > max_nonnegative_int(eval, *cast_ty)? {
+                        return None;
+                    }
+                }
+            }
+            IndexedBound::Const(_) => {}
         }
         let q = destination.local;
         if !destination.projection.is_empty()
@@ -1163,19 +1235,47 @@ fn match_one_indexed_loop<'tcx>(
         }
         one.consumed_calls.insert(call_bb);
         one.loop_locals.insert(q);
-        if let Some(bytes) = bound.checked_mul(width).filter(|&b| b > 0) {
-            one.contributions.push((
-                header,
-                Interval {
-                    start: 0,
-                    end: bytes,
-                },
-            ));
-        } else if bound > 0 {
-            return None;
+        match bound {
+            IndexedBound::Const(bound) => {
+                if let Some(bytes) = bound.checked_mul(width).filter(|&bytes| bytes > 0) {
+                    one.contributions.push((
+                        header,
+                        Interval {
+                            start: 0,
+                            end: bytes,
+                        }
+                        .into(),
+                    ));
+                } else if bound > 0 {
+                    return None;
+                }
+            }
+            IndexedBound::RuntimeParam { param } => {
+                let queried_width = tcx
+                    .layout_of(eval.typing_env.as_query_input(queried_pointee))
+                    .ok()?
+                    .size
+                    .bytes();
+                if queried_width == 0 || width != queried_width {
+                    return None;
+                }
+                one.contributions
+                    .push((header, Contribution::RuntimeParam { param }));
+            }
         }
     }
     Some(one)
+}
+
+/// The largest nonnegative value `ty` (a MIR integer type) can represent:
+/// `2^(bits-1) - 1` for a signed type, or the full unsigned max otherwise.
+fn max_nonnegative_int<'tcx>(eval: &EvalCx<'_, 'tcx>, ty: Ty<'tcx>) -> Option<u128> {
+    let size = eval.int_size(ty)?;
+    Some(if ty.is_signed() {
+        (1u128 << (size.bits() - 1)) - 1
+    } else {
+        size.unsigned_int_max()
+    })
 }
 
 impl<'tcx> ReadExtentAnalysis<'tcx> {
@@ -1701,7 +1801,8 @@ impl<'tcx> ReadExtentAnalysis<'tcx> {
                 Interval {
                     start: 0,
                     end: bytes,
-                },
+                }
+                .into(),
             ));
         } else if count0 > 0 {
             return None;
@@ -2221,6 +2322,71 @@ fn is_step_by_one(eval: &EvalCx<'_, '_>, site: DefSite, var: Local, op: BinOp) -
             }
         }
     }
+}
+
+/// Follows an operand backward through zero or more single-def, unprojected,
+/// same-typed `Rvalue::Use` copies to a stable integer parameter: one never
+/// assigned (so its value is the entry value throughout). Any cast, any
+/// arithmetic, any local whose type differs from the operand's own, or any
+/// local that does not eventually resolve to an unassigned parameter fails
+/// the match. Unlike `resolve_copy_chain`, this helper has no cast or
+/// arithmetic arm by design: a parameter reached through either would not be
+/// the runtime count itself.
+fn resolve_runtime_bound_param<'tcx>(
+    eval: &EvalCx<'_, 'tcx>,
+    operand: &Operand<'tcx>,
+) -> Option<usize> {
+    let mut operand = operand;
+    let expected_ty = operand.ty(&eval.body.local_decls, eval.tcx);
+    if !matches!(expected_ty.kind(), ty::TyKind::Int(_) | ty::TyKind::Uint(_)) {
+        return None;
+    }
+    for _ in 0..MAX_EVAL_DEPTH {
+        let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+            return None;
+        };
+        if !place.projection.is_empty() || eval.body.local_decls[place.local].ty != expected_ty {
+            return None;
+        }
+        let local = place.local;
+        if local_address_taken(eval.body, local) {
+            return None;
+        }
+        let index = local.as_usize();
+        if index >= 1 && index <= eval.body.arg_count {
+            return (!eval.defs.contains_key(&local)).then_some(index - 1);
+        }
+        let Some(Some(DefSite::Stmt(bb, statement))) = eval.defs.get(&local) else {
+            return None;
+        };
+        let StatementKind::Assign(box (_, Rvalue::Use(inner))) =
+            &eval.body.basic_blocks[*bb].statements[*statement].kind
+        else {
+            return None;
+        };
+        if inner.ty(&eval.body.local_decls, eval.tcx) != expected_ty {
+            return None;
+        }
+        operand = inner;
+    }
+    None
+}
+
+/// Whether any statement in `body` takes a reference or raw address of
+/// `target` (`&target`, `&mut target`, `&raw const target`, or
+/// `&raw mut target`). A runtime bound resolved through such a local would
+/// no longer be provably stable: code reached through the taken address
+/// could rewrite it before the loop reads it.
+fn local_address_taken(body: &Body<'_>, target: Local) -> bool {
+    body.basic_blocks.iter().any(|block| {
+        block.statements.iter().any(|statement| {
+            matches!(
+                &statement.kind,
+                StatementKind::Assign(box (_, Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)))
+                    if place.local == target
+            )
+        })
+    })
 }
 
 /// Follows an operand backward through single-def unprojected copies (and,

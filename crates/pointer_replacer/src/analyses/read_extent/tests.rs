@@ -329,8 +329,67 @@ fn indexed_loop_with_context_bound_is_exact() {
         run_extent(code, "checksum", 1, &[(2, 8)]),
         Extent::Const(32)
     );
-    // Without the bound in the context the iteration count is unknown.
-    assert_eq!(run_extent(code, "checksum", 1, &[]), Extent::Unknown);
+    // Without the bound in the context, the loop still names a stable runtime
+    // parameter as its count.
+    assert_eq!(
+        run_extent(code, "checksum", 1, &[]),
+        Extent::RuntimeParam { param: 2 }
+    );
+}
+
+/// The fma_array shape: an indexed loop reading one element per iteration
+/// up to a runtime parameter bound.
+const RUNTIME_INDEXED_SIGNED: &str = r#"
+pub unsafe fn checksum(out: *mut u32, msg: *const u32, n: i32) {
+    let mut csum: u32 = 0;
+    let mut i: i32 = 0;
+    while i < n {
+        csum = csum.wrapping_add(*msg.offset(i as isize));
+        i = i.wrapping_add(1);
+    }
+    *out = csum;
+}
+"#;
+
+#[test]
+fn indexed_loop_with_signed_param_bound_is_runtime() {
+    assert_eq!(
+        run_extent(RUNTIME_INDEXED_SIGNED, "checksum", 1, &[]),
+        Extent::RuntimeParam { param: 2 },
+    );
+}
+
+#[test]
+fn indexed_loop_with_unsigned_param_bound_is_runtime() {
+    let code = RUNTIME_INDEXED_SIGNED
+        .replace("n: i32", "n: u32")
+        .replace("i: i32", "i: u32");
+    assert_eq!(
+        run_extent(&code, "checksum", 1, &[]),
+        Extent::RuntimeParam { param: 2 },
+    );
+}
+
+#[test]
+fn indexed_loop_runtime_bound_stays_const_under_context() {
+    assert_eq!(
+        run_extent(RUNTIME_INDEXED_SIGNED, "checksum", 1, &[(2, 8)]),
+        Extent::Const(32),
+    );
+}
+
+#[test]
+fn indexed_loop_bound_through_same_typed_copies_is_runtime() {
+    let code = RUNTIME_INDEXED_SIGNED
+        .replace(
+            "let mut csum: u32 = 0;",
+            "let bound_0: i32 = n; let bound_1: i32 = bound_0; let mut csum: u32 = 0;",
+        )
+        .replace("while i < n", "while i < bound_1");
+    assert_eq!(
+        run_extent(&code, "checksum", 1, &[]),
+        Extent::RuntimeParam { param: 2 },
+    );
 }
 
 #[test]
@@ -782,4 +841,186 @@ fn identity_observed_through_forwarding() {
         }
         "#;
     assert!(run_identity(code, "caller", 0));
+}
+
+#[test]
+fn runtime_bound_integer_cast_is_unknown() {
+    let code = RUNTIME_INDEXED_SIGNED
+        .replace("n: i32", "n: i64")
+        .replace("while i < n", "let bound = n as i32; while i < bound");
+    assert_eq!(run_extent(&code, "checksum", 1, &[]), Extent::Unknown);
+}
+
+#[test]
+fn runtime_bound_arithmetic_is_unknown() {
+    for expression in [
+        "n.wrapping_mul(1)",
+        "n << 0",
+        "n.wrapping_add(0)",
+        "n.wrapping_sub(0)",
+    ] {
+        let code = RUNTIME_INDEXED_SIGNED
+            .replace(
+                "let mut csum: u32 = 0;",
+                &format!("let bound: i32 = {expression}; let mut csum: u32 = 0;"),
+            )
+            .replace("while i < n", "while i < bound");
+        assert_eq!(
+            run_extent(&code, "checksum", 1, &[]),
+            Extent::Unknown,
+            "arithmetic bound must be rejected: {expression}",
+        );
+    }
+}
+
+#[test]
+fn runtime_loop_with_different_load_width_is_unknown() {
+    let code = r#"
+pub unsafe fn checksum(out: *mut u32, msg: *const u32, n: i32) {
+    let bytes = msg as *const u8;
+    let mut csum: u32 = 0;
+    let mut i: i32 = 0;
+    while i < n {
+        csum = csum.wrapping_add(*bytes.offset(i as isize) as u32);
+        i = i.wrapping_add(1);
+    }
+    *out = csum;
+}
+"#;
+    assert_eq!(run_extent(code, "checksum", 1, &[]), Extent::Unknown);
+}
+
+#[test]
+fn reassigned_runtime_length_parameter_is_unknown() {
+    let code = RUNTIME_INDEXED_SIGNED
+        .replace("let mut csum: u32 = 0;", "n = n; let mut csum: u32 = 0;")
+        .replace("n: i32", "mut n: i32");
+    assert_eq!(run_extent(&code, "checksum", 1, &[]), Extent::Unknown);
+}
+
+#[test]
+fn runtime_bound_that_does_not_resolve_to_one_parameter_is_unknown() {
+    let code = RUNTIME_INDEXED_SIGNED
+        .replace(
+            "let mut csum: u32 = 0;",
+            "let bound: i32; if n > 0 { bound = n; } else { bound = 0; } let mut csum: u32 = 0;",
+        )
+        .replace("while i < n", "while i < bound");
+    assert_eq!(run_extent(&code, "checksum", 1, &[]), Extent::Unknown);
+}
+
+#[test]
+fn address_taken_runtime_length_parameter_is_unknown() {
+    for (binding, address) in [
+        ("shared", "&n as *const i32 as usize"),
+        ("mutable", "&mut n as *mut i32 as usize"),
+        ("raw_const", "&raw const n as usize"),
+        ("raw_mut", "&raw mut n as usize"),
+    ] {
+        let code = format!(
+            r#"
+pub unsafe fn checksum(out: *mut u32, msg: *const u32, mut n: i32) -> usize {{
+    let address = {address};
+    let mut csum: u32 = 0;
+    let mut i: i32 = 0;
+    while i < n {{
+        csum = csum.wrapping_add(*msg.offset(i as isize));
+        i = i.wrapping_add(1);
+    }}
+    *out = csum;
+    address
+}}
+"#
+        );
+        assert_eq!(
+            run_extent(&code, "checksum", 1, &[]),
+            Extent::Unknown,
+            "address-taking form must be rejected: {binding}",
+        );
+    }
+}
+
+#[test]
+fn address_taken_runtime_bound_copy_is_unknown() {
+    let code = RUNTIME_INDEXED_SIGNED
+        .replace(
+            "let mut csum: u32 = 0;",
+            "let bound = n; let address = &raw const bound as usize; let mut csum: u32 = 0;",
+        )
+        .replace("while i < n", "while i < bound")
+        .replace("*out = csum;", "*out = csum.wrapping_add(address as u32);");
+    assert_eq!(run_extent(&code, "checksum", 1, &[]), Extent::Unknown);
+}
+
+#[test]
+fn runtime_memcpy_length_remains_unknown() {
+    let code = format!(
+        "{MEMCPY} pub unsafe fn callee(out: *mut u8, src: *const u8, n: usize) {{ memcpy(out, src, n); }}"
+    );
+    assert_eq!(run_extent(&code, "callee", 1, &[]), Extent::Unknown);
+}
+
+#[test]
+fn runtime_forwarding_remains_unknown() {
+    let code = format!(
+        r#"
+{RUNTIME_INDEXED_SIGNED}
+pub unsafe fn wrapper(out: *mut u32, msg: *const u32, n: i32) {{
+    checksum(out, msg, n);
+}}
+"#
+    );
+    assert_eq!(run_extent(&code, "wrapper", 1, &[]), Extent::Unknown);
+}
+
+#[test]
+fn constant_and_runtime_contributions_are_unknown() {
+    let code =
+        RUNTIME_INDEXED_SIGNED.replace("let mut csum: u32 = 0;", "let mut csum: u32 = *msg;");
+    assert_eq!(run_extent(&code, "checksum", 1, &[]), Extent::Unknown);
+}
+
+#[test]
+fn two_different_runtime_parameters_are_unknown() {
+    let code = r#"
+pub unsafe fn checksum(out: *mut u32, msg: *const u32, a: i32, b: i32) {
+    let mut sum = 0u32;
+    let mut i = 0i32;
+    while i < a {
+        sum = sum.wrapping_add(*msg.offset(i as isize));
+        i = i.wrapping_add(1);
+    }
+    let mut j = 0i32;
+    while j < b {
+        sum = sum.wrapping_add(*msg.offset(j as isize));
+        j = j.wrapping_add(1);
+    }
+    *out = sum;
+}
+"#;
+    assert_eq!(run_extent(code, "checksum", 1, &[]), Extent::Unknown);
+}
+
+#[test]
+fn two_runtime_loops_with_the_same_parameter_are_runtime() {
+    let code = r#"
+pub unsafe fn checksum(out: *mut u32, msg: *const u32, n: i32) {
+    let mut sum = 0u32;
+    let mut i = 0i32;
+    while i < n {
+        sum = sum.wrapping_add(*msg.offset(i as isize));
+        i = i.wrapping_add(1);
+    }
+    let mut j = 0i32;
+    while j < n {
+        sum = sum.wrapping_add(*msg.offset(j as isize));
+        j = j.wrapping_add(1);
+    }
+    *out = sum;
+}
+"#;
+    assert_eq!(
+        run_extent(code, "checksum", 1, &[]),
+        Extent::RuntimeParam { param: 2 },
+    );
 }

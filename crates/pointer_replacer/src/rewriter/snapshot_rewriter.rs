@@ -23,7 +23,7 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::{
-    mir::{TerminatorKind, VarDebugInfoContents},
+    mir::{Local, Operand, Rvalue, StatementKind, TerminatorKind, VarDebugInfoContents},
     ty::{self, TyCtxt},
 };
 use rustc_span::{Span, def_id::LocalDefId};
@@ -46,7 +46,15 @@ pub(crate) struct SiteRewrite {
     pub(crate) callee: LocalDefId,
     /// The call expression's span, which identifies the AST statement.
     call_span: Span,
+    runtime_len: Option<RuntimeLen>,
     copies: Vec<PlannedCopy>,
+}
+
+/// The site's shared runtime length: the call argument position holding it
+/// and its source name in the caller (an unprojected parameter local).
+struct RuntimeLen {
+    arg_index: usize,
+    source_name: String,
 }
 
 /// One read-only argument's copy, with everything resolved to strings.
@@ -67,6 +75,83 @@ enum PlannedCopy {
         elem_ty: String,
         len: u64,
     },
+    /// `let snap: Vec<elem_ty> = if <captured_len> > 0 { <read>.to_vec() }
+    /// else { Vec::new() };` and the argument becomes `snap.as_ptr()`. The
+    /// site's shared `runtime_len` supplies the captured length.
+    Runtime { arg_index: usize, elem_ty: String },
+}
+
+/// The source-level debug name of an unprojected local, if the body has one
+/// recorded (compiler temporaries do not).
+fn local_source_name(body: &rustc_middle::mir::Body<'_>, local: Local) -> Option<String> {
+    body.var_debug_info.iter().find_map(|info| {
+        let VarDebugInfoContents::Place(place) = &info.value else {
+            return None;
+        };
+        (place.local == local && place.projection.is_empty()).then(|| info.name.to_string())
+    })
+}
+
+/// Maximum anonymous copy hops walked by `skip_anonymous_copies` before
+/// giving up, mirroring `analyses::aliasing`'s own bound.
+const MAX_ANONYMOUS_COPY_DEPTH: usize = 32;
+
+/// Walks back through anonymous (no source name) unprojected `Rvalue::Use`
+/// copies — the compiler's own call-argument temporaries — to the local they
+/// ultimately copy, so a call argument like `move _7` (where `_7 = copy
+/// _2;`) resolves to the named parameter `_2` behind it. Mirrors
+/// `analyses::aliasing::skip_anonymous_copies`, which the gate stage already
+/// used to prove this call's length argument is a direct caller parameter;
+/// this re-walk reaches the same local to read its debug name.
+fn skip_anonymous_copies(body: &rustc_middle::mir::Body<'_>, mut local: Local) -> Local {
+    let has_debug_name = |local: Local| local_source_name(body, local).is_some();
+    let definitions_of = |local: Local| {
+        let mut sources = vec![];
+        let mut other_definitions = false;
+        for block in body.basic_blocks.iter() {
+            for statement in &block.statements {
+                match &statement.kind {
+                    StatementKind::Assign(box (place, Rvalue::Use(operand)))
+                        if place.as_local() == Some(local) =>
+                    {
+                        match operand {
+                            Operand::Copy(source) | Operand::Move(source)
+                                if source.projection.is_empty() =>
+                            {
+                                sources.push(source.local);
+                            }
+                            _ => other_definitions = true,
+                        }
+                    }
+                    StatementKind::Assign(box (place, _)) if place.as_local() == Some(local) => {
+                        other_definitions = true;
+                    }
+                    _ => {}
+                }
+            }
+            if let TerminatorKind::Call { destination, .. } = &block.terminator().kind
+                && destination.as_local() == Some(local)
+            {
+                other_definitions = true;
+            }
+        }
+        (sources, other_definitions)
+    };
+    for _ in 0..MAX_ANONYMOUS_COPY_DEPTH {
+        if has_debug_name(local) {
+            return local;
+        }
+        let (sources, other_definitions) = definitions_of(local);
+        if other_definitions || sources.len() != 1 {
+            return local;
+        }
+        let source = sources[0];
+        if source == local {
+            return local;
+        }
+        local = source;
+    }
+    local
 }
 
 /// Resolves gated candidates into rewrite-ready sites and drops the ones the
@@ -105,6 +190,7 @@ pub(crate) fn plan_sites<'tcx>(
         };
 
         let mut copies = vec![];
+        let mut runtime_len: Option<RuntimeLen> = None;
         for plan in &gated_candidate.copies {
             match *plan {
                 CopyPlan::ExactPrefix { arg_index, elems } => {
@@ -123,14 +209,7 @@ pub(crate) fn plan_sites<'tcx>(
                     base_local,
                     len,
                 } => {
-                    let base_name = body.var_debug_info.iter().find_map(|info| {
-                        let VarDebugInfoContents::Place(place) = &info.value else {
-                            return None;
-                        };
-                        (place.local == base_local && place.projection.is_empty())
-                            .then(|| info.name.to_string())
-                    });
-                    let Some(base_name) = base_name else {
+                    let Some(base_name) = local_source_name(&body, base_local) else {
                         skip(&gated_candidate, "array base has no source name");
                         continue 'candidates;
                     };
@@ -144,6 +223,57 @@ pub(crate) fn plan_sites<'tcx>(
                         len,
                     });
                 }
+                CopyPlan::RuntimePrefix {
+                    arg_index,
+                    len_param,
+                } => {
+                    let arg_ty = args[arg_index].node.ty(&body.local_decls, tcx);
+                    let ty::TyKind::RawPtr(pointee, _) = arg_ty.kind() else {
+                        continue 'candidates;
+                    };
+                    let Some(len_arg) = args.get(len_param) else {
+                        continue 'candidates;
+                    };
+                    let (Operand::Copy(place) | Operand::Move(place)) = &len_arg.node else {
+                        skip(&gated_candidate, "runtime length argument is not a place");
+                        continue 'candidates;
+                    };
+                    if !place.projection.is_empty() {
+                        skip(&gated_candidate, "runtime length argument is projected");
+                        continue 'candidates;
+                    }
+                    let len_local = skip_anonymous_copies(&body, place.local);
+                    let Some(source_name) = local_source_name(&body, len_local) else {
+                        skip(&gated_candidate, "runtime length local has no source name");
+                        continue 'candidates;
+                    };
+                    match &runtime_len {
+                        Some(existing) if existing.arg_index != len_param => {
+                            skip(
+                                &gated_candidate,
+                                "runtime copies at this site disagree on the length argument",
+                            );
+                            continue 'candidates;
+                        }
+                        Some(existing) if existing.source_name != source_name => {
+                            skip(
+                                &gated_candidate,
+                                "runtime copies at this site disagree on the length source name",
+                            );
+                            continue 'candidates;
+                        }
+                        _ => {
+                            runtime_len = Some(RuntimeLen {
+                                arg_index: len_param,
+                                source_name,
+                            });
+                        }
+                    }
+                    copies.push(PlannedCopy::Runtime {
+                        arg_index,
+                        elem_ty: pointee.to_string(),
+                    });
+                }
             }
         }
         drop(body);
@@ -151,6 +281,7 @@ pub(crate) fn plan_sites<'tcx>(
             caller: candidate.caller,
             callee: candidate.callee,
             call_span,
+            runtime_len,
             copies,
         };
         resolved.push((gated_candidate, site));
@@ -223,7 +354,7 @@ impl<'ast> Visitor<'ast> for FeasibilityVisitor<'_> {
                 if site.call_span != expr.span {
                     continue;
                 }
-                let rewritable = site.copies.iter().all(|copy| match copy {
+                let copies_rewritable = site.copies.iter().all(|copy| match copy {
                     PlannedCopy::Prefix { arg_index, .. } => call_args.len() > *arg_index,
                     PlannedCopy::Whole {
                         arg_index,
@@ -232,8 +363,15 @@ impl<'ast> Visitor<'ast> for FeasibilityVisitor<'_> {
                     } => call_args.get(*arg_index).is_some_and(|arg| {
                         rewrite_whole_arg(arg, base_name, "__crat_snap").is_some()
                     }),
+                    PlannedCopy::Runtime { arg_index, .. } => call_args.len() > *arg_index,
                 });
-                if rewritable {
+                let runtime_rewritable = site.runtime_len.as_ref().is_none_or(|runtime| {
+                    call_args
+                        .get(runtime.arg_index)
+                        .is_some_and(|arg| is_plain_ident(arg, &runtime.source_name))
+                        && call_args.iter().all(|arg| plain_ident_name(arg).is_some())
+                });
+                if copies_rewritable && runtime_rewritable {
                     self.feasible.insert(i);
                 }
             }
@@ -345,6 +483,16 @@ impl EmitVisitor<'_> {
 
         let mut inserts = vec![];
         for site in sites {
+            // The site's runtime length, captured once before any copy reads
+            // it, so a mutable call downstream of the length argument cannot
+            // change what gets snapshotted.
+            let runtime_capture = site.runtime_len.as_ref().map(|runtime| {
+                let name = self.fresh_len_name();
+                let source_name = &runtime.source_name;
+                inserts.push(utils::stmt!("let {name} = {source_name};"));
+                *call_args[runtime.arg_index] = utils::expr!("{name}");
+                name
+            });
             // Whole-array copies of one site share a single snapshot.
             let mut shared_whole: Option<String> = None;
             for copy in &site.copies {
@@ -403,6 +551,29 @@ impl EmitVisitor<'_> {
                             self.changed = true;
                         }
                     }
+                    PlannedCopy::Runtime { arg_index, elem_ty } => {
+                        let len = runtime_capture
+                            .as_ref()
+                            .expect("runtime copy has a site length capture");
+                        let name = self.fresh_name();
+                        let arg = pprust::expr_to_string(&call_args[*arg_index]);
+                        let read = self.in_unsafe(format!(
+                            "std::slice::from_raw_parts(({arg}) as *const {elem_ty}, {len} as usize).to_vec()"
+                        ));
+                        inserts.push(utils::stmt!(
+                            "let {name}: Vec<{elem_ty}> = if {len} > 0 {{ {read} }} else {{ Vec::new() }};"
+                        ));
+                        if self.validate {
+                            let check = self.in_unsafe(format!(
+                                "std::slice::from_raw_parts(({arg}) as *const {elem_ty}, {len} as usize)"
+                            ));
+                            inserts.push(utils::stmt!(
+                                "if {len} > 0 {{ debug_assert_eq!({check}, &{name}[..]); }}"
+                            ));
+                        }
+                        *call_args[*arg_index] = utils::expr!("{name}.as_ptr()");
+                        self.changed = true;
+                    }
                 }
             }
         }
@@ -411,6 +582,12 @@ impl EmitVisitor<'_> {
 
     fn fresh_name(&mut self) -> String {
         let name = format!("__crat_snap_{}", self.snap_counter);
+        self.snap_counter += 1;
+        name
+    }
+
+    fn fresh_len_name(&mut self) -> String {
+        let name = format!("__crat_snap_len_{}", self.snap_counter);
         self.snap_counter += 1;
         name
     }
@@ -464,13 +641,22 @@ fn rewrite_whole_arg(expr: &Expr, base_name: &str, snap_name: &str) -> Option<Ex
     }
 }
 
-fn is_plain_ident(expr: &Expr, name: &str) -> bool {
+/// The identifier name of a (possibly parenthesized) plain-path expression,
+/// e.g. `x` or `(x)`. `None` for any other shape.
+fn plain_ident_name(expr: &Expr) -> Option<&str> {
     let mut expr = expr;
     while let ExprKind::Paren(inner) = &expr.kind {
-        expr = &**inner;
+        expr = inner;
     }
     let ExprKind::Path(None, path) = &expr.kind else {
-        return false;
+        return None;
     };
-    path.segments.len() == 1 && path.segments[0].ident.name.as_str() == name
+    let [segment] = path.segments.as_slice() else {
+        return None;
+    };
+    Some(segment.ident.name.as_str())
+}
+
+fn is_plain_ident(expr: &Expr, name: &str) -> bool {
+    plain_ident_name(expr) == Some(name)
 }
