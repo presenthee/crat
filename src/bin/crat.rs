@@ -553,6 +553,9 @@ fn main() {
                 }
             }
             Pass::Pointer => {
+                if config.verbose {
+                    println!("Pointer: rewrite struct arrays");
+                }
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::rewrite_struct_arrays(&config.pointer, tcx)
                 })
@@ -561,6 +564,9 @@ fn main() {
                     std::fs::write(&file, s).unwrap();
                 }
 
+                if config.verbose {
+                    println!("Pointer: rewrite struct parameter fields");
+                }
                 let (s, changed, field_specs) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
                 })
@@ -581,6 +587,9 @@ fn main() {
                     std::fs::write(&file, s).unwrap();
                 }
 
+                if config.verbose {
+                    println!("Pointer: split borrow epochs");
+                }
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::rewrite_epoch_split(&config.pointer, tcx)
                 })
@@ -589,6 +598,9 @@ fn main() {
                     std::fs::write(&file, s).unwrap();
                 }
 
+                if config.verbose {
+                    println!("Pointer: rewrite aliasing");
+                }
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::rewrite_aliasing(&config.pointer, tcx)
                 })
@@ -597,6 +609,9 @@ fn main() {
                     std::fs::write(&file, s).unwrap();
                 }
 
+                if config.verbose {
+                    println!("Pointer: rewrite array local provenance");
+                }
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::rewrite_array_local_provenance(&config.pointer, tcx)
                 })
@@ -605,6 +620,9 @@ fn main() {
                     std::fs::write(&file, s).unwrap();
                 }
 
+                if config.verbose {
+                    println!("Pointer: replace local borrows");
+                }
                 let (s, bytemuck) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::replace_local_borrows(&config.pointer, tcx)
                 })

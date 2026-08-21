@@ -1140,6 +1140,53 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 #[test]
+fn test_rewriter_removes_noop_path_statement_after_pointer_update() {
+    run_test(
+        r#"
+pub unsafe fn fill(mut values: *mut i32) {
+    loop {
+        *values = 1;
+        values = values.offset(1);
+        values;
+        if *values == 0 { break; }
+    }
+}
+"#,
+        &["values ="],
+        &["values;", "(values).offset"],
+    );
+}
+
+#[test]
+fn test_rewriter_reborrows_mutable_optional_ref_copied_before_reuse() {
+    run_test(
+        r#"
+pub struct Node {
+    pub next: *mut Node,
+}
+
+extern "C" {
+    fn alloc_node() -> *mut Node;
+}
+
+pub unsafe fn append(root: *mut Node) -> *mut Node {
+    if root.is_null() {
+        return alloc_node();
+    }
+    let mut alias = root;
+    while !(*alias).next.is_null() {
+        alias = (*alias).next;
+    }
+    (*alias).next = append((*alias).next);
+    root
+}
+"#,
+        &["let mut alias: Option<&mut crate::Node> = (root).as_mut()"],
+        &["let mut alias: Option<&mut crate::Node> = root;"],
+    );
+}
+
+#[test]
 fn test_non_null_param_to_ref() {
     run_test(
         r#"
@@ -1776,8 +1823,8 @@ pub unsafe fn make_buf(len: usize) -> *mut core::ffi::c_char {
 "#,
         &[
             "pub unsafe fn make_buf(len: usize) -> Box<[i8]>",
-            ".take(((1) * (len) /",
-            "std::mem::size_of::<i8>()) as",
+            ".wrapping_mul((len) as usize)",
+            "std::mem::size_of::<i8>())",
         ],
         &["Box::leak(", "Box::into_raw(", "calloc(1, len)"],
     );
@@ -1808,6 +1855,25 @@ pub unsafe fn foo() -> *mut i32 {
             "Box::into_raw(",
             "malloc(4 * std::mem::size_of::<i32>())",
         ],
+    );
+}
+
+#[test]
+fn test_rewriter_casts_wide_malloc_byte_count_before_size_division() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: u64) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn make_buf(len: u64) -> *mut i8 {
+    let p: *mut i8 = malloc(len) as *mut i8;
+    *p.offset(1) = 7;
+    p
+}
+"#,
+        &["(len) as usize", "std::mem::size_of::<i8>()"],
+        &["(len) / std::mem::size_of::<i8>()"],
     );
 }
 
@@ -2374,8 +2440,8 @@ pub unsafe fn clear_list(head: *mut Node) {
 }
         "#,
         &[
-            "let mut x: *mut crate::Node<'a> =",
-            "let mut y: *mut crate::Node<'a> = std::ptr::null_mut();",
+            "let mut x: *mut crate::Node<'_> =",
+            "let mut y: *mut crate::Node<'_> = std::ptr::null_mut();",
         ],
         &["Option<&crate::Node>"],
     );
@@ -4307,6 +4373,426 @@ pub unsafe fn hold(nodes: &Vec<Node>) -> usize {
 }
 
 #[test]
+fn test_rewriter_propagates_lifetime_through_nested_struct_value() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+}
+
+pub unsafe fn touch_inner(mut x: i32) -> i32 {
+    let mut inner = Inner { value: &raw mut x };
+    *inner.value = 7;
+    x
+}
+
+pub fn outer_size() -> usize {
+    std::mem::size_of::<Outer>()
+}
+"#,
+        &[
+            "pub struct Inner<'a>",
+            "pub struct Outer<'a>",
+            "pub inner: Inner<'a>",
+            "size_of::<Outer<'_>>()",
+        ],
+        &["pub inner: Inner<'_>"],
+    );
+}
+
+#[test]
+fn test_rewriter_updates_impl_for_struct_with_dependent_lifetime() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+}
+
+impl Copy for Inner {}
+impl Clone for Inner {
+    fn clone(&self) -> Self { *self }
+}
+impl Copy for Outer {}
+impl Clone for Outer {
+    fn clone(&self) -> Self { *self }
+}
+
+pub unsafe fn read() -> i32 {
+    let x = 7;
+    let inner = Inner { value: &raw const x };
+    *inner.value
+}
+"#,
+        &[
+            "impl<'a> Copy for Outer<'a>",
+            "impl<'a> Clone for Outer<'a>",
+        ],
+        &["impl Copy for Outer {"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_unrelated_struct_parameter_lifetimes_independent() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Left {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct Right {
+    pub data: *const u8,
+}
+
+pub unsafe fn seed() -> u8 {
+    let value = 7;
+    let left = Left { data: &raw const value };
+    let right = Right { data: &raw const value };
+    *left.data + *right.data
+}
+
+pub unsafe fn sum(left: *const Left, right: *const Right) -> u8 {
+    *(*left).data + *(*right).data
+}
+"#,
+        &[
+            "left: &crate::Left<'a>",
+            "right: &crate::Right<'crat_inner_1>",
+        ],
+        &["fn sum<'a>"],
+    );
+}
+
+#[test]
+fn test_rewriter_ties_promoted_struct_lifetimes_for_pointer_comparison() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn seed() -> i32 {
+    let mut value = 7;
+    let holder = Holder { data: &raw mut value };
+    *holder.data
+}
+
+pub unsafe fn same(a: *mut Holder, b: *mut Holder) -> bool {
+    a == b
+}
+"#,
+        &[
+            "fn same<'crat>",
+            "a: Option<&crate::Holder<'crat>>",
+            "b: Option<&crate::Holder<'crat>>",
+        ],
+        &["'crat_inner_1"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_fields_reachable_from_union_storage_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub data: *mut i32,
+}
+impl Copy for Inner {}
+impl Clone for Inner { fn clone(&self) -> Self { *self } }
+
+#[repr(C)]
+pub struct Wrapper {
+    pub inner: Inner,
+}
+impl Copy for Wrapper {}
+impl Clone for Wrapper { fn clone(&self) -> Self { *self } }
+
+#[repr(C)]
+pub union Storage {
+    pub wrapper: Wrapper,
+    pub bits: usize,
+}
+impl Copy for Storage {}
+impl Clone for Storage { fn clone(&self) -> Self { *self } }
+
+pub unsafe fn read(wrapper: *mut Wrapper) -> i32 {
+    *(*wrapper).inner.data
+}
+"#,
+        &["pub data: *mut i32", "pub union Storage"],
+        &["pub struct Inner<'", "Option<&mut i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_ties_slice_parameter_to_stored_struct_field_lifetime() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Reader {
+    pub data: *const u8,
+}
+
+pub unsafe fn init(reader: *mut Reader, data: *const u8) -> u8 {
+    (*reader).data = data;
+    *(*reader).data.offset(0)
+}
+"#,
+        &[
+            "fn init<'crat>",
+            "reader: &mut crate::Reader<'crat>",
+            "data: &'crat [u8]",
+        ],
+        &["Reader<'_>, mut data: &'crat"],
+    );
+}
+
+#[test]
+fn test_rewriter_ties_whole_struct_assignment_parameter_lifetimes() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub data: *const i32,
+}
+
+impl Copy for State {}
+impl Clone for State {
+    fn clone(&self) -> Self { *self }
+}
+
+pub unsafe fn seed() -> i32 {
+    let value = 7;
+    let state = State { data: &raw const value };
+    *state.data
+}
+
+pub unsafe fn copy(dest: *mut State, source: *const State) {
+    *dest = *source;
+}
+"#,
+        &[
+            "fn copy<'crat>",
+            "dest: &mut crate::State<'crat>",
+            "source: &crate::State<'crat>",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_related_parameters_use_return_lifetime() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Matrix {
+    pub values: [f32; 4],
+}
+
+pub unsafe fn assign(out: *mut Matrix, input: *const Matrix) -> *mut Matrix {
+    if out != input as *mut Matrix {
+        (*out).values = (*input).values;
+    }
+    out
+}
+"#,
+        &[
+            "fn assign<'a>",
+            "out: &'a mut crate::Matrix",
+            "input: Option<&'a crate::Matrix>",
+            "-> &'a mut crate::Matrix",
+        ],
+        &["'crat"],
+    );
+}
+
+#[test]
+fn test_rewriter_does_not_tie_snapshot_to_unpromoted_raw_source_field() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Reader {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct Snapshot {
+    pub data: *const u8,
+}
+
+unsafe fn advance_pointer(data: *mut *const u8) {
+    *data = (*data).offset(1);
+}
+
+pub unsafe fn advance(reader: *mut Reader) {
+    advance_pointer(&mut (*reader).data);
+}
+
+pub unsafe fn save(from: *const Reader, to: *mut Snapshot) {
+    (*to).data = (*from).data;
+}
+
+pub unsafe fn read(reader: *mut Reader) -> u8 {
+    let mut snapshot = Snapshot { data: std::ptr::null() };
+    save(reader, &raw mut snapshot);
+    advance(reader);
+    *snapshot.data
+}
+"#,
+        &["pub data: *const u8", "pub struct Snapshot<'"],
+        &[],
+    );
+}
+
+#[test]
+fn test_mutable_array_field_projection_through_promoted_struct_parameter() {
+    run_test(
+        r#"
+pub struct State {
+    pub values: [u32; 4],
+}
+
+pub unsafe fn initialize(state: *mut State) {
+    let p: *mut u32 = &mut *((*state).values.as_mut_ptr().offset(1));
+    *p = 7;
+}
+"#,
+        &["state: &mut crate::State"],
+        &["&mut ((*&*(state)).values)"],
+    );
+}
+
+#[test]
+fn test_shared_view_of_optional_mut_reference_does_not_reborrow_temporary() {
+    run_test(
+        r#"
+pub struct Queue {
+    pub values: [i32; 2],
+}
+
+unsafe fn first(queue: *const Queue) -> *const i32 {
+    (*queue).values.as_ptr()
+}
+
+unsafe fn update(queue: *mut Queue) {
+    (*queue).values[1] = 2;
+}
+
+pub unsafe fn read(queue: *mut Queue) -> i32 {
+    update(queue);
+    let value = first(queue);
+    *value
+}
+"#,
+        &[],
+        &[".as_deref()).as_deref()"],
+    );
+}
+
+#[test]
+fn test_nullable_struct_input_returning_interior_pointer_stays_raw() {
+    run_test(
+        r#"
+pub struct State {
+    pub values: [i32; 4],
+}
+
+pub unsafe fn first(state: *mut State) -> *mut i32 {
+    if state.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*state).values.as_mut_ptr()
+}
+"#,
+        &["state: *mut crate::State"],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_adds_named_lifetime_to_promoted_struct_alias() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub value: *mut i32,
+}
+
+pub type HolderAlias = Holder;
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let holder: HolderAlias = Holder { value: &raw mut x };
+    *holder.value
+}
+"#,
+        &[
+            "pub type HolderAlias<'a> = Holder<'a>",
+            "let holder: HolderAlias<'_>",
+        ],
+        &["pub type HolderAlias = Holder<'_>"],
+    );
+}
+
+#[test]
+fn test_rewriter_transforms_struct_literal_through_type_alias_constructor() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub value: *mut i32,
+}
+
+pub type HolderAlias = Holder;
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let mut holder = Holder { value: &raw mut x };
+    *holder.value = 7;
+    x
+}
+
+pub fn empty() {
+    let _holder: HolderAlias = HolderAlias { value: std::ptr::null_mut() };
+}
+"#,
+        &["HolderAlias { value: None }"],
+        &["HolderAlias { value: std::ptr::null_mut() }"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_reassigned_pointer_parameter_raw() {
+    run_test(
+        r#"
+pub unsafe fn replace(p: *mut i32) -> *mut i32 {
+    p
+}
+
+pub unsafe fn read(mut p: *mut i32) -> i32 {
+    p = replace(p);
+    *p
+}
+"#,
+        &["pub unsafe fn read(mut p: *mut i32)"],
+        &["pub unsafe fn read(mut p: Option<&mut i32>)"],
+    );
+}
+
+#[test]
 fn test_rewriter_demotes_multiple_mutable_struct_fields_from_same_local() {
     run_test(
         r#"
@@ -4416,6 +4902,34 @@ pub unsafe fn mark_if_linked(node: *mut Node) -> i32 {
 }
 
 #[test]
+fn test_cross_nominal_raw_struct_cast_demotes_pointer_field() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub chars: *mut u32,
+}
+
+#[repr(C)]
+pub struct Other {
+    pub chars: *mut u32,
+}
+
+extern "C" {
+    fn bridge(p: *mut Other);
+}
+
+pub unsafe fn read(a: *mut Holder, i: usize) -> u32 {
+    bridge(a as *mut Other);
+    *(*a).chars.offset(i as isize)
+}
+"#,
+        &["pub chars: *mut u32", "*(*a).chars.offset(i as isize)"],
+        &["pub chars: &mut [u32]"],
+    );
+}
+
+#[test]
 fn test_rewriter_preserves_address_taken_field_base_for_promoted_struct_param() {
     run_test(
         r#"
@@ -4450,10 +4964,10 @@ pub unsafe fn vm_init(vm: *mut VM) {
 "#,
         &[
             "pub unsafe fn vm_init(mut vm: &mut crate::VM)",
-            "init_vec((Some(&mut (*vm).stack)).unwrap())",
+            "&raw mut (vm.stack)",
             "vm.steps = 0",
         ],
-        &["&raw mut (vm.stack)", "&mut *(&raw mut"],
+        &[],
     );
 }
 
@@ -5991,7 +6505,8 @@ pub unsafe fn multiply_with_log(a: i32, b: i32) -> (i32, *mut i8) {
             "pub unsafe fn multiply_with_log(a: i32, b: i32) -> (i32, *mut i8)",
             "let mut log_msg: *mut i8 = std::ptr::null_mut();",
             "log_msg =",
-            "create_result_string(bytemuck::cast_slice",
+            "create_result_string(unsafe",
+            "std::slice::from_raw_parts",
         ],
         &[
             "Option<&mut i8>",
@@ -7254,6 +7769,84 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+/// a cast around a projected slice pointer must not hide its promoted base
+/// from null-check rewriting.
+#[test]
+fn test_is_null_projected_cast_slice() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut values: [libc::c_int; 4] = [0; 4];
+    let mut p: *mut libc::c_int = values.as_mut_ptr();
+    *p.offset(1 as isize) = 10 as libc::c_int;
+    if !((p.offset(1 as isize) as *mut libc::c_int).is_null()) {
+        return *p.offset(1 as isize);
+    }
+    return 0 as libc::c_int;
+}
+"#,
+        &["&mut [i32]", "is_empty"],
+        &["is_null", ").offset(1 as isize) as *mut i32"],
+    );
+}
+
+#[test]
+fn test_address_taken_pointer_field_stays_raw_for_nested_pointer_parameter() {
+    run_test(
+        r#"
+pub struct Context {
+    pub next: *const u8,
+}
+
+unsafe fn advance(next: *mut *const u8) {
+    *next = (*next).offset(1);
+}
+
+pub unsafe fn read(context: *mut Context) -> u8 {
+    let before = *(*context).next;
+    advance(&mut (*context).next);
+    before + *(*context).next
+}
+"#,
+        &["pub next: *const u8", "&raw mut (context.next)"],
+        &[
+            "pub next: &[u8]",
+            "pub next: crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_fields_stay_raw_across_nominal_struct_pointer_cast() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Number {
+    pub len: usize,
+    pub data: *mut u32,
+}
+
+#[repr(C)]
+pub struct AllocatorNumber {
+    pub len: usize,
+    pub data: *mut u32,
+}
+
+unsafe fn reserve(number: *mut AllocatorNumber) {
+    (*number).len = 1;
+}
+
+pub unsafe fn set(number: *mut Number) {
+    reserve(number as *mut AllocatorNumber);
+    *(*number).data = 7;
+}
+"#,
+        &["pub data: *mut u32"],
+        &["pub data: Option<&mut u32>", "pub data: &mut [u32]"],
+    );
+}
+
 /// Return statement with raw pointer return type — p is internally OptRef
 /// but the function returns `*mut c_int`, so the return coerces p to Raw.
 #[test]
@@ -7962,7 +8555,7 @@ pub unsafe fn foo(info: *mut Info) {
     consume((*info).addr.as_mut_ptr().offset(pos as isize));
 }
 "#,
-        &["consume(&mut ((*info).addr)[(pos as isize) as usize..]);"],
+        &["consume(&mut (info.addr)[(pos as isize) as usize..]);"],
         &["from_raw_parts_mut", ".addr.as_mut_ptr().offset"],
     );
 }
@@ -7995,7 +8588,7 @@ pub unsafe fn transform(m: *mut Md5) -> u32 {
             "unpack(&",
             "buffer)[",
             "10 as core::ffi::c_int",
-            "* 4 as core::ffi::c_int",
+            "4 as core::ffi::c_int",
             "as usize..])",
         ],
         &["from_raw_parts", ".buffer.as_mut_ptr().offset"],
@@ -8223,6 +8816,134 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_static_i8_bytestr_slice_uses_const_compatible_cast() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub name: *const i8,
+}
+
+impl Copy for Entry {}
+impl Clone for Entry {
+    fn clone(&self) -> Self { *self }
+}
+
+static mut ENTRIES: [Entry; 1] = [Entry {
+    name: b"name\0" as *const u8 as *const i8,
+}];
+
+pub unsafe fn read_name() -> i8 {
+    let entry = ENTRIES[0];
+    *entry.name.offset(0) + *entry.name.offset(1)
+}
+"#,
+        &["std::slice::from_raw_parts", "*const i8"],
+        &["bytemuck::cast_slice"],
+    );
+}
+
+#[test]
+fn test_mutable_bytestr_argument_uses_writable_copy() {
+    run_test(
+        r#"
+pub unsafe fn overwrite(p: *mut i8) {
+    *p.offset(0) = b'X' as i8;
+    *p.offset(1) = b'Y' as i8;
+}
+pub unsafe fn caller() {
+    overwrite(b"ab\0" as *const u8 as *const i8 as *mut i8);
+}
+"#,
+        &["Box::leak", "to_vec().into_boxed_slice()"],
+        &[],
+    );
+}
+
+#[test]
+fn test_bytestr_conditional_cast_drops_obsolete_raw_cast() {
+    run_test(
+        r#"
+pub unsafe fn first(flag: bool) -> i8 {
+    let fmt: *mut i8 = (if flag {
+        b"a\0" as *const u8 as *const i8
+    } else {
+        b"b\0" as *const u8 as *const i8
+    }) as *mut i8;
+    *fmt
+}
+"#,
+        &["let fmt: &i8", "std::slice::from_raw_parts"],
+        &["as *mut i8"],
+    );
+}
+
+#[test]
+fn test_casted_raw_pointer_deref_keeps_pointee_cast() {
+    run_test(
+        r#"
+pub unsafe fn read(ptr: *mut core::ffi::c_void) -> u32 {
+    *(ptr as *mut u32)
+}
+"#,
+        &["*(ptr as *mut u32)"],
+        &["*ptr"],
+    );
+}
+
+#[test]
+fn test_transmuted_fn_ptr_local_call_uses_declared_raw_signature() {
+    run_test(
+        r#"
+pub type Erased = Option<unsafe fn()>;
+pub type Concrete = Option<unsafe fn(*mut i32)>;
+
+pub struct Hooks {
+    pub callback: Erased,
+}
+
+pub unsafe fn target(p: *mut i32) {
+    *p = 7;
+}
+
+pub unsafe fn install(hooks: &mut Hooks) {
+    hooks.callback = std::mem::transmute::<Concrete, Erased>(
+        Some(target as unsafe fn(*mut i32)),
+    );
+}
+
+pub unsafe fn invoke(hooks: &Hooks, p: *mut i32) {
+    let callback: Concrete = std::mem::transmute::<Erased, Concrete>(hooks.callback);
+    callback.unwrap()(p);
+}
+"#,
+        &["callback.unwrap()((p).as_mut_ptr())"],
+        &["callback.unwrap()((p).as_mut())"],
+    );
+}
+
+#[test]
+fn test_fn_ptr_cast_rewrites_pointer_type_alias_inputs() {
+    run_test(
+        r#"
+pub type IntPtr = *mut i32;
+
+pub unsafe fn target(p: IntPtr) {
+    *p = 7;
+}
+
+pub unsafe fn install() {
+    let _erased = std::mem::transmute::<_, unsafe fn()>(
+        target as unsafe fn(IntPtr),
+    );
+}
+"#,
+        &["target as unsafe fn(&mut i32)"],
+        &["target as unsafe fn(IntPtr)"],
+    );
+}
+
 // ===== Fallthrough tests (lines 734-755): struct field pointer access =====
 
 /// Fallthrough + OptRef: struct field `s.data` is a `*mut c_int` → `PtrExprBaseKind::Other`.
@@ -8342,8 +9063,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(0 as isize);
 }
 "#,
-        &["let _x", "from_raw_parts_mut"],
-        &["as *mut _"],
+        &["let _x", "from_raw_parts_mut", "as *mut _"],
+        &[],
     );
 }
 
@@ -8392,6 +9113,50 @@ pub unsafe extern "C" fn foo() {
 }
 
 #[test]
+fn test_negative_offset_from_struct_field_address_stays_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub prefix: [i32; 4],
+    pub fields: [i32; 4],
+}
+
+pub unsafe fn read_prefix(info: &mut Info) -> i32 {
+    *(&mut info.fields[0] as *mut i32).offset(-(3 as isize))
+}
+"#,
+        &["as *mut i32).offset(-(3 as isize))"],
+        &["18446744073709551613", "slice::from_mut", "slice::from_ref"],
+    );
+}
+
+#[test]
+fn test_flexible_array_member_pointer_uses_allocated_tail() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Stream {
+    pub count: i32,
+    pub buffer: [f64; 0],
+}
+
+pub unsafe fn update(stream: *mut Stream, index: i32, value: f64) -> f64 {
+    let buffer: *mut f64 = (*stream).buffer.as_mut_ptr();
+    *buffer.offset(index as isize) = value;
+    *buffer.offset(index as isize)
+}
+"#,
+        &[
+            "SliceCursorMut<'_, f64>",
+            "SliceCursorMut::from_raw_parts_mut",
+            "1_000_000",
+        ],
+        &["SliceCursorMut::new(&mut stream.buffer)"],
+    );
+}
+
+#[test]
 fn test_param_byte_cast_offset_rewrites_to_slice_cursor() {
     run_test(
         r#"
@@ -8424,7 +9189,7 @@ pub unsafe extern "C" fn caller(info: *mut Info, offset: i32, value: u32) {
 }
 
 #[test]
-fn test_raw_local_noop_cast_call_does_not_demote_cursor_callee() {
+fn test_foreign_struct_escape_demotes_later_array_field_pointer() {
     run_test(
         r#"
 #[repr(C)]
@@ -8448,15 +9213,12 @@ pub unsafe extern "C" fn caller(v_info: *mut core::ffi::c_void, offset: i32, val
 }
 "#,
         &[
-            "crate::slice_cursor::SliceCursorMut<'_, u32>",
-            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
-            "as *mut u8, 1_000_000",
-            "set_type(if (leaf_addr).is_null()",
-            "SliceCursorMut::from_raw_parts_mut((leaf_addr),",
+            "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
+            "let mut leaf_addr: *mut u32",
+            "set_type(leaf_addr as *mut u32, offset, value)",
         ],
         &[
-            "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
-            "*(addr as *mut u8).offset",
+            "crate::slice_cursor::SliceCursorMut<'_, u32>",
             "bytemuck::cast_slice_mut",
         ],
     );
@@ -8735,6 +9497,58 @@ pub unsafe fn drive() -> u8 {
 }
 
 #[test]
+fn test_raw_field_caller_keeps_dynamic_backward_cursor_input_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub values: *mut u16,
+}
+
+pub unsafe fn store(values: *mut u16, links: *const i32) {
+    *values.offset(*links.offset(1) as isize) = 7;
+}
+
+pub unsafe fn drive(state: *mut State, links: *const i32) {
+    store((*state).values, links);
+}
+"#,
+        &["pub unsafe fn store(mut values: *mut u16"],
+        &[
+            "pub unsafe fn store(values: crate::slice_cursor::SliceCursorMut",
+            "SliceCursorMut::from_raw_parts_mut((*state).values",
+        ],
+    );
+}
+
+#[test]
+fn test_local_loaded_from_raw_abi_field_stays_raw() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("update".to_string());
+    run_test_with_config(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub values: *mut u32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn update(state: *mut State, index: usize, value: u32) {
+    let values: *mut u32 = (*state).values;
+    *values.offset(index as isize) = value;
+}
+"#,
+        &config,
+        &[
+            "pub values: *mut u32",
+            "let mut values: *mut u32",
+            "*values.offset(index as isize) = value",
+        ],
+        &["let values: &mut [u32]", "from_raw_parts_mut(state.values"],
+    );
+}
+
+#[test]
 fn test_array_pointer_caller_keeps_negative_cursor_input_cursor() {
     run_test(
         r#"
@@ -8766,7 +9580,10 @@ pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) {
     *p.offset(a).offset(b) = 1;
 }
 "#,
-        &["(p)[((a) as isize).wrapping_add((b) as isize)] = 1"],
+        &[
+            "let __crat_index = ((a) as isize).wrapping_add((b) as isize);",
+            "(p)[__crat_index] = 1",
+        ],
         &["(p).as_deref_mut().offset_by"],
     );
 }
@@ -8946,8 +9763,8 @@ pub unsafe fn copy_tail(
     );
 }
 "#,
-        &["&((*src).data)[("],
-        &["&mut ((*src).data)"],
+        &["&(src.data)[("],
+        &["&mut (src.data)"],
     );
 }
 

@@ -101,6 +101,29 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
                     .tcx
                     .mir_drops_elaborated_and_const_checked(def_id)
                     .borrow();
+                const MAX_BODY_LOCATIONS: usize = 1_000;
+                let body_locations = body
+                    .basic_blocks
+                    .iter()
+                    .map(|block| block.statements.len() + usize::from(block.terminator.is_some()))
+                    .sum::<usize>();
+                let trace = std::env::var_os("CRAT_ACCESS_ORDER_TRACE").is_some();
+                if trace {
+                    eprintln!(
+                        "ACCESS_ORDER_START function={} locations={body_locations}",
+                        self.tcx.def_path_str(def_id.to_def_id()),
+                    );
+                }
+                if body_locations > MAX_BODY_LOCATIONS {
+                    self.summaries.insert(def_id, budget_exceeded_summary());
+                    if trace {
+                        eprintln!(
+                            "ACCESS_ORDER_SKIP function={} reason=body_budget",
+                            self.tcx.def_path_str(def_id.to_def_id()),
+                        );
+                    }
+                    continue;
+                }
                 let Some(flow) = self.flows.get(&def_id) else {
                     self.summaries.insert(
                         def_id,
@@ -154,6 +177,12 @@ impl<'a, 'tcx> AccessOrderAnalysis<'a, 'tcx> {
                 );
                 let summary = solve_body(&body, &effects, &atomic_loops);
                 self.summaries.insert(def_id, summary);
+                if trace {
+                    eprintln!(
+                        "ACCESS_ORDER_DONE function={}",
+                        self.tcx.def_path_str(def_id.to_def_id()),
+                    );
+                }
             }
         }
     }
