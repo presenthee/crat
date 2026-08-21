@@ -115,13 +115,21 @@ impl BytemuckDependency {
 }
 
 pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, BytemuckDependency) {
+    let started = std::time::Instant::now();
+    let progress = |step: &str| {
+        if config.verbose {
+            println!("Pointer replace: {step} ({:?})", started.elapsed());
+        }
+    };
+    progress("build expanded AST");
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let (input, analysis_results, fn_ptr_groups, fn_ptr_rewrite) =
-        analyze(config, PointerDecisionOptions::default(), tcx);
+        analyze(config, PointerDecisionOptions::default(), tcx, &progress);
 
+    progress("rewrite AST");
     let diagnostics = diagnostics::DecisionDiagnostics::from_env();
     let mut visitor = TransformVisitor::new(
         config,
@@ -135,6 +143,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     visitor.visit_crate(&mut krate);
 
     // add SliceCursor module to the crate if it was used
+    progress("print transformed AST");
     let slice_cursor_used = visitor.slice_cursor.get();
     let mut code = pprust::crate_to_string_for_macros(&krate);
     if slice_cursor_used {
@@ -143,6 +152,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     }
 
     visitor.emit_diagnostics();
+    progress("done");
 
     (code, visitor.bytemuck_dependency())
 }
@@ -152,7 +162,7 @@ pub fn initial_pointer_decisions(
     options: PointerDecisionOptions,
     tcx: TyCtxt<'_>,
 ) -> InitialPointerDecisions {
-    let (input, analysis, fn_ptr_groups, _) = analyze(config, options, tcx);
+    let (input, analysis, fn_ptr_groups, _) = analyze(config, options, tcx, &|_: &str| {});
     let lifetime_plans = lifetimes::LifetimePlans::new(&input, &analysis);
     let signatures = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
     let diffs = collector::collect_diffs(&input, &analysis, &signatures, &fn_ptr_groups);
@@ -166,6 +176,7 @@ fn analyze<'tcx>(
     config: &Config,
     options: PointerDecisionOptions,
     tcx: TyCtxt<'tcx>,
+    progress: &dyn Fn(&str),
 ) -> (
     RustProgram<'tcx>,
     Analysis,
@@ -173,15 +184,20 @@ fn analyze<'tcx>(
     FnPtrRewriteDecision,
 ) {
     let input = collect_input(tcx);
+    progress("build type shapes");
     let arena = typed_arena::Arena::new();
     let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
     let andersen_config = andersen::Config {
         use_optimized_mir: false,
         c_exposed_fns: config.c_exposed_fns.clone(),
     };
+    progress("pre-analyze points-to");
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
+    progress("solve points-to");
     let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+    progress("find parameter aliases");
     let aliases = find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
+    progress("post-analyze points-to");
     let points_to = andersen::post_analyze(
         &andersen_config,
         pre_points_to.clone(),
@@ -190,23 +206,31 @@ fn analyze<'tcx>(
         tcx,
     );
 
+    progress("analyze mutability");
     let mutability_result =
         analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
+    progress("compute output parameters");
     let output_params =
         analyses::output_params::compute_output_params(&input, &mutability_result, &aliases);
+    progress("analyze ownership");
     let ownership_schemes = maybe_solidified_ownership(config, &input, &output_params);
+    progress("group source variables");
     let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
     let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
+    progress("analyze borrow promotion");
     let borrow_promotion_result =
         analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
     let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
+    progress("analyze struct copies");
     let struct_copy_result =
         analyses::struct_copy::analyze(&input, &borrow_promotion_result.mutable_fields);
     let promoted_mut_ref_result = source_var_groups
         .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
     let promoted_shared_ref_result = source_var_groups
         .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
+    progress("analyze pointer fatness");
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
+    progress("analyze offset signs");
     let offset_sign_result = if options.assume_nonnegative_offsets {
         OffsetSignResult::default()
     } else {
@@ -214,6 +238,7 @@ fn analyze<'tcx>(
         result.access_signs = source_var_groups.postprocess_offset_signs(result.access_signs);
         result
     };
+    progress("analyze nullity");
     let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
     nullity_result.non_null_locals =
         source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
@@ -233,12 +258,14 @@ fn analyze<'tcx>(
         source_var_groups,
     };
 
+    progress("build function-pointer groups");
     let fn_ptr_groups = FnPtrGroups::build(
         &pre_points_to,
         &points_to_solutions,
         &input,
         &analysis_results,
     );
+    progress("decide function-pointer rewrites");
     let fn_ptr_rewrite = FnPtrRewriteDecision::build(
         &pre_points_to,
         &points_to_solutions,
@@ -327,19 +354,29 @@ pub fn rewrite_struct_param_fields(
 /// go to stderr under `CRAT_SNAPSHOT_TRACE`; `CRAT_SNAPSHOT_VALIDATE` adds a
 /// `debug_assert_eq!` after each exact-prefix copy.
 pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+    let started = std::time::Instant::now();
+    let progress = |step: &str| {
+        if config.verbose {
+            println!("Pointer aliasing: {step} ({:?})", started.elapsed());
+        }
+    };
+    progress("build expanded AST");
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let input = collect_input(tcx);
+    progress("build type shapes");
     let arena = typed_arena::Arena::new();
     let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
     let andersen_config = andersen::Config {
         use_optimized_mir: false,
         c_exposed_fns: config.c_exposed_fns.clone(),
     };
+    progress("pre-analyze points-to");
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
     let alloc_fns = pre_points_to.alloc_fns.clone();
+    progress("solve points-to");
     let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
 
     let trace = snapshot_rewriter::trace_enabled();
@@ -369,9 +406,13 @@ pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
         eprintln!("SNAPSHOT_EQUIV ok ({} callees)", expected.len());
     }
 
+    progress("analyze pointer flow");
     let flows = analyses::pointer_flow::pointer_flow_analysis(&input, &alloc_fns);
+    progress("classify array provenance");
     let provenances = analyses::array_local_provenance::array_local_provenance_from_flows(&flows);
+    progress("analyze access order");
     let access_order = analyses::access_order::AccessOrderAnalysis::analyze(&input, &flows);
+    progress("detect snapshot candidates");
     let candidates =
         analyses::aliasing::detect_snapshot_candidates(&input, &provenances, &access_order, trace);
     if trace {
@@ -386,6 +427,7 @@ pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
         }
     }
 
+    progress("plan snapshot rewrites");
     let changed = if candidates.is_empty() {
         false
     } else {
@@ -423,6 +465,7 @@ pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
         snapshot_rewriter::apply_snapshot_isolation(&mut krate, &sites, &ast_to_hir, validate)
     };
 
+    progress("print transformed AST");
     (pprust::crate_to_string_for_macros(&krate), changed)
 }
 
@@ -682,8 +725,8 @@ fn slice_cursor_mod_str() -> &'static str {
             SliceCursorMut { base: &mut self.base[..], pos: self.pos }
         }
 
-        pub fn as_deref(self) -> SliceCursor<'a, T> {
-            SliceCursor { base: self.base, pos: self.pos }
+        pub fn as_deref(&self) -> SliceCursor<'_, T> {
+            SliceCursor { base: &self.base[..], pos: self.pos }
         }
 
         pub fn seek(&mut self, offset: isize) {
@@ -720,6 +763,10 @@ fn slice_cursor_mod_str() -> &'static str {
         }
 
         pub fn as_slice_mut(&mut self) -> &mut [T] {
+            &mut self.base[self.pos..]
+        }
+
+        pub fn into_slice_mut(self) -> &'a mut [T] {
             &mut self.base[self.pos..]
         }
     }

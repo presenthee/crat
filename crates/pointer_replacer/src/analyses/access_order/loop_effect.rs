@@ -86,6 +86,9 @@ pub(crate) fn build_loop_effect<'tcx>(
                     phase,
                 )?);
                 accesses.extend(intrinsic_phase_accesses);
+                if accesses.len() > ACCESS_SUMMARY_BUDGET {
+                    return None;
+                }
                 phase = phase.checked_add(1)?;
                 continue;
             }
@@ -97,6 +100,9 @@ pub(crate) fn build_loop_effect<'tcx>(
                     footprint,
                     phase,
                 }));
+                if accesses.len() > ACCESS_SUMMARY_BUDGET {
+                    return None;
+                }
                 phase = phase.checked_add(1)?;
             }
         }
@@ -132,6 +138,9 @@ pub(crate) fn build_loop_effect<'tcx>(
                         }
                         for read in &builtin_phase_accesses[index + 1..] {
                             if read.kind == AccessKind::Read {
+                                if same_iteration_hazards.len() >= ACCESS_SUMMARY_BUDGET {
+                                    return None;
+                                }
                                 same_iteration_hazards.push(PotentialHazard {
                                     write: write.footprint.clone(),
                                     read: read.footprint.clone(),
@@ -141,6 +150,9 @@ pub(crate) fn build_loop_effect<'tcx>(
                         }
                     }
                     accesses.extend(builtin_phase_accesses);
+                    if accesses.len() > ACCESS_SUMMARY_BUDGET {
+                        return None;
+                    }
                     phase = phase.checked_add(1)?;
                     continue;
                 }
@@ -168,6 +180,9 @@ pub(crate) fn build_loop_effect<'tcx>(
                                 phase,
                             }),
                     );
+                    if accesses.len() > ACCESS_SUMMARY_BUDGET {
+                        return None;
+                    }
                 }
                 for write in &summary.effect.writes {
                     accesses.extend(
@@ -180,6 +195,9 @@ pub(crate) fn build_loop_effect<'tcx>(
                                 phase,
                             }),
                     );
+                    if accesses.len() > ACCESS_SUMMARY_BUDGET {
+                        return None;
+                    }
                 }
                 for hazard in &summary.effect.hazards {
                     if hazard.order != HazardOrder::Sequential {
@@ -187,13 +205,18 @@ pub(crate) fn build_loop_effect<'tcx>(
                     }
                     let writes = tracer.substitute_footprint(&hazard.write, args, frame)?;
                     let reads = tracer.substitute_footprint(&hazard.read, args, frame)?;
-                    same_iteration_hazards.extend(writes.iter().flat_map(|write| {
-                        reads.iter().map(|read| PotentialHazard {
-                            write: write.clone(),
-                            read: read.clone(),
-                            order: HazardOrder::SameIteration(recognized.id),
-                        })
-                    }));
+                    for write in &writes {
+                        for read in &reads {
+                            if same_iteration_hazards.len() >= ACCESS_SUMMARY_BUDGET {
+                                return None;
+                            }
+                            same_iteration_hazards.push(PotentialHazard {
+                                write: write.clone(),
+                                read: read.clone(),
+                                order: HazardOrder::SameIteration(recognized.id),
+                            });
+                        }
+                    }
                 }
                 phase = phase.checked_add(1)?;
             }
@@ -236,11 +259,17 @@ pub(crate) fn build_loop_effect<'tcx>(
     for write in &writes {
         for read in &reads {
             if write.phase < read.phase {
+                if hazards.len() >= ACCESS_SUMMARY_BUDGET {
+                    return None;
+                }
                 hazards.push(PotentialHazard {
                     write: write.footprint.clone(),
                     read: read.footprint.clone(),
                     order: HazardOrder::SameIteration(recognized.id),
                 });
+            }
+            if hazards.len() >= ACCESS_SUMMARY_BUDGET {
+                return None;
             }
             hazards.push(PotentialHazard {
                 write: write.footprint.clone(),
