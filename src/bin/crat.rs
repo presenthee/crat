@@ -119,6 +119,16 @@ struct Args {
         help = "Enable verbose ownership solver output for the pointer pass"
     )]
     pointer_verbose: bool,
+    #[arg(
+        long,
+        help = "Skip the five pointer preparation sub-passes before replacing local borrows"
+    )]
+    pointer_skip_prepasses: bool,
+    #[arg(
+        long,
+        help = "Report raw-pointer type counts at pointer sub-pass boundaries"
+    )]
+    pointer_report_raw_pointers: bool,
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
     #[arg(long, value_delimiter = ',', help = "Transformation passes to run")]
@@ -553,85 +563,136 @@ fn main() {
                 }
             }
             Pass::Pointer => {
-                if config.verbose {
-                    println!("Pointer: rewrite struct arrays");
-                }
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_struct_arrays(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
-
-                if config.verbose {
-                    println!("Pointer: rewrite struct parameter fields");
-                }
-                let (s, changed, field_specs) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
-                })
-                .unwrap();
-                if !field_specs.is_empty() {
-                    // the sidecar persists across reruns on purpose: a rerun over
-                    // already-specialized output finds nothing to specialize (empty map)
-                    // but the existing records are still what the interface pass needs;
-                    // genuinely stale entries fail closed there (no {name}_field fn)
-                    let field_spec_path = dir.join("field_spec_map.json");
-                    std::fs::write(
-                        &field_spec_path,
-                        serde_json::to_string_pretty(&field_specs).unwrap(),
-                    )
+                let report_raw_pointers = args.pointer_report_raw_pointers;
+                let report = |stage: &str, count: Option<usize>| {
+                    if let Some(count) = count {
+                        println!("POINTER_RAW_POINTERS stage={stage} count={count}");
+                    }
+                };
+                if !args.pointer_skip_prepasses {
+                    if config.verbose {
+                        println!("Pointer: rewrite struct arrays");
+                    }
+                    let (s, changed, count) = run_compiler_on_path(&file, |tcx| {
+                        let count = report_raw_pointers
+                            .then(|| finders::raw_pointer_finder::count_raw_pointers(tcx));
+                        let (s, changed) =
+                            pointer_replacer::rewrite_struct_arrays(&config.pointer, tcx);
+                        (s, changed, count)
+                    })
                     .unwrap();
-                }
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
+                    report("input", count);
+                    if changed {
+                        std::fs::write(&file, s).unwrap();
+                    }
 
-                if config.verbose {
-                    println!("Pointer: split borrow epochs");
-                }
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_epoch_split(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
+                    if config.verbose {
+                        println!("Pointer: rewrite struct parameter fields");
+                    }
+                    let (s, changed, field_specs, count) = run_compiler_on_path(&file, |tcx| {
+                        let count = report_raw_pointers
+                            .then(|| finders::raw_pointer_finder::count_raw_pointers(tcx));
+                        let (s, changed, field_specs) =
+                            pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx);
+                        (s, changed, field_specs, count)
+                    })
+                    .unwrap();
+                    report("struct_arrays", count);
+                    if !field_specs.is_empty() {
+                        // the sidecar persists across reruns on purpose: a rerun over
+                        // already-specialized output finds nothing to specialize (empty map)
+                        // but the existing records are still what the interface pass needs;
+                        // genuinely stale entries fail closed there (no {name}_field fn)
+                        let field_spec_path = dir.join("field_spec_map.json");
+                        std::fs::write(
+                            &field_spec_path,
+                            serde_json::to_string_pretty(&field_specs).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    if changed {
+                        std::fs::write(&file, s).unwrap();
+                    }
 
-                if config.verbose {
-                    println!("Pointer: rewrite aliasing");
-                }
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_aliasing(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
+                    if config.verbose {
+                        println!("Pointer: split borrow epochs");
+                    }
+                    let (s, changed, count) = run_compiler_on_path(&file, |tcx| {
+                        let count = report_raw_pointers
+                            .then(|| finders::raw_pointer_finder::count_raw_pointers(tcx));
+                        let (s, changed) =
+                            pointer_replacer::rewrite_epoch_split(&config.pointer, tcx);
+                        (s, changed, count)
+                    })
+                    .unwrap();
+                    report("struct_param_fields", count);
+                    if changed {
+                        std::fs::write(&file, s).unwrap();
+                    }
 
-                if config.verbose {
-                    println!("Pointer: rewrite array local provenance");
-                }
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_array_local_provenance(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
+                    if config.verbose {
+                        println!("Pointer: rewrite aliasing");
+                    }
+                    let (s, changed, count) = run_compiler_on_path(&file, |tcx| {
+                        let count = report_raw_pointers
+                            .then(|| finders::raw_pointer_finder::count_raw_pointers(tcx));
+                        let (s, changed) = pointer_replacer::rewrite_aliasing(&config.pointer, tcx);
+                        (s, changed, count)
+                    })
+                    .unwrap();
+                    report("epoch_split", count);
+                    if changed {
+                        std::fs::write(&file, s).unwrap();
+                    }
+
+                    if config.verbose {
+                        println!("Pointer: rewrite array local provenance");
+                    }
+                    let (s, changed, count) = run_compiler_on_path(&file, |tcx| {
+                        let count = report_raw_pointers
+                            .then(|| finders::raw_pointer_finder::count_raw_pointers(tcx));
+                        let (s, changed) =
+                            pointer_replacer::rewrite_array_local_provenance(&config.pointer, tcx);
+                        (s, changed, count)
+                    })
+                    .unwrap();
+                    report("aliasing", count);
+                    if changed {
+                        std::fs::write(&file, s).unwrap();
+                    }
                 }
 
                 if config.verbose {
                     println!("Pointer: replace local borrows");
                 }
-                let (s, bytemuck) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::replace_local_borrows(&config.pointer, tcx)
+                let (s, bytemuck, count) = run_compiler_on_path(&file, |tcx| {
+                    let count = report_raw_pointers
+                        .then(|| finders::raw_pointer_finder::count_raw_pointers(tcx));
+                    let (s, bytemuck) =
+                        pointer_replacer::replace_local_borrows(&config.pointer, tcx);
+                    (s, bytemuck, count)
                 })
                 .unwrap();
+                report(
+                    if args.pointer_skip_prepasses {
+                        "input"
+                    } else {
+                        "array_local_provenance"
+                    },
+                    count,
+                );
                 std::fs::write(&file, s).unwrap();
                 if bytemuck.needs_derive() {
                     utils::bytemuck::ensure_bytemuck_with_derive(&dir);
                 } else if bytemuck.needs_runtime() && !utils::has_dependency(&dir, "bytemuck") {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
+                }
+                if report_raw_pointers {
+                    let count = run_compiler_on_path(&file, |tcx| {
+                        finders::raw_pointer_finder::count_raw_pointers(tcx)
+                    })
+                    .unwrap();
+                    report("replace_local_borrows", Some(count));
                 }
             }
             Pass::Static => {

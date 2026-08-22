@@ -25,6 +25,8 @@ enum Finder {
     Macro,
     Mapper,
     Mir,
+    #[value(name = "raw-pointer")]
+    RawPointer,
     Unsafe,
 }
 
@@ -50,6 +52,9 @@ fn main() {
         }
         Finder::Mir => {
             run_compiler_on_path(&file, finders::mir::run).unwrap();
+        }
+        Finder::RawPointer => {
+            run_compiler_on_path(&file, finders::raw_pointer_finder::find_raw_pointers).unwrap();
         }
         Finder::Unsafe => {
             run_compiler_on_path(&file, |tcx| {
