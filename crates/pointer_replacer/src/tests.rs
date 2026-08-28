@@ -17,6 +17,28 @@ fn rewrite_array_local_provenance_with_config(code: &str, config: &Config) -> (S
     .unwrap()
 }
 
+fn run_gated_prepasses_then_pointer(code: &str, config: &Config) -> (GatedPrepassResult, String) {
+    let gated = run_gated_pointer_prepasses(config, code);
+    let (final_source, _) = rewrite_with_config(&gated.source, config);
+    (gated, final_source)
+}
+
+fn rewrite_array_local_provenance_with_allowlist(
+    code: &str,
+    accepted: Option<&rustc_hash::FxHashSet<crate::rewriter::profitability::CandidateId>>,
+    lineage: &crate::rewriter::profitability::LineageCatalog,
+) -> crate::rewriter::array_local_index_rewriter::ArrayLocalRewriteResult {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_with_allowlist(
+            &Config::default(),
+            tcx,
+            accepted,
+            lineage,
+        )
+    })
+    .unwrap()
+}
+
 fn array_local_trace_events(code: &str) -> Vec<crate::rewriter::array_local_trace::TraceEvent> {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true).1
@@ -11609,7 +11631,7 @@ pub unsafe fn f(mut s: *mut State, mut n: isize) -> i32 {
 }
 
 #[test]
-fn test_array_local_rewriter_rewrites_field_base_cursor_local_used_in_offset_from() {
+fn test_array_local_rewriter_skips_group_when_member_application_fails() {
     let code = r#"
 #[repr(C)]
 pub struct ProcessState {
@@ -11636,26 +11658,11 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        changed,
-        "expected field-base cursor local to be rewritten:\n{s}"
-    );
+    assert!(!changed, "partial group rewrite must be rolled back:\n{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    // cursor is now an Option<isize> because memchr may return null
-    assert!(s.contains("ptr_idx: Option<isize>"), "{s}");
-    assert!(!s.contains("let mut ptr: *mut i8"), "{s}");
-    assert!(!s.contains("let ptr: *mut i8"), "{s}");
-    // memchr arg inlines the nullable cursor via map_or: ...map_or(...null..., |idx| ...offset(idx)...)
-    assert!(
-        s.contains("ptr_idx.map_or(") && s.contains(".offset(idx)"),
-        "expected memchr to inline nullable ptr_idx via map_or from the field base:\n{s}"
-    );
-    assert!(!s.contains("memchr(ptr as *const core::ffi::c_void"), "{s}");
-    assert!(!s.contains("ptr = found.offset(1)"), "{s}");
-    assert!(
-        !s.contains("ptr = ((*state).buffer).offset(ptr_idx)"),
-        "{s}"
-    );
+    assert!(s.contains("let mut ptr: *mut i8"), "{s}");
+    assert!(s.contains("let mut found: *mut i8"), "{s}");
+    assert!(!s.contains("ptr_idx"), "{s}");
 }
 
 #[test]
@@ -12147,6 +12154,7 @@ pub unsafe fn foo(base: *mut i8, needle: *const i8, n: isize) -> i32 {
     }
     total
 }
+
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(changed, "{s}");
@@ -12160,10 +12168,315 @@ pub unsafe fn foo(base: *mut i8, needle: *const i8, n: isize) -> i32 {
     );
 }
 
+#[test]
+fn test_array_local_allowlist_replays_complete_candidate_with_stable_member_order() {
+    // this catches a replay implementation that derives an ID from HashMap
+    // iteration or applies only a subset of a provenance rewrite group.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut q: *mut i32 = base.offset(2);
+    let mut p: *mut i32 = base.offset(1);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        total += *p + *q;
+        p = p.offset(1);
+        q = q.offset(1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let trial = rewrite_array_local_provenance_with_allowlist(
+        code,
+        None,
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert_eq!(trial.candidates.len(), 1, "{trial:#?}");
+    let candidate = &trial.candidates[0];
+    let artifact_ids = candidate
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.id.clone())
+        .collect::<rustc_hash::FxHashSet<_>>();
+    assert_eq!(
+        artifact_ids.len(),
+        candidate.artifacts.len(),
+        "{candidate:#?}"
+    );
+    let crate::rewriter::profitability::CandidateId::ArrayLocal { members, .. } = &candidate.id
+    else {
+        panic!("array-local pass produced a non-array candidate: {candidate:#?}");
+    };
+    assert_eq!(
+        members.as_slice(),
+        &[
+            crate::rewriter::profitability::SourceBindingKey::new("p", 0),
+            crate::rewriter::profitability::SourceBindingKey::new("q", 0),
+        ],
+    );
+    let accepted = rustc_hash::FxHashSet::from_iter([candidate.id.clone()]);
+    let replay = rewrite_array_local_provenance_with_allowlist(
+        code,
+        Some(&accepted),
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert!(replay.changed, "{}", replay.source);
+    assert_eq!(replay.candidates.len(), 1);
+    assert!(replay.source.contains("p_idx"), "{}", replay.source);
+    assert!(replay.source.contains("q_idx"), "{}", replay.source);
+    ::utils::compilation::run_compiler_on_str(&replay.source, ::utils::type_check)
+        .expect(&replay.source);
+}
+
+#[test]
+fn test_array_local_allowlist_omits_unaccepted_group() {
+    // an explicit replay allowlist is a hard gate: no matching record means the
+    // whole group remains source-identical, regardless of its local cost shape.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    p = p.offset(1);
+    *p
+}
+"#;
+    let accepted = rustc_hash::FxHashSet::default();
+    let replay = rewrite_array_local_provenance_with_allowlist(
+        code,
+        Some(&accepted),
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert!(!replay.changed, "{}", replay.source);
+    assert!(replay.candidates.is_empty(), "{replay:#?}");
+    assert!(replay.source.contains("let mut p: *mut i32"));
+    ::utils::compilation::run_compiler_on_str(&replay.source, ::utils::type_check)
+        .expect(&replay.source);
+}
+
+#[test]
+fn test_array_local_profitability_rejection_omits_replay_group() {
+    // with raw materializations tied, the compiler-backed reports expose one
+    // additional trial unsafe operation, so the shared gate rejects the group.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let trial = rewrite_array_local_provenance_with_allowlist(
+        code,
+        None,
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert!(trial.changed, "{}", trial.source);
+    let trial_report = ::utils::compilation::run_compiler_on_str(&trial.source, |tcx| {
+        crate::rewriter::collect_promotion_report(
+            &Config::default(),
+            tcx,
+            &crate::rewriter::profitability::LineageCatalog::default(),
+            &trial.artifacts,
+        )
+    })
+    .unwrap();
+    let baseline_report = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::collect_promotion_report(
+            &Config::default(),
+            tcx,
+            &crate::rewriter::profitability::LineageCatalog::default(),
+            &trial.artifacts,
+        )
+    })
+    .unwrap();
+    let measurement = crate::rewriter::profitability::CandidateMeasurement {
+        baseline: baseline_report.observations[0].metrics.clone(),
+        trial: trial_report.observations[0].metrics.clone(),
+        unknown_promotions: baseline_report.unknown_attributions
+            + trial_report.unknown_attributions,
+    };
+    assert!(
+        matches!(
+            crate::rewriter::profitability::decide(measurement.clone()),
+            crate::rewriter::profitability::ProfitabilityDecision::Reject {
+                reason: crate::rewriter::profitability::RejectionReason::MoreUnsafeOperations,
+                ..
+            }
+        ),
+        "{measurement:?}"
+    );
+    let rejected = rustc_hash::FxHashSet::default();
+    let replay = rewrite_array_local_provenance_with_allowlist(
+        code,
+        Some(&rejected),
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert!(!replay.changed, "{}", replay.source);
+    assert!(replay.source.contains("let mut q: *mut i32"));
+}
+
+#[test]
+fn test_array_local_candidate_keys_distinguish_shadowed_members() {
+    // a name-only candidate identity would merge these two lexical `p`
+    // bindings. the compiler-backed trial must retain their occurrences.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32) -> i32 {
+    let mut total = 0;
+    {
+        let mut p: *mut i32 = base.offset(1);
+        p = p.offset(1);
+        total += *p;
+    }
+    {
+        let mut p: *mut i32 = base.offset(2);
+        p = p.offset(1);
+        total += *p;
+    }
+    total
+}
+"#;
+    let trial = rewrite_array_local_provenance_with_allowlist(
+        code,
+        None,
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    let mut occurrences = trial
+        .candidates
+        .iter()
+        .flat_map(|candidate| match &candidate.id {
+            crate::rewriter::profitability::CandidateId::ArrayLocal { members, .. } => members,
+            _ => unreachable!("array-local adapter returned a non-array candidate"),
+        })
+        .filter(|member| member.name == "p")
+        .map(|member| member.occurrence)
+        .collect::<Vec<_>>();
+    occurrences.sort_unstable();
+    assert_eq!(occurrences, vec![0, 1], "{trial:#?}");
+}
+
+#[test]
+fn test_array_local_allowlist_rejects_epoch_parent_not_selected() {
+    // replay must not consume an epoch-generated cursor unless the epoch record
+    // that created it is selected by the same shared gate.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, mut r: *mut i32) -> i32 {
+    let mut q: *mut i32 = 0 as *mut i32;
+    q = p.offset(3);
+    *p = 1;
+    *q = 3;
+    let a: i32 = *q;
+    q = r.offset(1);
+    *r = 2;
+    *q = 5;
+    a
+}
+"#;
+    let epoch = rewrite_epoch_split_with_allowlist_config(code, None);
+    assert!(epoch.changed, "{}", epoch.source);
+    let trial = rewrite_array_local_provenance_with_allowlist(&epoch.source, None, &epoch.lineage);
+    assert!(!trial.candidates.is_empty(), "{trial:#?}");
+    let accepted = rustc_hash::FxHashSet::from_iter(
+        trial
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.clone()),
+    );
+    let replay = rewrite_array_local_provenance_with_allowlist(
+        &epoch.source,
+        Some(&accepted),
+        &epoch.lineage,
+    );
+    assert!(!replay.changed, "{}", replay.source);
+    assert!(
+        replay.candidates.iter().all(|candidate| {
+            candidate.counts.unknown == 1
+                && candidate.artifacts.iter().any(|artifact| {
+                    artifact.fate == crate::rewriter::profitability::ArtifactFate::Unknown
+                })
+        }),
+        "{replay:#?}"
+    );
+    assert!(replay.source.contains("q_0"));
+    ::utils::compilation::run_compiler_on_str(&replay.source, ::utils::type_check)
+        .expect(&replay.source);
+}
+
+#[test]
+fn test_array_local_allowlist_fails_closed_for_ambiguous_epoch_lineage() {
+    // duplicate lineage attribution is ambiguous even when the array candidate
+    // itself is allowlisted, so replay leaves the complete group untouched.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base.offset(2);
+    p = p.offset(n);
+    q = q.offset(1);
+    *p + *q
+}
+"#;
+    let trial = rewrite_array_local_provenance_with_allowlist(
+        code,
+        None,
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert_eq!(trial.candidates.len(), 1, "{trial:#?}");
+    let candidate = &trial.candidates[0];
+    let crate::rewriter::profitability::CandidateId::ArrayLocal { function, .. } = candidate.id
+    else {
+        unreachable!("expected an array-local candidate");
+    };
+    let mut lineage = crate::rewriter::profitability::LineageCatalog::default();
+    lineage.insert(
+        function,
+        "p",
+        crate::rewriter::profitability::CandidateId::epoch(
+            function,
+            crate::rewriter::profitability::SourceBindingKey::new("scratch", 0),
+        ),
+        0,
+    );
+    lineage.insert(
+        function,
+        "p",
+        crate::rewriter::profitability::CandidateId::epoch(
+            function,
+            crate::rewriter::profitability::SourceBindingKey::new("other", 0),
+        ),
+        0,
+    );
+    let accepted = rustc_hash::FxHashSet::from_iter([candidate.id.clone()]);
+    let replay = rewrite_array_local_provenance_with_allowlist(code, Some(&accepted), &lineage);
+    assert!(!replay.changed, "{}", replay.source);
+    assert!(
+        replay
+            .candidates
+            .iter()
+            .any(|candidate| candidate.counts.unknown == 1)
+    );
+    assert!(replay.source.contains("let mut p: *mut i32"));
+}
+
 // ── epoch split (pointer-pass stage before array-local provenance) ────────────
 
 fn rewrite_epoch_split_with_config(code: &str, config: &Config) -> (String, bool) {
     ::utils::compilation::run_compiler_on_str(code, |tcx| rewrite_epoch_split(config, tcx)).unwrap()
+}
+
+fn analyze_epoch_split_candidates_with_config(code: &str) -> crate::rewriter::EpochSplitTrialPlan {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::analyze_epoch_split_candidates(tcx)
+    })
+    .unwrap()
+}
+
+fn rewrite_epoch_split_with_allowlist_config(
+    code: &str,
+    accepted: Option<&rustc_hash::FxHashSet<crate::rewriter::profitability::CandidateId>>,
+) -> crate::rewriter::EpochSplitRewriteResult {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_epoch_split_with_allowlist(&Config::default(), tcx, accepted)
+    })
+    .unwrap()
 }
 
 fn run_epoch_split_test(code: &str, includes: &[&str], excludes: &[&str]) {
@@ -12218,6 +12531,242 @@ pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
         ],
         &["let mut x: *mut i8 = 0 as *mut i8"],
     )
+}
+
+#[test]
+fn test_epoch_split_trial_records_stable_generated_lineage() {
+    let code = r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let _c: i8 = *x;
+    x = b;
+    x
+}
+    "#;
+    let trial = analyze_epoch_split_candidates_with_config(code);
+    assert_eq!(trial.candidates.len(), 1, "{trial:?}");
+    let candidate = &trial.candidates[0];
+    assert_eq!(candidate.generated_epochs.len(), 2, "{candidate:?}");
+    assert_eq!(candidate.generated_epochs[0].name, "x_0");
+    assert_eq!(candidate.generated_epochs[0].ordinal, 0);
+    assert_eq!(candidate.generated_epochs[1].name, "x_1");
+    assert_eq!(candidate.generated_epochs[1].ordinal, 1);
+    assert_eq!(
+        trial.lineage.lookup(
+            match candidate.id {
+                crate::rewriter::profitability::CandidateId::Epoch { function, .. } => function,
+                _ => unreachable!("epoch split produced a non-epoch candidate"),
+            },
+            "x_1",
+        ),
+        Some((&candidate.id, 1)),
+    );
+    assert!(candidate.artifacts.iter().any(|artifact| {
+        artifact.ownership == crate::rewriter::profitability::ArtifactOwnership::Baseline
+            && artifact.fate == crate::rewriter::profitability::ArtifactFate::Eliminated
+            && artifact.id.ordinal == usize::MAX
+    }));
+    assert_eq!(
+        candidate
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.ownership == crate::rewriter::profitability::ArtifactOwnership::Trial
+                    && artifact.fate == crate::rewriter::profitability::ArtifactFate::RemainsRaw
+            })
+            .count(),
+        2,
+    );
+}
+
+#[test]
+fn test_epoch_split_allowlist_rejects_raw_increasing_trial() {
+    // the shared downstream report proves both generated epochs remain raw, so
+    // the shared profitability decision rejects the raw-increasing trial.
+    let code = r#"
+pub unsafe extern "C" fn f(
+    mut a: *mut core::ffi::c_void,
+    mut b: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    let mut x: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;
+    x = a;
+    let _is_null: bool = x.is_null();
+    x = b;
+    x
+}
+    "#;
+    let trial = rewrite_epoch_split_with_allowlist_config(code, None);
+    let trial_report = ::utils::compilation::run_compiler_on_str(&trial.source, |tcx| {
+        crate::rewriter::collect_promotion_report(
+            &Config::default(),
+            tcx,
+            &trial.lineage,
+            &trial.artifacts,
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        trial_report.observations[0]
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.ownership == crate::rewriter::profitability::ArtifactOwnership::Trial
+                    && artifact.fate == crate::rewriter::profitability::ArtifactFate::RemainsRaw
+            })
+            .count(),
+        2,
+    );
+    let mut baseline_artifact = trial.candidates[0].artifacts[0].clone();
+    baseline_artifact.ownership = crate::rewriter::profitability::ArtifactOwnership::Trial;
+    baseline_artifact.fate = crate::rewriter::profitability::ArtifactFate::RemainsRaw;
+    let baseline_report = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::collect_promotion_report(
+            &Config::default(),
+            tcx,
+            &crate::rewriter::profitability::LineageCatalog::default(),
+            &[baseline_artifact],
+        )
+    })
+    .unwrap();
+    let measurement = crate::rewriter::profitability::CandidateMeasurement {
+        baseline: baseline_report.observations[0].metrics.clone(),
+        trial: trial_report.observations[0].metrics.clone(),
+        unknown_promotions: baseline_report.unknown_attributions
+            + trial_report.unknown_attributions,
+    };
+    assert!(
+        matches!(
+            crate::rewriter::profitability::decide(measurement.clone()),
+            crate::rewriter::profitability::ProfitabilityDecision::Reject {
+                reason: crate::rewriter::profitability::RejectionReason::MoreRawMaterializations,
+                ..
+            }
+        ),
+        "{measurement:?}",
+    );
+    let accepted = rustc_hash::FxHashSet::default();
+    let replay = rewrite_epoch_split_with_allowlist_config(code, Some(&accepted));
+    assert!(!replay.changed, "{}", replay.source);
+    assert!(replay.candidates.is_empty());
+    assert!(replay.artifacts.is_empty());
+    assert!(
+        replay
+            .source
+            .contains("let mut x: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void")
+    );
+    assert!(replay.source.contains("x = a"));
+    assert!(replay.source.contains("x = b"));
+    ::utils::compilation::run_compiler_on_str(&replay.source, ::utils::type_check)
+        .expect(&replay.source);
+}
+
+#[test]
+fn test_epoch_split_allowlist_replays_complete_promotable_candidate() {
+    // the generated locals are proven promotable by the downstream report; the
+    // gate can therefore select this complete scratch-local candidate for replay.
+    let code = r#"
+pub unsafe fn f() -> i32 {
+    let mut a: i32 = 1;
+    let mut b: i32 = 2;
+    let mut x: *mut i32 = 0 as *mut i32;
+    x = &mut a;
+    *x = 3;
+    x = &mut b;
+    *x
+}
+    "#;
+    let trial = analyze_epoch_split_candidates_with_config(code);
+    let accepted = rustc_hash::FxHashSet::from_iter([trial.candidates[0].id.clone()]);
+    let result = rewrite_epoch_split_with_allowlist_config(code, Some(&accepted));
+    assert!(result.changed, "{}", result.source);
+    assert_eq!(result.candidates.len(), 1);
+    assert_eq!(result.candidates[0].generated_epochs.len(), 2);
+    assert!(result.source.contains("let mut x_0: *mut i32 = &mut a"));
+    assert!(result.source.contains("let mut x_1: *mut i32 = &mut b"));
+    assert!(
+        !result
+            .source
+            .contains("let mut x: *mut i32 = 0 as *mut i32")
+    );
+    ::utils::compilation::run_compiler_on_str(&result.source, ::utils::type_check)
+        .expect(&result.source);
+    let report = ::utils::compilation::run_compiler_on_str(&result.source, |tcx| {
+        crate::rewriter::collect_promotion_report(
+            &Config::default(),
+            tcx,
+            &result.lineage,
+            &result.artifacts,
+        )
+    })
+    .unwrap();
+    assert!(report.observations[0].artifacts.iter().any(|artifact| {
+        artifact.ownership == crate::rewriter::profitability::ArtifactOwnership::Trial
+            && matches!(
+                artifact.fate,
+                crate::rewriter::profitability::ArtifactFate::Promoted(_)
+            )
+    }));
+}
+
+#[test]
+fn test_epoch_split_allowlist_skips_missing_candidate_identity() {
+    let code = r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let _c: i8 = *x;
+    x = b;
+    x
+}
+    "#;
+    let trial = analyze_epoch_split_candidates_with_config(code);
+    let crate::rewriter::profitability::CandidateId::Epoch { function, .. } =
+        &trial.candidates[0].id
+    else {
+        unreachable!("epoch split produced a non-epoch candidate");
+    };
+    let accepted =
+        rustc_hash::FxHashSet::from_iter([crate::rewriter::profitability::CandidateId::epoch(
+            *function,
+            crate::rewriter::profitability::SourceBindingKey::new("missing", 0),
+        )]);
+    let result = rewrite_epoch_split_with_allowlist_config(code, Some(&accepted));
+    assert!(!result.changed, "{}", result.source);
+    assert!(result.candidates.is_empty());
+    assert!(result.source.contains("let mut x: *mut i8 = 0 as *mut i8"));
+}
+
+#[test]
+fn test_epoch_split_allowlist_skips_ambiguous_candidate_identity() {
+    let code = r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let _c: i8 = *x;
+    x = b;
+    x
+}
+    "#;
+    let mut trial = analyze_epoch_split_candidates_with_config(code);
+    let candidate = trial.candidates[0].clone();
+    let accepted = rustc_hash::FxHashSet::from_iter([candidate.id.clone()]);
+    // a duplicated record models an identity collision discovered during replay.
+    trial.candidates.push(candidate);
+    let (_, selected, lineage) = trial.select(Some(&accepted));
+    assert!(selected.is_empty());
+    assert!(
+        lineage
+            .lookup_all(
+                match &accepted.iter().next().unwrap() {
+                    crate::rewriter::profitability::CandidateId::Epoch { function, .. } =>
+                        *function,
+                    _ => unreachable!("epoch split produced a non-epoch candidate"),
+                },
+                "x_0",
+            )
+            .is_none()
+    );
 }
 
 #[test]
@@ -12480,6 +13029,480 @@ pub unsafe fn foo(mut p: *mut i32, mut r: *mut i32) -> i32 {
     assert!(s.contains("*((p).offset(q_0_idx) as *mut i32) = 3"), "{s}");
     assert!(s.contains("*((r).offset(q_1_idx) as *mut i32) = 5"), "{s}");
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
+}
+
+#[test]
+fn gated_pointer_prepasses_preserve_trial_selection_and_replay_order() {
+    use crate::rewriter::profitability::{
+        CandidateId, ProfitabilityDecision, ProfitabilityMetric, ProfitabilityMetrics,
+    };
+    // this fixture has one whole-local epoch candidate and array-local groups
+    // derived from its generated epochs. The driver must finish the complete
+    // in-memory trial before restoring the checkpoint and replaying IDs.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, mut r: *mut i32) -> i32 {
+    let mut q: *mut i32 = 0 as *mut i32;
+    q = p.offset(3);
+    *p = 1;
+    *q = 3;
+    let a: i32 = *q;
+    q = r.offset(1);
+    *r = 2;
+    *q = 5;
+    a
+}
+"#;
+
+    let (result, final_source) = run_gated_prepasses_then_pointer(code, &Config::default());
+    assert_eq!(
+        result.phases,
+        vec![
+            GatedPrepassPhase::EpochTrial,
+            GatedPrepassPhase::AliasingTrial,
+            GatedPrepassPhase::ArrayTrial,
+            GatedPrepassPhase::DownstreamReport,
+            GatedPrepassPhase::ArraySelection,
+            GatedPrepassPhase::EpochSelection,
+            GatedPrepassPhase::RestoreCheckpoint,
+            GatedPrepassPhase::EpochReplay,
+            GatedPrepassPhase::AliasingReplay,
+            GatedPrepassPhase::ArrayReplay,
+        ]
+    );
+    assert_eq!((result.accepted_epochs, result.rejected_epochs), (1, 0));
+    assert_eq!((result.accepted_arrays, result.rejected_arrays), (2, 0));
+    assert_eq!(result.decisions.len(), 3);
+    let mut saw_p = false;
+    let mut saw_r = false;
+    let mut saw_epoch = false;
+    for record in &result.decisions {
+        let ProfitabilityDecision::Accept {
+            measurement,
+            deciding_metric: ProfitabilityMetric::RawMaterializations,
+        } = &record.decision
+        else {
+            panic!("unexpected profitability decision: {record:?}");
+        };
+        match &record.candidate {
+            CandidateId::ArrayLocal { base, .. } if base.name == "p" => {
+                saw_p = true;
+                assert_eq!(
+                    (measurement.baseline.clone(), measurement.trial.clone()),
+                    (
+                        ProfitabilityMetrics {
+                            raw_materializations: 1,
+                            unsafe_operations: 4,
+                            dereferences: 3,
+                        },
+                        ProfitabilityMetrics {
+                            raw_materializations: 0,
+                            unsafe_operations: 5,
+                            dereferences: 3,
+                        },
+                    )
+                );
+            }
+            CandidateId::ArrayLocal { base, .. } if base.name == "r" => {
+                saw_r = true;
+                assert_eq!(
+                    (measurement.baseline.clone(), measurement.trial.clone()),
+                    (
+                        ProfitabilityMetrics {
+                            raw_materializations: 1,
+                            unsafe_operations: 3,
+                            dereferences: 2,
+                        },
+                        ProfitabilityMetrics {
+                            raw_materializations: 0,
+                            unsafe_operations: 3,
+                            dereferences: 2,
+                        },
+                    )
+                );
+            }
+            CandidateId::Epoch { binding, .. } if binding.name == "q" => {
+                saw_epoch = true;
+                assert_eq!(
+                    (measurement.baseline.clone(), measurement.trial.clone()),
+                    (
+                        ProfitabilityMetrics {
+                            raw_materializations: 1,
+                            unsafe_operations: 5,
+                            dereferences: 3,
+                        },
+                        ProfitabilityMetrics {
+                            raw_materializations: 0,
+                            unsafe_operations: 6,
+                            dereferences: 3,
+                        },
+                    )
+                );
+            }
+            _ => panic!("unexpected candidate: {record:?}"),
+        }
+        assert_eq!(measurement.unknown_promotions, 0);
+    }
+    assert!((saw_p && saw_r && saw_epoch), "{:#?}", result.decisions);
+    assert!(!result.combined_trial_failed);
+    ::utils::compilation::run_compiler_on_str(&final_source, ::utils::type_check)
+        .expect(&final_source);
+}
+
+#[test]
+fn gated_pointer_prepasses_uses_each_reported_metric_as_the_decider() {
+    use crate::rewriter::{
+        CandidateObservation, array_local_index_rewriter,
+        profitability::{
+            CandidateId, ProfitabilityDecision, ProfitabilityMetric, ProfitabilityMetrics,
+            SourceBindingKey,
+        },
+    };
+
+    let id = CandidateId::array_local(
+        rustc_span::def_id::DefPathHash::default(),
+        SourceBindingKey::new("base", 0),
+        vec![SourceBindingKey::new("member", 0)],
+    );
+    let candidate = array_local_index_rewriter::ArrayLocalCandidateRecord {
+        id: id.clone(),
+        artifacts: Vec::new(),
+        counts: array_local_index_rewriter::ArrayLocalArtifactCounts::default(),
+        upstream_origins: Vec::new(),
+    };
+    let observation = |metrics| CandidateObservation {
+        candidate: id.clone(),
+        artifacts: Vec::new(),
+        metrics,
+        unknown_attributions: 0,
+    };
+
+    for (baseline, trial, deciding_metric) in [
+        (
+            ProfitabilityMetrics {
+                raw_materializations: 2,
+                unsafe_operations: 5,
+                dereferences: 4,
+            },
+            ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 7,
+                dereferences: 6,
+            },
+            ProfitabilityMetric::RawMaterializations,
+        ),
+        (
+            ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 5,
+                dereferences: 4,
+            },
+            ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 4,
+                dereferences: 6,
+            },
+            ProfitabilityMetric::UnsafeOperations,
+        ),
+        (
+            ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 5,
+                dereferences: 4,
+            },
+            ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 5,
+                dereferences: 3,
+            },
+            ProfitabilityMetric::Dereferences,
+        ),
+    ] {
+        let baseline = observation(baseline);
+        let trial = observation(trial);
+        let measurement =
+            crate::rewriter::array_candidate_measurement(&candidate, Some(&baseline), Some(&trial));
+        assert!(matches!(
+            crate::rewriter::profitability::decide(measurement),
+            ProfitabilityDecision::Accept {
+                deciding_metric: actual,
+                ..
+            } if actual == deciding_metric
+        ));
+    }
+}
+
+#[test]
+fn gated_pointer_prepasses_rejects_unknown_or_missing_candidate_reports() {
+    use crate::rewriter::{
+        CandidateObservation, array_local_index_rewriter,
+        profitability::{
+            CandidateId, ProfitabilityDecision, ProfitabilityMetrics, RejectionReason,
+            SourceBindingKey,
+        },
+    };
+
+    let id = CandidateId::array_local(
+        rustc_span::def_id::DefPathHash::default(),
+        SourceBindingKey::new("base", 0),
+        vec![SourceBindingKey::new("member", 0)],
+    );
+    let candidate = array_local_index_rewriter::ArrayLocalCandidateRecord {
+        id: id.clone(),
+        artifacts: Vec::new(),
+        counts: array_local_index_rewriter::ArrayLocalArtifactCounts::default(),
+        upstream_origins: Vec::new(),
+    };
+    let baseline = CandidateObservation {
+        candidate: id,
+        artifacts: Vec::new(),
+        metrics: ProfitabilityMetrics {
+            raw_materializations: 1,
+            unsafe_operations: 1,
+            dereferences: 1,
+        },
+        unknown_attributions: 1,
+    };
+
+    for measurement in [
+        crate::rewriter::array_candidate_measurement(&candidate, Some(&baseline), None),
+        crate::rewriter::array_candidate_measurement(&candidate, None, Some(&baseline)),
+    ] {
+        assert!(matches!(
+            crate::rewriter::profitability::decide(measurement),
+            ProfitabilityDecision::Reject {
+                reason: RejectionReason::UnknownAttribution,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn gated_pointer_prepasses_epoch_measurement_adds_only_retained_array_deltas() {
+    use crate::rewriter::{
+        CandidateObservation, EpochSplitCandidateRecord,
+        array_local_index_rewriter::{ArrayLocalArtifactCounts, ArrayLocalCandidateRecord},
+        profitability::{
+            CandidateId, CandidateMeasurement, ProfitabilityMetrics, SourceBindingKey,
+        },
+    };
+
+    let function = rustc_span::def_id::DefPathHash::default();
+    let epoch_id = CandidateId::epoch(function, SourceBindingKey::new("scratch", 0));
+    let array_id = CandidateId::array_local(
+        function,
+        SourceBindingKey::new("base", 0),
+        vec![SourceBindingKey::new("scratch_0", 0)],
+    );
+    let epoch = EpochSplitCandidateRecord {
+        id: epoch_id.clone(),
+        generated_epochs: Vec::new(),
+        artifacts: Vec::new(),
+    };
+    let array = ArrayLocalCandidateRecord {
+        id: array_id.clone(),
+        artifacts: Vec::new(),
+        counts: ArrayLocalArtifactCounts::default(),
+        upstream_origins: vec![epoch_id.clone()],
+    };
+    let observation = |metrics| CandidateObservation {
+        candidate: epoch_id.clone(),
+        artifacts: Vec::new(),
+        metrics,
+        unknown_attributions: 0,
+    };
+    let baseline = observation(ProfitabilityMetrics {
+        raw_materializations: 1,
+        unsafe_operations: 5,
+        dereferences: 3,
+    });
+    let pre_array = observation(ProfitabilityMetrics {
+        raw_materializations: 2,
+        unsafe_operations: 6,
+        dereferences: 4,
+    });
+    let array_measurements = rustc_hash::FxHashMap::from_iter([(
+        array_id.clone(),
+        CandidateMeasurement {
+            baseline: ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 3,
+                dereferences: 2,
+            },
+            trial: ProfitabilityMetrics {
+                raw_materializations: 0,
+                unsafe_operations: 1,
+                dereferences: 1,
+            },
+            unknown_promotions: 0,
+        },
+    )]);
+    let accepted = rustc_hash::FxHashSet::from_iter([array_id]);
+
+    let measurement = crate::rewriter::epoch_candidate_measurement(
+        &epoch,
+        Some(&baseline),
+        Some(&pre_array),
+        &[array],
+        &accepted,
+        &array_measurements,
+    );
+    assert_eq!(measurement.baseline, baseline.metrics);
+    assert_eq!(
+        measurement.trial,
+        ProfitabilityMetrics {
+            raw_materializations: 1,
+            unsafe_operations: 4,
+            dereferences: 3,
+        }
+    );
+}
+
+#[test]
+fn gated_pointer_prepasses_aliasing_propagates_epoch_lineage_to_snapshots() {
+    use crate::rewriter::profitability::CandidateId;
+
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) {
+    *out = *src;
+}
+pub unsafe fn driver(mut p: *mut i32, mut r: *mut i32) {
+    let mut q: *mut i32 = 0 as *mut i32;
+    q = p.offset(0);
+    callee(q, q);
+    q = r.offset(0);
+    callee(q, q);
+}
+"#;
+    let epoch = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_epoch_split_with_allowlist(&Config::default(), tcx, None)
+    })
+    .unwrap();
+    assert!(epoch.changed, "{}", epoch.source);
+    let parent = epoch.candidates[0].id.clone();
+    let CandidateId::Epoch { function, .. } = parent else { unreachable!() };
+    let result = ::utils::compilation::run_compiler_on_str(&epoch.source, |tcx| {
+        crate::rewriter::rewrite_aliasing_with_lineage(&Config::default(), tcx, &epoch.lineage)
+    })
+    .unwrap();
+
+    assert!(result.changed, "{}", result.source);
+    assert!(result.source.contains("__crat_snap_0"), "{}", result.source);
+    assert_eq!(
+        result.lineage.lookup(function, "__crat_snap_0"),
+        Some((&parent, 0))
+    );
+}
+
+#[test]
+fn gated_pointer_prepasses_reject_array_groups_with_rejected_epoch_parent() {
+    // shadowed whole-locals make baseline attribution ambiguous, so both epoch
+    // parents fail closed even though their generated array groups are locally
+    // profitable. None of those groups may escape the hierarchy during replay.
+    let code = r#"
+pub unsafe fn foo(
+    mut p: *mut i32,
+    mut r: *mut i32,
+) -> i32 {
+    let mut total = 0;
+    {
+        let mut q: *mut i32 = 0 as *mut i32;
+        q = p.offset(3);
+        *p = 1;
+        *q = 3;
+        total += *q;
+        q = r.offset(1);
+        *r = 2;
+        *q = 5;
+        total += *q;
+    }
+    {
+        let mut q: *mut i32 = 0 as *mut i32;
+        q = p.offset(2);
+        *q = 7;
+        total += *q;
+        q = r.offset(2);
+        *q = 9;
+        total += *q;
+    }
+    total
+}
+"#;
+
+    let result = run_gated_pointer_prepasses(&Config::default(), code);
+    assert_eq!(result.accepted_epochs, 0, "{:#?}", result.decisions);
+    assert_eq!(result.rejected_epochs, 2, "{:#?}", result.decisions);
+    assert_eq!(result.accepted_arrays, 0, "{:#?}", result.decisions);
+    assert!(result.rejected_arrays > 0, "{:#?}", result.decisions);
+    assert!(result.source.contains("let mut q: *mut i32"));
+    assert!(!result.source.contains("q_0_idx"));
+    ::utils::compilation::run_compiler_on_str(&result.source, ::utils::type_check)
+        .expect(&result.source);
+}
+
+#[test]
+fn gated_pointer_prepasses_reject_mixed_epoch_lineage_even_when_both_parents_pass() {
+    use crate::rewriter::profitability::{
+        CandidateId, CandidateMeasurement, ProfitabilityDecision, ProfitabilityMetrics,
+        SourceBindingKey,
+    };
+
+    let function = rustc_span::def_id::DefPathHash::default();
+    let left = CandidateId::epoch(function, SourceBindingKey::new("left", 0));
+    let right = CandidateId::epoch(function, SourceBindingKey::new("right", 0));
+    let accepted = rustc_hash::FxHashSet::from_iter([left.clone(), right.clone()]);
+    let decision = ProfitabilityDecision::Accept {
+        measurement: CandidateMeasurement {
+            baseline: ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 0,
+                dereferences: 0,
+            },
+            trial: ProfitabilityMetrics {
+                raw_materializations: 0,
+                unsafe_operations: 0,
+                dereferences: 0,
+            },
+            unknown_promotions: 0,
+        },
+        deciding_metric: crate::rewriter::profitability::ProfitabilityMetric::RawMaterializations,
+    };
+
+    let decision =
+        crate::rewriter::gate_array_decision_by_upstream(decision, &[left, right], &accepted);
+    assert!(matches!(
+        decision,
+        ProfitabilityDecision::Reject {
+            reason: crate::rewriter::profitability::RejectionReason::UnknownAttribution,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn gated_pointer_prepasses_trial_failure_falls_back_through_aliasing_and_pointer() {
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) {
+    *out = *src;
+}
+pub unsafe fn driver() {
+    let mut a: [i32; 16] = [0; 16];
+    callee(a.as_mut_ptr(), a.as_ptr());
+}
+"#;
+    let config = Config {
+        force_gated_prepass_trial_failure: true,
+        ..Config::default()
+    };
+
+    let (result, final_source) = run_gated_prepasses_then_pointer(code, &config);
+    assert!(result.combined_trial_failed);
+    assert_eq!(result.accepted_epochs, 0);
+    assert_eq!(result.accepted_arrays, 0);
+    assert!(result.source.contains("__crat_snap_0"), "{}", result.source);
+    assert!(result.phases.contains(&GatedPrepassPhase::AliasingFallback));
+    ::utils::compilation::run_compiler_on_str(&final_source, ::utils::type_check)
+        .expect(&final_source);
 }
 
 #[test]

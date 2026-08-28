@@ -32,7 +32,13 @@ use crate::{
         },
         type_qualifier::foster::mutability::MutabilityResult,
     },
-    rewriter::array_local_trace::{RewriteTrace, TraceDecision, TraceStage, TraceSubject},
+    rewriter::{
+        array_local_trace::{RewriteTrace, TraceDecision, TraceStage, TraceSubject},
+        profitability::{
+            ArtifactFate, ArtifactFootprint, ArtifactId, ArtifactOwnership, CandidateId,
+            LineageCatalog, SourceBindingKey,
+        },
+    },
     utils::rustc::RustProgram,
 };
 
@@ -104,15 +110,52 @@ struct BaseCursorRewrite {
 
 type BaseCursorKey = (HirId, String);
 
-#[derive(Default)]
+/// stable accounting for one complete array-local rewrite group.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ArrayLocalArtifactCounts {
+    pub declarations: usize,
+    pub reconstructions: usize,
+    pub offset_or_conversions: usize,
+    pub dereferences: usize,
+    pub eliminated: usize,
+    pub remains_raw: usize,
+    pub unknown: usize,
+}
+
+/// a session-independent candidate record for one all-or-nothing rewrite group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArrayLocalCandidateRecord {
+    pub id: CandidateId,
+    pub artifacts: Vec<ArtifactFootprint>,
+    pub counts: ArrayLocalArtifactCounts,
+    pub upstream_origins: Vec<CandidateId>,
+}
+
+/// result of applying the array-local adapter in trial or allowlisted replay mode.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ArrayLocalRewriteResult {
+    pub source: String,
+    pub changed: bool,
+    pub candidates: Vec<ArrayLocalCandidateRecord>,
+    pub artifacts: Vec<ArtifactFootprint>,
+}
+
+#[derive(Default, Clone)]
 struct RewritePlan {
     by_hir_id: FxHashMap<HirId, BindingRewrite>,
     base_by_key: FxHashMap<BaseCursorKey, BaseCursorRewrite>,
     index_names_by_fn: FxHashMap<LocalDefId, FxHashSet<String>>,
+    groups: FxHashMap<CandidateId, Vec<HirId>>,
+    group_origins: FxHashMap<CandidateId, Vec<CandidateId>>,
+    summaries: FxHashMap<HirId, BindingUseSummary>,
+    rejected_records: Vec<ArrayLocalCandidateRecord>,
 }
 
 #[derive(Default, Clone, Debug)]
 struct BindingUseSummary {
+    declaration_count: usize,
+    reconstruction_count: usize,
+    offset_or_conversion_count: usize,
     deref_count: usize,
     field_or_index_count: usize,
     pointer_value_count: usize,
@@ -491,8 +534,7 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     ast_to_hir: &AstToHir,
     c_exposed_fns: &FxHashSet<String>,
 ) -> bool {
-    let mut trace = RewriteTrace::from_env();
-    let changed = apply_array_local_index_rewrite_inner(
+    apply_array_local_index_rewrite_with_allowlist(
         krate,
         input,
         provenances,
@@ -501,10 +543,50 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
         points_to,
         ast_to_hir,
         c_exposed_fns,
+        None,
+        &LineageCatalog::default(),
+    )
+    .changed
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_array_local_index_rewrite_with_allowlist<'tcx>(
+    krate: &mut Crate,
+    input: &RustProgram<'tcx>,
+    provenances: &FxHashMap<LocalDefId, ArrayLocalProvenance>,
+    mutability_result: &MutabilityResult,
+    nullity_result: &analyses::nullity::NullityResult,
+    points_to: &andersen::AnalysisResult,
+    ast_to_hir: &AstToHir,
+    c_exposed_fns: &FxHashSet<String>,
+    accepted: Option<&FxHashSet<CandidateId>>,
+    lineage: &LineageCatalog,
+) -> ArrayLocalRewriteResult {
+    let mut trace = RewriteTrace::from_env();
+    let (changed, candidates) = apply_array_local_index_rewrite_inner(
+        krate,
+        input,
+        provenances,
+        mutability_result,
+        nullity_result,
+        points_to,
+        ast_to_hir,
+        c_exposed_fns,
+        accepted,
+        lineage,
         &mut trace,
     );
     trace.emit(input.tcx);
-    changed
+    let artifacts = candidates
+        .iter()
+        .flat_map(|candidate| candidate.artifacts.iter().cloned())
+        .collect();
+    ArrayLocalRewriteResult {
+        source: pprust::crate_to_string_for_macros(krate),
+        changed,
+        candidates,
+        artifacts,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -517,18 +599,23 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
     points_to: &andersen::AnalysisResult,
     ast_to_hir: &AstToHir,
     c_exposed_fns: &FxHashSet<String>,
+    accepted: Option<&FxHashSet<CandidateId>>,
+    lineage: &LineageCatalog,
     trace: &mut RewriteTrace,
-) -> bool {
+) -> (bool, Vec<ArrayLocalCandidateRecord>) {
     let mut plan = build_rewrite_plan(
         input,
         provenances,
         mutability_result,
         nullity_result,
         points_to,
+        accepted,
+        lineage,
         trace,
     );
     refine_base_pointer_kinds_from_ast(krate, ast_to_hir, input.tcx, &mut plan);
     prune_unsupported_direct_place_uses(krate, ast_to_hir, input.tcx, &mut plan, trace);
+    retain_complete_groups(&mut plan, trace);
     choose_binding_representations(
         krate,
         ast_to_hir,
@@ -537,10 +624,12 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
         &mut plan,
         trace,
     );
+    retain_complete_groups(&mut plan, trace);
     if plan.by_hir_id.is_empty() {
-        return false;
+        return (false, build_candidate_records(&plan));
     }
 
+    let mut rewritten_krate = krate.clone();
     let mut visitor = ArrayLocalIndexRewriteVisitor {
         tcx: input.tcx,
         ast_to_hir,
@@ -549,8 +638,13 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
         changed: false,
         trace,
     };
-    visitor.visit_crate(krate);
-    visitor.changed
+    visitor.visit_crate(&mut rewritten_krate);
+    if !visitor.groups_applied_completely() {
+        return (false, visitor.failed_application_records());
+    }
+    let candidates = build_candidate_records(&visitor.plan);
+    *krate = rewritten_krate;
+    (visitor.changed, candidates)
 }
 
 #[cfg(test)]
@@ -576,6 +670,8 @@ pub(crate) fn apply_array_local_index_rewrite_traced<'tcx>(
         points_to,
         ast_to_hir,
         c_exposed_fns,
+        None,
+        &LineageCatalog::default(),
         &mut trace,
     );
     trace.into_events()
@@ -651,6 +747,8 @@ fn build_rewrite_plan<'tcx>(
     mutability_result: &MutabilityResult,
     nullity_result: &analyses::nullity::NullityResult,
     points_to: &andersen::AnalysisResult,
+    accepted: Option<&FxHashSet<CandidateId>>,
+    lineage: &LineageCatalog,
     trace: &mut RewriteTrace,
 ) -> RewritePlan {
     let mut plan = RewritePlan::default();
@@ -718,8 +816,43 @@ fn build_rewrite_plan<'tcx>(
             .map(|(hir_id, local)| (*local, *hir_id))
             .collect();
         let mut existing_names = binding_names_in_body(input.tcx, def_id);
+        let binding_keys = source_binding_keys_in_body(input.tcx, def_id);
 
         for group in groups {
+            let Some((candidate_id, member_hir_ids)) = candidate_id_for_group(
+                input.tcx,
+                def_id,
+                provenance,
+                &body,
+                &local_to_hir,
+                &binding_keys,
+                &group,
+            ) else {
+                trace.record(
+                    def_id,
+                    TraceSubject::Group(format!("{:?}", group.base_local)),
+                    TraceStage::Plan,
+                    TraceDecision::Dropped,
+                    || "plan: candidate identity is absent or ambiguous".to_string(),
+                );
+                continue;
+            };
+            let upstream_origins = upstream_origins_for_group(&candidate_id, lineage, accepted);
+            let Some(upstream_origins) = upstream_origins else {
+                plan.rejected_records
+                    .push(unknown_candidate_record(candidate_id.clone()));
+                trace.record(
+                    def_id,
+                    TraceSubject::Group(format!("{:?}", group.base_local)),
+                    TraceStage::Plan,
+                    TraceDecision::Dropped,
+                    || "plan: mixed or rejected upstream lineage".to_string(),
+                );
+                continue;
+            };
+            if accepted.is_some_and(|accepted| !accepted.contains(&candidate_id)) {
+                continue;
+            }
             let mut context = GroupPlanContext {
                 tcx: input.tcx,
                 def_id,
@@ -732,6 +865,14 @@ fn build_rewrite_plan<'tcx>(
                 trace: &mut *trace,
             };
             add_group_to_plan(&mut context, &group);
+            let Some(members) = planned_group_members(&member_hir_ids, context.plan) else {
+                continue;
+            };
+            context.plan.groups.insert(candidate_id.clone(), members);
+            context
+                .plan
+                .group_origins
+                .insert(candidate_id, upstream_origins);
         }
     }
     plan
@@ -911,6 +1052,174 @@ fn binding_names_in_body(tcx: TyCtxt<'_>, def_id: LocalDefId) -> FxHashSet<Strin
     };
     visitor.visit_body(tcx.hir_body_owned_by(def_id));
     visitor.names
+}
+
+fn source_binding_keys_in_body(
+    tcx: TyCtxt<'_>,
+    def_id: LocalDefId,
+) -> FxHashMap<HirId, SourceBindingKey> {
+    struct KeyVisitor {
+        keys: FxHashMap<HirId, SourceBindingKey>,
+        occurrences: FxHashMap<String, usize>,
+    }
+    impl<'tcx> HirVisitor<'tcx> for KeyVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            hir::intravisit::walk_expr(self, expr);
+        }
+
+        fn visit_pat(&mut self, pat: &'tcx hir::Pat<'tcx>) {
+            if let hir::PatKind::Binding(_, hir_id, ident, _) = pat.kind {
+                let name = ident.name.to_string();
+                let occurrence = self.occurrences.entry(name.clone()).or_default();
+                self.keys
+                    .insert(hir_id, SourceBindingKey::new(name, *occurrence));
+                *occurrence += 1;
+            }
+            hir::intravisit::walk_pat(self, pat);
+        }
+    }
+    let mut visitor = KeyVisitor {
+        keys: FxHashMap::default(),
+        occurrences: FxHashMap::default(),
+    };
+    let body = tcx.hir_body_owned_by(def_id);
+    for param in body.params {
+        visitor.visit_pat(param.pat);
+    }
+    visitor.visit_expr(body.value);
+    visitor.keys
+}
+
+fn candidate_id_for_group(
+    tcx: TyCtxt<'_>,
+    def_id: LocalDefId,
+    provenance: &ArrayLocalProvenance,
+    body: &rustc_middle::mir::Body<'_>,
+    local_to_hir: &FxHashMap<Local, HirId>,
+    binding_keys: &FxHashMap<HirId, SourceBindingKey>,
+    group: &RewriteGroup,
+) -> Option<(CandidateId, Vec<HirId>)> {
+    let base_hir_id = *local_to_hir.get(&group.base_local)?;
+    let base = source_binding_key(binding_keys, base_hir_id)?;
+    let source_members = source_group_members(provenance, body, local_to_hir, binding_keys, group)?;
+    let members = source_members
+        .iter()
+        .map(|(_, key)| key.clone())
+        .collect::<Vec<_>>();
+    let candidate = CandidateId::array_local(tcx.def_path_hash(def_id.to_def_id()), base, members);
+    if candidate.has_duplicate_members() {
+        return None;
+    }
+    Some((
+        candidate,
+        source_members
+            .into_iter()
+            .map(|(hir_id, _)| hir_id)
+            .collect(),
+    ))
+}
+
+fn source_binding_key(
+    binding_keys: &FxHashMap<HirId, SourceBindingKey>,
+    hir_id: HirId,
+) -> Option<SourceBindingKey> {
+    binding_keys.get(&hir_id).cloned()
+}
+
+/// returns every user-visible raw-pointer member in source-key order. a missing
+/// slot, binding, or key is an invalid group rather than a partially identified
+/// candidate. compiler temporaries are not source members and are ignored.
+fn source_group_members(
+    provenance: &ArrayLocalProvenance,
+    body: &rustc_middle::mir::Body<'_>,
+    local_to_hir: &FxHashMap<Local, HirId>,
+    binding_keys: &FxHashMap<HirId, SourceBindingKey>,
+    group: &RewriteGroup,
+) -> Option<Vec<(HirId, SourceBindingKey)>> {
+    let mut members = Vec::new();
+    let mut seen_hir_ids = FxHashSet::default();
+    let mut seen_keys = FxHashSet::default();
+    for &slot_idx in &group.members {
+        let info = provenance.slot_table().slot_infos.get(slot_idx)?;
+        if info.root == group.base_local
+            || !info.path.is_empty()
+            || !matches!(
+                body.local_decls[info.root].ty.kind(),
+                ty::TyKind::RawPtr(..)
+            )
+        {
+            continue;
+        }
+        let Some(&hir_id) = local_to_hir.get(&info.root) else {
+            if is_user_source_local(body, info.root) {
+                return None;
+            }
+            continue;
+        };
+        let key = source_binding_key(binding_keys, hir_id)?;
+        if !seen_hir_ids.insert(hir_id) {
+            continue;
+        }
+        if !seen_keys.insert(key.clone()) {
+            return None;
+        }
+        members.push((hir_id, key));
+    }
+    members.sort_by(|left, right| left.1.cmp(&right.1));
+    (!members.is_empty()).then_some(members)
+}
+
+fn is_user_source_local(body: &rustc_middle::mir::Body<'_>, local: Local) -> bool {
+    local.index() != 0
+        && (local.index() <= body.arg_count
+            || body.var_debug_info.iter().any(|debug| {
+                matches!(&debug.value, rustc_middle::mir::VarDebugInfoContents::Place(place) if place.local == local)
+            }))
+}
+
+fn upstream_origins_for_group(
+    candidate: &CandidateId,
+    lineage: &LineageCatalog,
+    accepted: Option<&FxHashSet<CandidateId>>,
+) -> Option<Vec<CandidateId>> {
+    if candidate.has_duplicate_members() {
+        return None;
+    }
+    let CandidateId::ArrayLocal {
+        function,
+        base,
+        members,
+    } = candidate
+    else {
+        return None;
+    };
+    let mut origins = Vec::new();
+    for key in std::iter::once(base).chain(members.iter()) {
+        if lineage.is_unknown(*function, &key.name) {
+            return None;
+        }
+        let Some(entries) = lineage.lookup_all(*function, &key.name) else {
+            continue;
+        };
+        if entries.len() != 1 {
+            return None;
+        }
+        let (origin, _) = &entries[0];
+        if accepted.is_some_and(|accepted| !accepted.contains(origin)) {
+            return None;
+        }
+        if !origins.contains(origin) {
+            origins.push(origin.clone());
+        }
+    }
+    Some(origins)
+}
+
+fn planned_group_members(member_hir_ids: &[HirId], plan: &RewritePlan) -> Option<Vec<HirId>> {
+    member_hir_ids
+        .iter()
+        .all(|hir_id| plan.by_hir_id.contains_key(hir_id))
+        .then(|| member_hir_ids.to_vec())
 }
 
 struct GroupPlanContext<'a, 'tcx> {
@@ -1595,18 +1904,6 @@ fn prune_unsupported_direct_place_uses(
     }
 }
 
-// whether a group-base binding is a function parameter (as opposed to a local).
-fn base_is_fn_param(tcx: TyCtxt<'_>, base_hir_id: HirId) -> bool {
-    for (_, node) in tcx.hir_parent_iter(base_hir_id) {
-        match node {
-            hir::Node::Param(_) => return true,
-            hir::Node::Pat(_) => {}
-            _ => return false,
-        }
-    }
-    false
-}
-
 fn prune_orphan_base_cursors(plan: &mut RewritePlan) {
     let live_base_keys = plan
         .by_hir_id
@@ -1618,11 +1915,119 @@ fn prune_orphan_base_cursors(plan: &mut RewritePlan) {
         .retain(|base_key, _| live_base_keys.contains(base_key));
 }
 
+fn retain_complete_groups(plan: &mut RewritePlan, trace: &mut RewriteTrace) {
+    let incomplete: FxHashSet<CandidateId> = plan
+        .groups
+        .iter()
+        .filter_map(|(candidate, members)| {
+            members
+                .iter()
+                .all(|member| plan.by_hir_id.contains_key(member))
+                .then_some(())
+                .is_none()
+                .then(|| candidate.clone())
+        })
+        .collect();
+    if incomplete.is_empty() {
+        return;
+    }
+    for candidate in &incomplete {
+        if let Some(members) = plan.groups.get(candidate) {
+            for member in members {
+                if let Some(rewrite) = plan.by_hir_id.get(member) {
+                    trace.record(
+                        member.owner.def_id,
+                        TraceSubject::Member(rewrite.source_name.clone()),
+                        TraceStage::Prune,
+                        TraceDecision::Dropped,
+                        || "prune: complete rewrite group could not be retained".to_string(),
+                    );
+                }
+                plan.by_hir_id.remove(member);
+            }
+        }
+        plan.groups.remove(candidate);
+        plan.group_origins.remove(candidate);
+    }
+    prune_orphan_base_cursors(plan);
+}
+
+fn build_candidate_records(plan: &RewritePlan) -> Vec<ArrayLocalCandidateRecord> {
+    let mut records = plan.rejected_records.clone();
+    records.extend(
+        plan.groups
+            .iter()
+            .filter_map(|(id, members)| {
+                let mut artifacts = Vec::new();
+                let mut counts = ArrayLocalArtifactCounts::default();
+                for (ordinal, member) in members.iter().enumerate() {
+                    let rewrite = plan.by_hir_id.get(member)?;
+                    let summary = plan.summaries.get(member).cloned().unwrap_or_default();
+                    counts.declarations += summary.declaration_count;
+                    counts.reconstructions += summary.reconstruction_count;
+                    counts.offset_or_conversions += summary.offset_or_conversion_count;
+                    counts.dereferences += summary.deref_count;
+                    counts.eliminated += 1;
+                    artifacts.push(ArtifactFootprint {
+                        id: ArtifactId {
+                            candidate: id.clone(),
+                            ordinal: ordinal * 2,
+                        },
+                        source_name: Some(rewrite.source_name.clone()),
+                        source_span: None,
+                        ownership: ArtifactOwnership::Baseline,
+                        fate: ArtifactFate::Eliminated,
+                    });
+                    artifacts.push(ArtifactFootprint {
+                        id: ArtifactId {
+                            candidate: id.clone(),
+                            ordinal: ordinal * 2 + 1,
+                        },
+                        source_name: Some(rewrite.index_name.clone()),
+                        source_span: None,
+                        ownership: ArtifactOwnership::Trial,
+                        fate: ArtifactFate::Eliminated,
+                    });
+                }
+                Some(ArrayLocalCandidateRecord {
+                    id: id.clone(),
+                    artifacts,
+                    counts,
+                    upstream_origins: plan.group_origins.get(id).cloned().unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    );
+    records.sort_by(|left, right| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)));
+    records
+}
+
+fn unknown_candidate_record(candidate: CandidateId) -> ArrayLocalCandidateRecord {
+    ArrayLocalCandidateRecord {
+        artifacts: vec![ArtifactFootprint {
+            id: ArtifactId {
+                candidate: candidate.clone(),
+                ordinal: usize::MAX,
+            },
+            source_name: None,
+            source_span: None,
+            ownership: ArtifactOwnership::Trial,
+            fate: ArtifactFate::Unknown,
+        }],
+        id: candidate,
+        counts: ArrayLocalArtifactCounts {
+            unknown: 1,
+            ..ArrayLocalArtifactCounts::default()
+        },
+        upstream_origins: Vec::new(),
+    }
+}
+
 fn choose_binding_representations(
     krate: &Crate,
     ast_to_hir: &AstToHir,
     tcx: TyCtxt<'_>,
-    c_exposed_fns: &FxHashSet<String>,
+    _c_exposed_fns: &FxHashSet<String>,
     plan: &mut RewritePlan,
     trace: &mut RewriteTrace,
 ) {
@@ -1638,71 +2043,13 @@ fn choose_binding_representations(
     visitor.visit_crate(krate);
     let mut summaries = std::mem::take(&mut visitor.summaries);
     drop(visitor);
-    // cost model: a nullable member of a raw base pays one raw `offset` per
-    // materialized use (value use, call argument, deref, write through the
-    // pointer) and only removes offsets for movements and existing
-    // `offset_from` uses. the decision is aggregated per group over its
-    // nullable raw-base members and applied to them as a unit: same-group
-    // copies make per-member drops inconsistent (a dropped copy target turns
-    // the free index copy into a fresh materialization on the kept member).
-    let mut group_costs: FxHashMap<BaseCursorKey, (usize, usize, Vec<HirId>)> =
-        FxHashMap::default();
-    for (hir_id, rewrite) in &plan.by_hir_id {
-        if !rewrite.nullable || !rewrite.base_is_raw_ptr || rewrite.field_base {
-            continue;
-        }
-        // only bail when the base is pinned raw for good: a parameter of a
-        // c-exposed function keeps its ABI type, so the materialized uses stay
-        // unsafe. any other base may still be upgraded to a slice by later
-        // stages, turning the same materializations into safe indexing.
-        if !base_is_fn_param(tcx, rewrite.base_hir_id)
-            || !crate::utils::rustc::is_c_exposed_fn(
-                tcx,
-                rewrite.base_hir_id.owner.def_id,
-                c_exposed_fns,
-            )
-        {
-            continue;
-        }
-        let Some(summary) = summaries.get(hir_id) else { continue };
-        let added = summary.pointer_value_count
-            + summary.call_arg_count
-            + summary.deref_count
-            + summary.field_or_index_count
-            + summary.write_through_pointer_count;
-        let removed = summary.movement_count + summary.offset_from_count;
-        let entry = group_costs
-            .entry(base_cursor_key(rewrite.base_hir_id, &rewrite.base_name))
-            .or_default();
-        entry.0 += added;
-        entry.1 += removed;
-        entry.2.push(*hir_id);
+    for summary in summaries.values_mut() {
+        summary.declaration_count = 1;
+        summary.reconstruction_count = summary.pointer_value_count + summary.call_arg_count;
+        summary.offset_or_conversion_count =
+            summary.movement_count + summary.offset_from_count + summary.field_or_index_count;
     }
-    let mut unprofitable: Vec<HirId> = Vec::new();
-    for (added, removed, members) in group_costs.into_values() {
-        if added > removed {
-            unprofitable.extend(members);
-        }
-    }
-    for hir_id in &unprofitable {
-        if let Some(rewrite) = plan.by_hir_id.get(hir_id) {
-            let source_name = rewrite.source_name.clone();
-            trace.record(
-                hir_id.owner.def_id,
-                TraceSubject::Member(source_name),
-                TraceStage::Representation,
-                TraceDecision::Dropped,
-                || {
-                    "cost: index rewrite would add more unsafe operations than it removes"
-                        .to_string()
-                },
-            );
-        }
-        plan.by_hir_id.remove(hir_id);
-    }
-    if !unprofitable.is_empty() {
-        prune_orphan_base_cursors(plan);
-    }
+    plan.summaries = summaries.clone();
     for (hir_id, rewrite) in &mut plan.by_hir_id {
         let summary = summaries.remove(hir_id).unwrap_or_default();
         rewrite.has_index_benefit = summary.has_index_benefit();
@@ -3570,6 +3917,27 @@ struct ArrayLocalIndexRewriteVisitor<'a, 'tcx> {
 }
 
 impl ArrayLocalIndexRewriteVisitor<'_, '_> {
+    fn groups_applied_completely(&self) -> bool {
+        self.plan.groups.values().all(|members| {
+            members.iter().all(|hir_id| {
+                self.plan.by_hir_id.contains_key(hir_id) && self.introduced_hir_ids.contains(hir_id)
+            })
+        })
+    }
+
+    fn failed_application_records(&self) -> Vec<ArrayLocalCandidateRecord> {
+        let mut records = self.plan.rejected_records.clone();
+        records.extend(
+            self.plan
+                .groups
+                .keys()
+                .cloned()
+                .map(unknown_candidate_record),
+        );
+        records.sort_by(|left, right| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)));
+        records
+    }
+
     fn introduced_index_backed_rewrite(&self, hir_id: HirId) -> Option<&BindingRewrite> {
         if !self.introduced_hir_ids.contains(&hir_id) {
             return None;

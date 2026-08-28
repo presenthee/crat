@@ -18,7 +18,7 @@ use super::{
 };
 use crate::{analyses::ownership::Ownership, utils::rustc::RustProgram};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PtrKind {
     /// reference: &mut T for Ref(true), or &T for Ref(false)
     Ref(bool),
@@ -1362,6 +1362,41 @@ pub unsafe fn foo(p: {pointer_ty}) {{
             decide_for_param(false, false, false, false, true, false, true),
             PtrKind::OptRef(true)
         );
+    }
+
+    #[test]
+    fn downstream_promotion_distinguishes_raw_promoted_and_alias_forced_raw() {
+        assert_eq!(
+            decide_for_param_with_ty(
+                "*const i32",
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            PtrKind::Raw(false),
+        );
+        assert_eq!(
+            decide_for_param_with_ty("*const i32", false, false, false, false, false, true, false),
+            PtrKind::OptRef(false),
+        );
+
+        let mut decision = None;
+        with_test_fn_body(
+            "pub unsafe fn f(p: *mut i32, q: *mut i32) {}",
+            |tcx, _did, body| {
+                let local = Local::from_u32(1);
+                let maker = synthetic_decision_maker_with_non_null(
+                    tcx, body, local, true, false, false, false, false, true, false, false,
+                );
+                let aliases = FxHashSet::from_iter([Local::from_u32(2)]);
+                decision = maker.decide(local, &body.local_decls[local], Some(&aliases));
+            },
+        );
+        assert_eq!(decision, Some(PtrKind::Raw(true)));
     }
 
     #[test]

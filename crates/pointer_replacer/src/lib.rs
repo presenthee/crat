@@ -29,9 +29,13 @@ mod rewriter;
 mod utils;
 
 pub use rewriter::{
-    BytemuckDependency, Config, replace_local_borrows, rewrite_aliasing,
-    rewrite_array_local_provenance, rewrite_epoch_split, rewrite_struct_arrays,
-    rewrite_struct_param_fields,
+    BytemuckDependency, Config, GatedCandidateDecision, GatedPrepassPhase, GatedPrepassResult,
+    profitability::{
+        CandidateId, CandidateMeasurement, ProfitabilityDecision, ProfitabilityMetric,
+        ProfitabilityMetrics, RejectionReason,
+    },
+    replace_local_borrows, rewrite_aliasing, rewrite_array_local_provenance, rewrite_epoch_split,
+    rewrite_struct_arrays, rewrite_struct_param_fields, run_gated_pointer_prepasses,
 };
 
 #[cfg(test)]

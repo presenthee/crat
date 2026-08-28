@@ -26,7 +26,10 @@ use rustc_middle::{
     mir::{Local, Operand, Rvalue, StatementKind, TerminatorKind, VarDebugInfoContents},
     ty::{self, TyCtxt},
 };
-use rustc_span::{Span, def_id::LocalDefId};
+use rustc_span::{
+    Span,
+    def_id::{DefPathHash, LocalDefId},
+};
 use thin_vec::thin_vec;
 use utils::ir::AstToHir;
 
@@ -44,6 +47,7 @@ pub(crate) fn trace_enabled() -> bool {
 pub(crate) struct SiteRewrite {
     pub(crate) caller: LocalDefId,
     pub(crate) callee: LocalDefId,
+    function: DefPathHash,
     /// The call expression's span, which identifies the AST statement.
     call_span: Span,
     runtime_len: Option<RuntimeLen>,
@@ -63,6 +67,7 @@ enum PlannedCopy {
     /// and the argument becomes `snap.as_ptr()`.
     Prefix {
         arg_index: usize,
+        source_name: Option<String>,
         elem_ty: String,
         elems: u64,
     },
@@ -78,7 +83,22 @@ enum PlannedCopy {
     /// `let snap: Vec<elem_ty> = if <captured_len> > 0 { <read>.to_vec() }
     /// else { Vec::new() };` and the argument becomes `snap.as_ptr()`. The
     /// site's shared `runtime_len` supplies the captured length.
-    Runtime { arg_index: usize, elem_ty: String },
+    Runtime {
+        arg_index: usize,
+        source_name: Option<String>,
+        elem_ty: String,
+    },
+}
+
+pub(crate) struct GeneratedSnapshot {
+    pub(crate) function: DefPathHash,
+    pub(crate) name: String,
+    pub(crate) origin_name: Option<String>,
+}
+
+pub(crate) struct SnapshotIsolationResult {
+    pub(crate) changed: bool,
+    pub(crate) generated: Vec<GeneratedSnapshot>,
 }
 
 /// The source-level debug name of an unprojected local, if the body has one
@@ -154,6 +174,20 @@ fn skip_anonymous_copies(body: &rustc_middle::mir::Body<'_>, mut local: Local) -
     local
 }
 
+fn argument_source_name(
+    body: &rustc_middle::mir::Body<'_>,
+    args: &[rustc_span::source_map::Spanned<Operand<'_>>],
+    arg_index: usize,
+) -> Option<String> {
+    let (Operand::Copy(place) | Operand::Move(place)) = &args.get(arg_index)?.node else {
+        return None;
+    };
+    if !place.projection.is_empty() {
+        return None;
+    }
+    local_source_name(body, skip_anonymous_copies(body, place.local))
+}
+
 /// Resolves gated candidates into rewrite-ready sites and drops the ones the
 /// AST cannot express: calls not in statement position, whole-array bases
 /// without a debug name, and argument shapes the substitution does not
@@ -200,6 +234,7 @@ pub(crate) fn plan_sites<'tcx>(
                     };
                     copies.push(PlannedCopy::Prefix {
                         arg_index,
+                        source_name: argument_source_name(&body, args, arg_index),
                         elem_ty: pointee.to_string(),
                         elems,
                     });
@@ -271,6 +306,7 @@ pub(crate) fn plan_sites<'tcx>(
                     }
                     copies.push(PlannedCopy::Runtime {
                         arg_index,
+                        source_name: argument_source_name(&body, args, arg_index),
                         elem_ty: pointee.to_string(),
                     });
                 }
@@ -280,6 +316,7 @@ pub(crate) fn plan_sites<'tcx>(
         let site = SiteRewrite {
             caller: candidate.caller,
             callee: candidate.callee,
+            function: tcx.def_path_hash(candidate.caller.to_def_id()),
             call_span,
             runtime_len,
             copies,
@@ -390,9 +427,12 @@ pub(crate) fn apply_snapshot_isolation(
     sites: &[SiteRewrite],
     ast_to_hir: &AstToHir,
     validate: bool,
-) -> bool {
+) -> SnapshotIsolationResult {
     if sites.is_empty() {
-        return false;
+        return SnapshotIsolationResult {
+            changed: false,
+            generated: Vec::new(),
+        };
     }
     let mut by_caller: FxHashMap<LocalDefId, Vec<&SiteRewrite>> = FxHashMap::default();
     for site in sites {
@@ -406,9 +446,13 @@ pub(crate) fn apply_snapshot_isolation(
         fn_is_unsafe: false,
         snap_counter: 0,
         changed: false,
+        generated: Vec::new(),
     };
     visitor.visit_crate(krate);
-    visitor.changed
+    SnapshotIsolationResult {
+        changed: visitor.changed,
+        generated: visitor.generated,
+    }
 }
 
 struct EmitVisitor<'a> {
@@ -420,6 +464,7 @@ struct EmitVisitor<'a> {
     fn_is_unsafe: bool,
     snap_counter: usize,
     changed: bool,
+    generated: Vec<GeneratedSnapshot>,
 }
 
 impl MutVisitor for EmitVisitor<'_> {
@@ -499,10 +544,19 @@ impl EmitVisitor<'_> {
                 match copy {
                     PlannedCopy::Prefix {
                         arg_index,
+                        source_name,
                         elem_ty,
                         elems,
                     } => {
                         let name = self.fresh_name();
+                        let origin_name = source_name.clone().or_else(|| {
+                            plain_ident_name(&call_args[*arg_index]).map(str::to_owned)
+                        });
+                        self.generated.push(GeneratedSnapshot {
+                            function: site.function,
+                            name: name.clone(),
+                            origin_name,
+                        });
                         let arg = pprust::expr_to_string(&call_args[*arg_index]);
                         // The element-pointer cast first: the argument may be
                         // a reference coerced to a raw pointer at the call,
@@ -536,6 +590,11 @@ impl EmitVisitor<'_> {
                             Some(name) => name.clone(),
                             None => {
                                 let name = self.fresh_name();
+                                self.generated.push(GeneratedSnapshot {
+                                    function: site.function,
+                                    name: name.clone(),
+                                    origin_name: Some(base_name.clone()),
+                                });
                                 inserts.push(utils::stmt!(
                                     "let {name}: [{elem_ty}; {len}] = {base_name};"
                                 ));
@@ -551,11 +610,23 @@ impl EmitVisitor<'_> {
                             self.changed = true;
                         }
                     }
-                    PlannedCopy::Runtime { arg_index, elem_ty } => {
+                    PlannedCopy::Runtime {
+                        arg_index,
+                        source_name,
+                        elem_ty,
+                    } => {
                         let len = runtime_capture
                             .as_ref()
                             .expect("runtime copy has a site length capture");
                         let name = self.fresh_name();
+                        let origin_name = source_name.clone().or_else(|| {
+                            plain_ident_name(&call_args[*arg_index]).map(str::to_owned)
+                        });
+                        self.generated.push(GeneratedSnapshot {
+                            function: site.function,
+                            name: name.clone(),
+                            origin_name,
+                        });
                         let arg = pprust::expr_to_string(&call_args[*arg_index]);
                         let read = self.in_unsafe(format!(
                             "std::slice::from_raw_parts(({arg}) as *const {elem_ty}, {len} as usize).to_vec()"
