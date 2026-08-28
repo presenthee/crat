@@ -588,37 +588,14 @@ fn main() {
                 }
 
                 if config.verbose {
-                    println!("Pointer: split borrow epochs");
+                    println!("Pointer: run gated pointer prepasses");
                 }
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_epoch_split(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
-
-                if config.verbose {
-                    println!("Pointer: rewrite aliasing");
-                }
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_aliasing(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
-
-                if config.verbose {
-                    println!("Pointer: rewrite array local provenance");
-                }
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_array_local_provenance(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
+                let checkpoint_source = std::fs::read_to_string(&file).unwrap();
+                let gated = pointer_replacer::run_gated_pointer_prepasses(
+                    &config.pointer,
+                    &checkpoint_source,
+                );
+                std::fs::write(&file, gated.source).unwrap();
 
                 if config.verbose {
                     println!("Pointer: replace local borrows");
