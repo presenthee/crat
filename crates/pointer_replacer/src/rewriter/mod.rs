@@ -1094,16 +1094,20 @@ fn run_gated_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(
 }
 
 /// Test-only entry point that runs the array-local pass with the decision trace
-/// forced on (`enabled = true`) or off (`enabled = false`) and returns both the
-/// rewritten source and the collected events. Mirrors
-/// `rewrite_array_local_provenance`'s setup. Returning the source lets tests
-/// assert the trace is behavior-neutral (enabled vs disabled output is equal).
+/// forced on (`enabled = true`) or off (`enabled = false`) and returns the
+/// rewritten source, collected events, and P1 candidate records. Mirrors
+/// `rewrite_array_local_provenance`'s setup. Returning the source and records
+/// lets tests assert the trace is behavior-neutral.
 #[cfg(test)]
 pub(crate) fn rewrite_array_local_provenance_trace(
     config: &Config,
     tcx: TyCtxt<'_>,
     enabled: bool,
-) -> (String, Vec<array_local_trace::TraceEvent>) {
+) -> (
+    String,
+    Vec<array_local_trace::TraceEvent>,
+    Vec<array_local_index_rewriter::ArrayLocalCandidateRecord>,
+) {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
@@ -1134,7 +1138,7 @@ pub(crate) fn rewrite_array_local_provenance_trace(
     let provenances =
         analyses::array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
 
-    let events = array_local_index_rewriter::apply_array_local_index_rewrite_traced(
+    let (events, candidates) = array_local_index_rewriter::apply_array_local_index_rewrite_traced(
         &mut krate,
         &input,
         &provenances,
@@ -1145,7 +1149,11 @@ pub(crate) fn rewrite_array_local_provenance_trace(
         &config.c_exposed_fns,
         enabled,
     );
-    (pprust::crate_to_string_for_macros(&krate), events)
+    (
+        pprust::crate_to_string_for_macros(&krate),
+        events,
+        candidates,
+    )
 }
 
 pub(crate) fn collect_input(tcx: TyCtxt<'_>) -> RustProgram<'_> {

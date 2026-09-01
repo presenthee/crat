@@ -12085,6 +12085,37 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
 }
 
 #[test]
+fn test_array_local_trace_reports_anonymous_offset_origin() {
+    use crate::rewriter::array_local_trace::{TraceStage, TraceSubject};
+
+    let code = r#"
+pub unsafe fn anonymous_offset_member(p: *mut i32) -> i32 {
+    let q = p.offset(1);
+    let first = *p;
+    let second = *q.offset(1);
+    first + second
+}
+"#;
+    let events = array_local_trace_events(code);
+    assert!(
+        events.iter().any(|event| event.stage == TraceStage::Origin
+            && matches!(event.subject, TraceSubject::Member(_))
+            && event.reason.contains("origin=expression")
+            && event.reason.contains("ast=yes")
+            && event.reason.contains("shape=offset")),
+        "expected an anonymous offset origin event: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| event.stage == TraceStage::Origin
+            && matches!(event.subject, TraceSubject::Member(_))
+            && event
+                .reason
+                .contains("origin=binding-copy source=_1 represented=yes")),
+        "expected a copy of the represented base binding: {events:#?}"
+    );
+}
+
+#[test]
 fn test_array_local_trace_disabled_is_neutral() {
     // enabling the trace must not change the rewritten output, and the disabled
     // trace must record nothing.
@@ -12096,14 +12127,16 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     *q
 }
 "#;
-    let (src_enabled, _events) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true)
-    })
-    .unwrap();
-    let (src_disabled, events_disabled) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, false)
-    })
-    .unwrap();
+    let (src_enabled, _events, candidates_enabled) =
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true)
+        })
+        .unwrap();
+    let (src_disabled, events_disabled, candidates_disabled) =
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, false)
+        })
+        .unwrap();
     assert!(
         events_disabled.is_empty(),
         "disabled trace must record nothing: {events_disabled:#?}"
@@ -12111,6 +12144,10 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     assert_eq!(
         src_enabled, src_disabled,
         "enabling the trace must not change pass output"
+    );
+    assert_eq!(
+        candidates_enabled, candidates_disabled,
+        "enabling the trace must not change P1 candidate records"
     );
 }
 
