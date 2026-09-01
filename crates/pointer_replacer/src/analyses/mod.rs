@@ -10,6 +10,7 @@ mod lattice;
 mod liveness;
 pub mod loop_recognizer;
 mod mir;
+pub(crate) mod mir_local_facts;
 pub mod mir_variable_grouping;
 pub mod nullity;
 pub mod offset_sign;

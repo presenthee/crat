@@ -228,17 +228,11 @@ fn find_relationships<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Relationshi
     }
 
     impl<'tcx> Visitor<'tcx> for CopyVisitor<'tcx> {
-        fn visit_assign(
-            &mut self,
-            place: &Place<'tcx>,
-            rvalue: &Rvalue<'tcx>,
-            _location: Location,
-        ) {
-            if let Some(dest_local) = place.as_local()
-                && let Rvalue::Use(Operand::Copy(src_place) | Operand::Move(src_place)) = rvalue
-                && let Some(src_local) = src_place.as_local()
+        fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
+            if let Some(edge) =
+                super::mir_local_facts::copy_edge_from_assignment(place, rvalue, location)
             {
-                self.rels.copies.push((dest_local, src_local));
+                self.rels.copies.push((edge.destination, edge.source));
             }
 
             if let Rvalue::BinaryOp(_, box (l, r)) = rvalue {
@@ -282,6 +276,7 @@ fn find_relationships<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Relationshi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rewriter::collect_input;
 
     fn source_var_groups() -> (SourceVarGroups, LocalDefId, Local) {
         let did = rustc_hir::def_id::CRATE_DEF_ID;
@@ -341,5 +336,99 @@ mod tests {
             widened[&did].iter().collect::<Vec<_>>(),
             vec![rep, Local::from_usize(2), Local::from_usize(3)]
         );
+    }
+
+    type GroupSnapshot = Vec<(String, Vec<(usize, Vec<usize>)>)>;
+
+    fn snapshot_source_var_groups(code: &str) -> GroupSnapshot {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = collect_input(tcx);
+            let groups = SourceVarGroups::new(&program);
+            let mut snapshot = program
+                .functions
+                .iter()
+                .map(|&function| {
+                    let mut function_groups = groups.inner[&function]
+                        .iter()
+                        .map(|(&source, members)| {
+                            (
+                                source.index(),
+                                members.iter().map(|member| member.index()).collect(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    function_groups.sort_by_key(|(source, _)| *source);
+                    (
+                        tcx.item_name(function.to_def_id()).to_string(),
+                        function_groups,
+                    )
+                })
+                .collect::<Vec<_>>();
+            snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+            snapshot
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn source_var_groups_match_pre_extraction_snapshot() {
+        let actual = snapshot_source_var_groups(
+            r#"
+            unsafe fn copy_chain(p: *mut i32) -> *mut i32 {
+                let q = p;
+                let r = q;
+                r
+            }
+
+            unsafe fn binary_operand(p: *mut i32, n: isize) -> *mut i32 {
+                let q = p;
+                let shifted = unsafe { q.offset(n + 1) };
+                shifted
+            }
+
+            fn borrowing_receivers(values: &mut Vec<i32>) -> (*const i32, *mut i32) {
+                let shared = values.as_ptr();
+                let mutable = values.as_mut_ptr();
+                (shared, mutable)
+            }
+
+            unsafe fn reassignment(
+                p: *mut i32,
+                other: *mut i32,
+            ) -> (*mut i32, *mut i32) {
+                let mut q = p;
+                let before = q;
+                q = other;
+                let after = q;
+                (before, after)
+            }
+            "#,
+        );
+
+        let expected = vec![
+            (
+                "binary_operand".to_string(),
+                vec![(1, vec![1]), (2, vec![2]), (3, vec![3]), (4, vec![4])],
+            ),
+            (
+                "borrowing_receivers".to_string(),
+                vec![(1, vec![1]), (2, vec![2, 6]), (4, vec![4, 7])],
+            ),
+            (
+                "copy_chain".to_string(),
+                vec![(1, vec![1]), (2, vec![2]), (3, vec![3])],
+            ),
+            (
+                "reassignment".to_string(),
+                vec![
+                    (1, vec![1]),
+                    (2, vec![2, 5]),
+                    (3, vec![3]),
+                    (4, vec![4, 7]),
+                    (6, vec![6, 8]),
+                ],
+            ),
+        ];
+        assert_eq!(actual, expected);
     }
 }
