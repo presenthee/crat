@@ -18,6 +18,7 @@ pub(crate) enum TraceSubject {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TraceStage {
     Selection,
+    Origin,
     Plan,
     Prune,
     Representation,
@@ -190,15 +191,18 @@ mod tests {
         trace.record(
             did(),
             TraceSubject::Member("q".into()),
-            TraceStage::Prune,
-            TraceDecision::Dropped,
-            || "q = b\"x\\0\"".into(),
+            TraceStage::Origin,
+            TraceDecision::Kept,
+            || "origin=expression ast=yes shape=offset definitions=1 hir=3".into(),
         );
         assert_eq!(trace.events().len(), 1);
         let e = &trace.events()[0];
         assert_eq!(e.subject, TraceSubject::Member("q".into()));
-        assert_eq!(e.stage, TraceStage::Prune);
-        assert_eq!(e.decision, TraceDecision::Dropped);
-        assert_eq!(e.reason, "q = b\"x\\0\"");
+        assert_eq!(e.stage, TraceStage::Origin);
+        assert_eq!(e.decision, TraceDecision::Kept);
+        assert_eq!(
+            e.reason,
+            "origin=expression ast=yes shape=offset definitions=1 hir=3"
+        );
     }
 }

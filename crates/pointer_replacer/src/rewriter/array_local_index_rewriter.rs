@@ -33,6 +33,7 @@ use crate::{
         type_qualifier::foster::mutability::MutabilityResult,
     },
     rewriter::{
+        array_local_origin::AnonymousOriginReporter,
         array_local_trace::{RewriteTrace, TraceDecision, TraceStage, TraceSubject},
         profitability::{
             ArtifactFate, ArtifactFootprint, ArtifactId, ArtifactOwnership, CandidateId,
@@ -603,6 +604,9 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
     lineage: &LineageCatalog,
     trace: &mut RewriteTrace,
 ) -> (bool, Vec<ArrayLocalCandidateRecord>) {
+    let mut origin_reporter = trace
+        .is_enabled()
+        .then(|| AnonymousOriginReporter::new(krate, ast_to_hir, input.tcx));
     let mut plan = build_rewrite_plan(
         input,
         provenances,
@@ -611,6 +615,7 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
         points_to,
         accepted,
         lineage,
+        origin_reporter.as_mut(),
         trace,
     );
     refine_base_pointer_kinds_from_ast(krate, ast_to_hir, input.tcx, &mut plan);
@@ -659,9 +664,12 @@ pub(crate) fn apply_array_local_index_rewrite_traced<'tcx>(
     ast_to_hir: &AstToHir,
     c_exposed_fns: &FxHashSet<String>,
     enabled: bool,
-) -> Vec<crate::rewriter::array_local_trace::TraceEvent> {
+) -> (
+    Vec<crate::rewriter::array_local_trace::TraceEvent>,
+    Vec<ArrayLocalCandidateRecord>,
+) {
     let mut trace = RewriteTrace::for_test(enabled);
-    let _ = apply_array_local_index_rewrite_inner(
+    let (_, candidates) = apply_array_local_index_rewrite_inner(
         krate,
         input,
         provenances,
@@ -674,7 +682,7 @@ pub(crate) fn apply_array_local_index_rewrite_traced<'tcx>(
         &LineageCatalog::default(),
         &mut trace,
     );
-    trace.into_events()
+    (trace.into_events(), candidates)
 }
 
 /// Returns true for an index-tracked base whose base slot lives behind a
@@ -741,6 +749,7 @@ pub(crate) fn group_has_rewritable_binding<'tcx>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_rewrite_plan<'tcx>(
     input: &RustProgram<'tcx>,
     provenances: &FxHashMap<LocalDefId, ArrayLocalProvenance>,
@@ -749,6 +758,7 @@ fn build_rewrite_plan<'tcx>(
     points_to: &andersen::AnalysisResult,
     accepted: Option<&FxHashSet<CandidateId>>,
     lineage: &LineageCatalog,
+    mut origin_reporter: Option<&mut AnonymousOriginReporter>,
     trace: &mut RewriteTrace,
 ) -> RewritePlan {
     let mut plan = RewritePlan::default();
@@ -815,6 +825,20 @@ fn build_rewrite_plan<'tcx>(
             .iter()
             .map(|(hir_id, local)| (*local, *hir_id))
             .collect();
+        if let Some(reporter) = origin_reporter.as_deref_mut() {
+            for group in &groups {
+                reporter.record_ready_group(
+                    input.tcx,
+                    def_id,
+                    &body,
+                    &hir_to_mir,
+                    provenance,
+                    group,
+                    &local_to_hir,
+                    trace,
+                );
+            }
+        }
         let mut existing_names = binding_names_in_body(input.tcx, def_id);
         let binding_keys = source_binding_keys_in_body(input.tcx, def_id);
 
