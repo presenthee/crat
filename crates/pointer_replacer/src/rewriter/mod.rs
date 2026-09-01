@@ -36,6 +36,7 @@ use crate::{
 };
 
 pub(crate) mod array_local_index_rewriter;
+pub(crate) mod array_local_origin;
 pub(crate) mod array_local_trace;
 pub(crate) mod collector;
 mod cursor_resolution;
