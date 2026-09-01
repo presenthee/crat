@@ -4,17 +4,24 @@ use rustc_ast::{
     Crate, Expr,
     visit::{self, Visitor},
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ExprKind, HirId, Node};
 use rustc_middle::{
-    mir::{Local, Location},
+    mir::{Body, Local, Location},
     ty::TyCtxt,
 };
-use utils::ir::AstToHir;
+use rustc_span::def_id::LocalDefId;
+use utils::ir::{AstToHir, thir_to_mir::ThirToMir};
 
-use crate::analyses::{
-    mir_local_facts::MirLocalDefinitionKind,
-    mir_source_origins::{BindingOriginIssue, BindingOriginKind, MirLocalSourceEvidence},
+use crate::{
+    analyses::{
+        array_local_provenance::{ArrayLocalProvenance, RewriteGroup},
+        mir_local_facts::MirLocalDefinitionKind,
+        mir_source_origins::{
+            BindingOriginIssue, BindingOriginKind, MirLocalSourceEvidence, MirSourceOrigins,
+        },
+    },
+    rewriter::array_local_trace::{RewriteTrace, TraceDecision, TraceStage, TraceSubject},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,6 +213,176 @@ pub(crate) fn collect_ast_expression_hir_ids(
     };
     collector.visit_crate(krate);
     collector.hir_ids
+}
+
+pub(crate) struct AnonymousOriginReporter {
+    origins: MirSourceOrigins,
+    ast_expression_hir_ids: FxHashSet<HirId>,
+}
+
+impl AnonymousOriginReporter {
+    pub(crate) fn new(krate: &Crate, ast_to_hir: &AstToHir, tcx: TyCtxt<'_>) -> Self {
+        Self {
+            origins: MirSourceOrigins::new(tcx),
+            ast_expression_hir_ids: collect_ast_expression_hir_ids(krate, ast_to_hir, tcx),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_ready_group<'tcx>(
+        &mut self,
+        tcx: TyCtxt<'tcx>,
+        def_id: LocalDefId,
+        body: &Body<'tcx>,
+        thir_to_mir: &ThirToMir,
+        provenance: &ArrayLocalProvenance,
+        group: &RewriteGroup,
+        local_to_hir: &FxHashMap<Local, HirId>,
+        trace: &mut RewriteTrace,
+    ) {
+        if !local_to_hir.contains_key(&group.base_local) {
+            return;
+        }
+
+        let mut represented_bindings = FxHashSet::default();
+        let mut anonymous_occurrences = Vec::new();
+        for &slot_index in &group.members {
+            let Some(info) = provenance.slot_table().slot_infos.get(slot_index) else {
+                continue;
+            };
+            if !info.path.is_empty()
+                || !matches!(
+                    body.local_decls[info.root].ty.kind(),
+                    rustc_middle::ty::TyKind::RawPtr(..)
+                )
+            {
+                continue;
+            }
+            if let Some(&hir_id) = local_to_hir.get(&info.root) {
+                represented_bindings.insert(hir_id);
+            } else if info.root != group.base_local {
+                anonymous_occurrences.push(info.root);
+            }
+        }
+        if anonymous_occurrences.is_empty() {
+            return;
+        }
+
+        self.origins
+            .analyze_function(tcx, def_id, body, thir_to_mir);
+        let occurrence_count = anonymous_occurrences.len();
+        anonymous_occurrences.sort_by_key(|local| local.index());
+        anonymous_occurrences.dedup();
+
+        let mut unique_ast_hir_ids = FxHashSet::default();
+        let mut all_unique_ast = true;
+        for &local in &anonymous_occurrences {
+            let missing = MirLocalSourceEvidence::default();
+            let evidence = self.origins.evidence(def_id, local).unwrap_or(&missing);
+            let status = classify_anonymous_member(
+                evidence,
+                &self.ast_expression_hir_ids,
+                &represented_bindings,
+                tcx,
+            );
+            let (decision, reason) = match &status {
+                AnonymousMemberStatus::BindingCopy {
+                    source_local,
+                    represented,
+                    ..
+                } => (
+                    TraceDecision::Skipped,
+                    format!(
+                        "origin=binding-copy source={source_local:?} represented={}",
+                        if *represented { "yes" } else { "no" }
+                    ),
+                ),
+                AnonymousMemberStatus::UniqueAstExpression {
+                    hir_id,
+                    definitions,
+                    shape,
+                } => {
+                    unique_ast_hir_ids.insert(*hir_id);
+                    (
+                        TraceDecision::Kept,
+                        format!(
+                            "origin=expression ast=yes shape={} definitions={} hir={}",
+                            shape.as_str(),
+                            definitions.len(),
+                            hir_id.local_id.index()
+                        ),
+                    )
+                }
+                AnonymousMemberStatus::UniqueHirExpressionWithoutAst {
+                    hir_id,
+                    definitions,
+                    shape,
+                } => (
+                    TraceDecision::Dropped,
+                    format!(
+                        "origin=expression ast=no shape={} definitions={} hir={}",
+                        shape.as_str(),
+                        definitions.len(),
+                        hir_id.local_id.index()
+                    ),
+                ),
+                AnonymousMemberStatus::Unresolved(failure) => {
+                    let reason = match failure {
+                        AnonymousOriginFailure::MultipleBindingOrigins => {
+                            "origin=unresolved reason=multiple-bindings".to_string()
+                        }
+                        AnonymousOriginFailure::MixedBindingAndExpressionDefinitions => {
+                            "origin=unresolved reason=mixed-definitions".to_string()
+                        }
+                        AnonymousOriginFailure::PartialExpressionCoverage => {
+                            "origin=unresolved reason=partial-expression".to_string()
+                        }
+                        AnonymousOriginFailure::MultipleExpressionOrigins => format!(
+                            "origin=unresolved reason=multiple-expressions candidates={}",
+                            evidence.expression_origins.len()
+                        ),
+                        AnonymousOriginFailure::NoExpressionEvidence => {
+                            "origin=unresolved reason=no-expression".to_string()
+                        }
+                        AnonymousOriginFailure::UnsupportedDefinitions => {
+                            "origin=unresolved reason=unsupported-definitions".to_string()
+                        }
+                        AnonymousOriginFailure::CopyCycle => {
+                            "origin=unresolved reason=copy-cycle".to_string()
+                        }
+                    };
+                    (TraceDecision::Dropped, reason)
+                }
+            };
+            all_unique_ast &= matches!(status, AnonymousMemberStatus::UniqueAstExpression { .. });
+            trace.record(
+                def_id,
+                TraceSubject::Member(format!("{local:?}")),
+                TraceStage::Origin,
+                decision,
+                || reason,
+            );
+        }
+
+        let unique_local_count = anonymous_occurrences.len();
+        let unique_ast_count = unique_ast_hir_ids.len();
+        trace.record(
+            def_id,
+            TraceSubject::Group(format!("{:?}", group.base_local)),
+            TraceStage::Origin,
+            if unique_ast_count > 0 {
+                TraceDecision::Kept
+            } else {
+                TraceDecision::Skipped
+            },
+            || {
+                format!(
+                    "origin-summary anonymous-occurrences={occurrence_count} unique-locals={unique_local_count} unique-ast={unique_ast_count} all-unique-ast={}",
+                    if all_unique_ast { "yes" } else { "no" }
+                )
+            },
+        );
+    }
 }
 
 #[cfg(test)]
