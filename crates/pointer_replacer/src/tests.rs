@@ -11542,3 +11542,86 @@ pub unsafe fn run_direct(value: Num) -> i32 {
         &["fn(Num) -> i32"],
     );
 }
+
+
+#[test]
+fn test_stored_pointer_lifetimes_direct() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Node { pub key: *const i8, pub next: *mut Node }
+#[repr(C)]
+pub struct Queue { pub head: *mut Node }
+pub unsafe fn seed() -> i8 {
+    let data = [7_i8];
+    let node = Node { key: data.as_ptr(), next: std::ptr::null_mut() };
+    *node.key.offset(0)
+}
+pub unsafe fn link(queue: *mut Queue, node: *mut Node) {
+    (*node).next = (*queue).head;
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+
+#[test]
+fn test_stored_pointer_lifetimes_atomic_temporary() {
+    run_test(
+        r#"
+#![feature(core_intrinsics)]
+#[repr(C)]
+pub struct Node { pub key: *const i8, pub next: *mut Node }
+#[repr(C)]
+pub struct Queue { pub head: *mut Node }
+pub unsafe fn seed() -> i8 {
+    let data = [7_i8];
+    let node = Node { key: data.as_ptr(), next: std::ptr::null_mut() };
+    *node.key.offset(0)
+}
+pub unsafe fn link(queue: *mut Queue, node: *mut Node) {
+    let next = (*queue).head;
+    (*node).next = next;
+    std::intrinsics::atomic_cxchg::<_,
+        { std::intrinsics::AtomicOrdering::SeqCst },
+        { std::intrinsics::AtomicOrdering::SeqCst }
+    >(&raw mut (*queue).head, next, node);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+
+#[test]
+fn test_stored_pointer_lifetimes_copy_chain() {
+    run_test(
+        r#"
+#![feature(core_intrinsics)]
+#[repr(C)]
+pub struct Node { pub key: *const i8, pub next: *mut Node }
+#[repr(C)]
+pub struct Queue { pub head: *mut Node }
+pub unsafe fn seed() -> i8 {
+    let data = [7_i8];
+    let node = Node { key: data.as_ptr(), next: std::ptr::null_mut() };
+    *node.key.offset(0)
+}
+pub unsafe fn link(queue: *mut Queue, node: *mut Node) {
+    let first = (*queue).head;
+    let second = first;
+    let next = second;
+    (*node).next = next;
+    std::intrinsics::atomic_cxchg::<_,
+        { std::intrinsics::AtomicOrdering::SeqCst },
+        { std::intrinsics::AtomicOrdering::SeqCst }
+    >(&raw mut (*queue).head, next, node);
+}
+"#,
+        &[],
+        &[],
+    );
+}

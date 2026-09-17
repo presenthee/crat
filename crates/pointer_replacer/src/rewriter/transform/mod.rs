@@ -4311,44 +4311,129 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn assignment_related_param_indices(&self, def_id: LocalDefId) -> FxHashSet<usize> {
-        struct AssignmentVisitor<'a, 'tcx> {
+        struct LocalInitializers<'tcx> {
             tcx: TyCtxt<'tcx>,
+            initializers: FxHashMap<HirId, &'tcx hir::Expr<'tcx>>,
+            invalidated: FxHashSet<HirId>,
+        }
+
+        impl<'tcx> Visitor<'tcx> for LocalInitializers<'tcx> {
+            fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) {
+                if let hir::StmtKind::Let(local) = stmt.kind
+                    && let hir::PatKind::Binding(mode, hir_id, _, None) = local.pat.kind
+                    && let Some(init) = local.init
+                {
+                    if matches!(mode.0, hir::ByRef::No) {
+                        self.initializers.insert(hir_id, init);
+                    } else if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) =
+                        hir_unwrap_casts(init).kind
+                        && let Res::Local(source) = path.res
+                    {
+                        self.invalidated.insert(source);
+                    }
+                }
+                intravisit::walk_stmt(self, stmt);
+            }
+
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+                use ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability};
+                if let hir::ExprKind::Closure(closure) = expr.kind
+                    && let Some(captures) = self.tcx.upvars_mentioned(closure.def_id)
+                {
+                    self.invalidated.extend(captures.keys().copied());
+                }
+                let implicit_mut_borrow = self
+                    .tcx
+                    .typeck(expr.hir_id.owner)
+                    .expr_adjustments(expr)
+                    .iter()
+                    .any(|adjustment| {
+                        matches!(
+                            adjustment.kind,
+                            Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Mut { .. }))
+                                | Adjust::Borrow(AutoBorrow::RawPtr(hir::Mutability::Mut))
+                        )
+                    });
+                let overwritten = match expr.kind {
+                    hir::ExprKind::Assign(lhs, _, _) | hir::ExprKind::AssignOp(_, lhs, _) => {
+                        Some(lhs)
+                    }
+                    // Raw const addresses can also be cast to writable pointers.
+                    hir::ExprKind::AddrOf(_, _, inner) => Some(inner),
+                    _ if implicit_mut_borrow => Some(expr),
+                    _ => None,
+                };
+                if let Some(expr) = overwritten
+                    && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) =
+                        hir_unwrap_casts(expr).kind
+                    && let Res::Local(hir_id) = path.res
+                {
+                    self.invalidated.insert(hir_id);
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        struct AssignmentVisitor<'a, 'b, 'tcx> {
+            tcx: TyCtxt<'tcx>,
+            transform: &'a TransformVisitor<'b, 'tcx>,
+            initializers: &'a FxHashMap<HirId, &'tcx hir::Expr<'tcx>>,
             param_indices: &'a FxHashMap<HirId, usize>,
             promoted_fields: &'a FxHashSet<StructFieldSlot>,
             related: FxHashSet<usize>,
         }
 
-        fn root_param(
-            expr: &hir::Expr<'_>,
-            param_indices: &FxHashMap<HirId, usize>,
-        ) -> Option<usize> {
-            let expr = hir_unwrap_casts(expr);
-            match expr.kind {
-                hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
-                    let Res::Local(hir_id) = path.res else {
-                        return None;
+        impl<'tcx> AssignmentVisitor<'_, '_, 'tcx> {
+            fn source_expr(&self, mut expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
+                loop {
+                    expr = hir_unwrap_casts(expr);
+                    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = expr.kind else {
+                        return expr;
                     };
-                    param_indices.get(&hir_id).copied()
+                    let Res::Local(hir_id) = path.res else { return expr };
+                    let Some(&init) = self.initializers.get(&hir_id) else { return expr };
+                    // Only follow pointer copies, not integer encodings or arbitrary values.
+                    let ty = self.tcx.typeck(expr.hir_id.owner).expr_ty(expr);
+                    if !matches!(ty.kind(), ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..)) {
+                        return expr;
+                    }
+                    expr = init;
                 }
-                hir::ExprKind::Unary(UnOp::Deref, inner)
-                | hir::ExprKind::Field(inner, _)
-                | hir::ExprKind::AddrOf(_, _, inner) => root_param(inner, param_indices),
-                _ => None,
+            }
+
+            fn root_param(&self, expr: &'tcx hir::Expr<'tcx>) -> Option<usize> {
+                let expr = self.source_expr(expr);
+                match expr.kind {
+                    hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+                        let Res::Local(hir_id) = path.res else { return None };
+                        self.param_indices.get(&hir_id).copied()
+                    }
+                    hir::ExprKind::Unary(UnOp::Deref, inner)
+                    | hir::ExprKind::Field(inner, _)
+                    | hir::ExprKind::AddrOf(_, _, inner) => self.root_param(inner),
+                    _ => None,
+                }
             }
         }
 
-        impl<'tcx> Visitor<'tcx> for AssignmentVisitor<'_, 'tcx> {
+        impl<'tcx> Visitor<'tcx> for AssignmentVisitor<'_, '_, 'tcx> {
             fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
                 if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
-                    && let Some(lhs_index) = root_param(lhs, self.param_indices)
-                    && let Some(rhs_index) = root_param(rhs, self.param_indices)
+                    && let Some(lhs_index) = self.root_param(lhs)
+                    && let Some(rhs_index) = self.root_param(rhs)
                     && lhs_index != rhs_index
                 {
-                    // an unpromoted raw field does not carry a Rust lifetime.
-                    // Copying its address into a promoted field must not extend
-                    // the borrow of the source struct.
-                    if hir_struct_field_slot(self.tcx, hir_unwrap_casts(rhs))
+                    // A raw scalar field does not carry the source struct's borrow.
+                    // A raw pointer to a promoted struct still carries its inner lifetimes,
+                    // including when the field is copied through a temporary.
+                    let source = self.source_expr(rhs);
+                    let source_ty = self.tcx.typeck(source.hir_id.owner).expr_ty(source);
+                    if hir_struct_field_slot(self.tcx, source)
                         .is_some_and(|field| !self.promoted_fields.contains(&field))
+                        && self
+                            .transform
+                            .signature_pointee_lifetimes(source_ty)
+                            .is_empty()
                     {
                         intravisit::walk_expr(self, expr);
                         return;
@@ -4365,8 +4450,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     }
                 } else if let hir::ExprKind::Binary(op, lhs, rhs) = expr.kind
                     && matches!(op.node, BinOpKind::Eq | BinOpKind::Ne)
-                    && let Some(lhs_index) = root_param(lhs, self.param_indices)
-                    && let Some(rhs_index) = root_param(rhs, self.param_indices)
+                    && let Some(lhs_index) = self.root_param(lhs)
+                    && let Some(rhs_index) = self.root_param(rhs)
                     && lhs_index != rhs_index
                 {
                     let typeck = self.tcx.typeck(expr.hir_id.owner);
@@ -4403,8 +4488,19 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             .copied()
             .collect();
         promoted_fields.retain(|field| !self.demoted_fields.contains(field));
+        let mut locals = LocalInitializers {
+            tcx: self.tcx,
+            initializers: FxHashMap::default(),
+            invalidated: FxHashSet::default(),
+        };
+        locals.visit_body(body);
+        locals
+            .initializers
+            .retain(|hir_id, _| !locals.invalidated.contains(hir_id));
         let mut visitor = AssignmentVisitor {
             tcx: self.tcx,
+            transform: self,
+            initializers: &locals.initializers,
             param_indices: &param_indices,
             promoted_fields: &promoted_fields,
             related: FxHashSet::default(),
@@ -18365,6 +18461,89 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
                 .copied(),
             Some(1),
         );
+    }
+
+    #[test]
+    fn stored_pointer_lifetimes_ignore_ambiguous_temporary_origins() {
+        let cases = [
+            (
+                "reassigned",
+                "let mut next = queue; next = node; (*node).next = next;",
+            ),
+            (
+                "address_taken",
+                "let mut next = queue; overwrite(&raw mut next); (*node).next = next;",
+            ),
+            (
+                "captured_mutation",
+                "let mut next = queue; let mut change = || { next = node; }; change(); (*node).next = next;",
+            ),
+            (
+                "pattern_borrow",
+                "let mut next = queue; let ref mut slot = next; *slot = node; (*node).next = next;",
+            ),
+            (
+                "raw_const_address",
+                "let mut next = queue; overwrite(&raw const next as *mut *mut Node); (*node).next = next;",
+            ),
+            (
+                "implicit_borrow",
+                "let mut next = queue; next.clone_from(&node); (*node).next = next;",
+            ),
+            (
+                "shadowed",
+                "let next = queue; { let next = node; (*node).next = next; }",
+            ),
+            (
+                "integer_encoding",
+                "let next = queue as usize; (*node).next = next as *mut Node;",
+            ),
+            (
+                "conditional",
+                "let next = if flag { queue } else { node }; (*node).next = next;",
+            ),
+            (
+                "raw_scalar_field",
+                "overwrite_scalar(&raw mut (*queue).value); let next = (*queue).value; (*node).value = next;",
+            ),
+        ];
+        for (name, body) in cases {
+            let code = format!(
+                r#"
+extern "C" {{ fn overwrite(slot: *mut *mut Node); fn overwrite_scalar(slot: *mut *mut i32); }}
+#[repr(C)]
+pub struct Node {{ pub next: *mut Node, pub value: *mut i32 }}
+pub unsafe fn link(queue: *mut Node, node: *mut Node, flag: bool) {{ {body} }}
+"#
+            );
+            ::utils::compilation::run_compiler_on_str(&code, |tcx| {
+                let mut krate = utils::ast::expanded_ast(tcx);
+                let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+                utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+                let (input, analysis) = build_analysis(tcx);
+                let did = *input
+                    .functions
+                    .iter()
+                    .find(|&&did| tcx.item_name(did.to_def_id()).as_str() == "link")
+                    .unwrap();
+                let visitor = TransformVisitor::new(
+                    &Config::default(),
+                    &input,
+                    &analysis,
+                    ast_to_hir,
+                    FnPtrGroups::default(),
+                    FnPtrRewriteDecision::default(),
+                    crate::rewriter::diagnostics::DecisionDiagnostics::for_test(
+                        crate::rewriter::diagnostics::DiagnosticsMode::Full,
+                    ),
+                );
+                assert!(
+                    visitor.assignment_related_param_indices(did).is_empty(),
+                    "{name}"
+                );
+            })
+            .unwrap();
+        }
     }
 
     fn unified_decision_events_for_code(
