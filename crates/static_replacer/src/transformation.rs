@@ -48,11 +48,15 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
         }
         if exprs.iter().all(|(_, mutated)| !*mutated) {
             immutables.insert(def_id);
-        } else if exprs.iter().all(|(e, _)| {
-            !matches!(
-                e.kind,
-                hir::ExprKind::AddrOf(_, _, _) | hir::ExprKind::MethodCall(_, _, _, _)
-            )
+        } else if exprs.iter().all(|(e, _)| match e.kind {
+            hir::ExprKind::AddrOf(_, _, _) | hir::ExprKind::MethodCall(_, _, _, _) => false,
+            hir::ExprKind::Assign(mut lhs, _, _) | hir::ExprKind::AssignOp(_, mut lhs, _) => {
+                while let hir::ExprKind::Index(base, _, _) = lhs.kind {
+                    lhs = base;
+                }
+                !matches!(lhs.kind, hir::ExprKind::Field(..))
+            }
+            _ => true,
         }) {
             cells.insert(def_id);
         } else {
@@ -663,6 +667,29 @@ pub unsafe fn read_owned() -> u32 { consume(OWNED.as_ref().unwrap()) }
             ],
             &["static mut", "consume(PTR.as_ref()", "consume(OWNED.as_ref()"],
         );
+    }
+
+    #[test]
+    fn test_field_writes_select_refcell() {
+        for field in ["pos", "slots[0]"] {
+            for op in ["=", "+="] {
+                let code = format!(
+                    r#"
+struct Counter {{ pos: u32, slots: [u32; 2] }}
+impl Copy for Counter {{}}
+impl Clone for Counter {{ fn clone(&self) -> Self {{ *self }} }}
+static mut STATE: Counter = Counter {{ pos: 0, slots: [0; 2] }};
+unsafe fn update() {{ STATE.{field} {op} 1; }}
+unsafe fn read() -> u32 {{ STATE.pos + STATE.slots[0] }}
+"#
+                );
+                run_test(
+                    &code,
+                    &["std::cell::RefCell", "STATE.with_borrow_mut", "STATE.with_borrow("],
+                    &["static mut", "std::cell::Cell"],
+                );
+            }
+        }
     }
 
     #[test]
