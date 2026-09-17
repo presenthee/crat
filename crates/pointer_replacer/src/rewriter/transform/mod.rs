@@ -1105,6 +1105,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     };
 
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                let callee_ty = typeck.expr_ty_adjusted(func);
+                let variadic_start = if matches!(
+                    callee_ty.kind(),
+                    ty::TyKind::FnDef(..) | ty::TyKind::FnPtr(..)
+                ) {
+                    let sig = callee_ty.fn_sig(self.tcx).skip_binder();
+                    sig.c_variadic.then_some(sig.inputs().len())
+                } else {
+                    None
+                };
 
                 if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
                     *expr = free_rewrite;
@@ -1143,6 +1153,18 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let Some(param_kind) = param_kind else { continue };
 
                     self.transform_rhs(arg, harg, param_kind);
+                    if variadic_start.is_some_and(|start| i >= start)
+                        && let PtrKind::Raw(m) = param_kind
+                        && is_null_ptr_constructor(arg)
+                        && let ty::TyKind::RawPtr(pointee, _) = ty.kind()
+                    {
+                        // Variadic arguments have no parameter type to infer the pointee from.
+                        *arg = P(utils::expr!(
+                            "std::ptr::null{}::<{}>()",
+                            if m { "_mut" } else { "" },
+                            self.anonymous_ty_name(*pointee),
+                        ));
+                    }
                     if param_kind == PtrKind::Raw(false)
                         && let ExprKind::AddrOf(BorrowKind::Ref, mutability, _) = &mut arg.kind
                     {

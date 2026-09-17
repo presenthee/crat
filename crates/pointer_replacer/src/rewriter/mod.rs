@@ -342,9 +342,14 @@ pub(crate) fn find_param_aliases<'tcx>(
     for def_id in tcx.hir_body_owners() {
         let calls = some_or!(pre.call_args.get(&def_id), continue);
         let mut aliases: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
-        let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+        let arg_count = tcx
+            .fn_sig(def_id)
+            .instantiate_identity()
+            .skip_binder()
+            .inputs()
+            .len();
         for call_args in calls {
-            for i in 0..body.arg_count {
+            for i in 0..arg_count {
                 for j in 0..i {
                     let arg_i = some_or!(call_args[i], continue);
                     let arg_j = some_or!(call_args[j], continue);

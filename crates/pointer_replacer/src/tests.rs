@@ -7074,8 +7074,6 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
-// ===== as_ptr + Raw context tests (lines 549-565) =====
-
 /// as_ptr + Raw, no cast: overlapping borrows from `.as_mut_ptr()` demote both
 /// to Raw. Same types → `!need_cast`. Output: `(arr).as_mut_ptr()`.
 #[test]
@@ -9593,35 +9591,7 @@ mod ownership_analysis {
         let pre = andersen::pre_analyze(&config, &tss, tcx);
         let points_to = andersen::analyze(&config, &pre, &tss, tcx);
 
-        let mut param_aliases = FxHashMap::default();
-        for def_id in tcx.hir_body_owners() {
-            let Some(calls) = pre.call_args.get(&def_id) else {
-                continue;
-            };
-            let mut aliases: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
-            let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
-            for call_args in calls {
-                for i in 0..body.arg_count {
-                    for j in 0..i {
-                        let Some(arg_i) = call_args[i] else { continue };
-                        let Some(arg_j) = call_args[j] else { continue };
-                        let mut sol_i = points_to[arg_i].clone();
-                        sol_i.intersect(&points_to[arg_j]);
-                        if !sol_i.is_empty() {
-                            let i = Local::from_usize(i + 1);
-                            let j = Local::from_usize(j + 1);
-                            aliases.entry(i).or_default().insert(j);
-                            aliases.entry(j).or_default().insert(i);
-                        }
-                    }
-                }
-            }
-            if !aliases.is_empty() {
-                param_aliases.insert(def_id, aliases);
-            }
-        }
-
-        param_aliases
+        crate::rewriter::find_param_aliases(&pre, &points_to, tcx)
     }
 
     fn analyze_program<'tcx>(
@@ -9758,6 +9728,51 @@ pub unsafe fn foo() -> *mut i32 {
                         .get(&Local::from_u32(2))
                         .is_some_and(|locals| locals.contains(&Local::from_u32(1)))
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn c_variadic_aliases_only_compare_fixed_params() {
+        run_compiler(
+            r#"
+#![feature(c_variadic)]
+
+pub unsafe extern "C" fn variadic_sink(
+    a: *mut i32,
+    b: *mut i32,
+    mut args: ...,
+) {
+    let _ = (a, b, &mut args);
+}
+
+pub unsafe fn call_variadic() {
+    let mut x = 7i32;
+    let p: *mut i32 = &mut x;
+    variadic_sink(p, p);
+    variadic_sink(p, p, p);
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let variadic_sink = find_function(&program, "variadic_sink").expect_local();
+                let aliases = compute_param_aliases(tcx);
+                let variadic_aliases = aliases
+                    .get(&variadic_sink)
+                    .expect("expected alias cluster for variadic_sink");
+
+                assert_eq!(variadic_aliases.len(), 2);
+                assert!(
+                    variadic_aliases
+                        .get(&Local::from_u32(1))
+                        .is_some_and(|locals| locals.contains(&Local::from_u32(2)))
+                );
+                assert!(
+                    variadic_aliases
+                        .get(&Local::from_u32(2))
+                        .is_some_and(|locals| locals.contains(&Local::from_u32(1)))
+                );
+                assert!(!variadic_aliases.contains_key(&Local::from_u32(3)));
             },
         );
     }
@@ -10573,3 +10588,66 @@ pub unsafe fn run(ptr: *mut i32) {
         &["(&mut ptr).unwrap()"],
     );
 }
+
+
+#[test]
+fn test_variadic_null_pointer_arguments_keep_pointee_types() {
+    run_test(
+        r#"
+extern "C" { fn consume(fixed: *mut i8, ...); }
+pub unsafe fn pass() {
+    consume(
+        0 as *mut i8,
+        0 as *mut core::ffi::c_void,
+        0 as *const i32,
+        std::ptr::null_mut::<u8>(),
+        std::ptr::null::<u16>(),
+        0 as *mut *const i64,
+    );
+}
+"#,
+        &[
+            "consume(std::ptr::null_mut(),",
+            "std::ptr::null_mut::<std::ffi::c_void>()",
+            "std::ptr::null::<i32>()",
+            "std::ptr::null_mut::<u8>()",
+            "std::ptr::null::<u16>()",
+            "std::ptr::null_mut::<*const i64>()",
+        ],
+        &[],
+    );
+}
+
+
+#[test]
+fn test_variadic_null_pointer_arguments_through_fn_pointer() {
+    run_test(
+        r#"
+pub unsafe fn pass(callback: unsafe extern "C" fn(*mut u8, *const i16, ...)) {
+    callback(0 as *mut u8, 0 as *const i16, 0 as *mut u8, 0 as *const i16);
+}
+pub unsafe fn pass_ref(callback: &unsafe extern "C" fn(*mut u8, *const i16, ...)) {
+    callback(0 as *mut u8, 0 as *const i16, 0 as *mut u8, 0 as *const i16);
+}
+"#,
+        &["std::ptr::null_mut::<u8>()", "std::ptr::null::<i16>()"],
+        &[],
+    );
+}
+
+
+#[test]
+fn test_variadic_null_fix_keeps_fixed_argument_inference() {
+    run_test(
+        r#"
+extern "C" { fn consume(value: *mut core::ffi::c_void); }
+pub unsafe fn pass() {
+    consume(0 as *mut core::ffi::c_void);
+}
+"#,
+        &["consume(std::ptr::null_mut());"],
+        &["null_mut::<"],
+    );
+}
+
+// ===== as_ptr + Raw context tests (lines 549-565) =====
