@@ -10420,3 +10420,48 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
         "{s}"
     );
 }
+
+
+#[test]
+fn test_rewriter_keeps_pointer_loaded_from_union_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub union Value {
+    pub ptr: *mut i8,
+    pub integer: i64,
+}
+
+pub unsafe fn load(value: *mut Value) -> *mut i8 {
+    let ptr = (*value).ptr;
+    ptr
+}
+"#,
+        &["pub ptr: *mut i8"],
+        &[],
+    );
+}
+
+
+#[test]
+fn test_rewriter_keeps_union_pointer_call_argument_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn consume(ptr: *mut i8);
+}
+
+#[repr(C)]
+pub union Value {
+    pub ptr: *mut i8,
+    pub integer: i64,
+}
+
+pub unsafe fn pass(value: *mut Value) {
+    consume((*value).ptr);
+}
+"#,
+        &["pub ptr: *mut i8", "consume("],
+        &[],
+    );
+}
