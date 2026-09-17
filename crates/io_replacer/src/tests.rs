@@ -2799,6 +2799,61 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_file_ptr_ptr_raw_address_local() {
+    run_test(
+        r#"
+unsafe fn open_slot(slot: *mut *mut FILE) {
+    *slot = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+}
+unsafe fn read() {
+    let mut stream: *mut FILE = std::ptr::null_mut();
+    open_slot(&raw mut stream);
+    fgetc(stream);
+    fclose(stream);
+}"#,
+        &[
+            "&raw mut stream",
+            "*mut Option<",
+            "File",
+            "crate::c_lib::rs_fgetc",
+            "drop",
+        ],
+        &["fopen", "fclose", "FILE"],
+    );
+}
+
+#[test]
+fn test_file_ptr_ptr_raw_address_field() {
+    run_test(
+        r#"
+#[repr(C)]
+struct Context { stream: *mut FILE }
+unsafe fn open_slot(slot: *mut *mut FILE) {
+    *slot = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+}
+unsafe fn read(context: &mut Context) {
+    open_slot(&raw mut context.stream);
+    fgetc(context.stream);
+    fclose(context.stream);
+}"#,
+        &[
+            "&raw mut context.stream",
+            "*mut Option<",
+            "File",
+            "crate::c_lib::rs_fgetc",
+            "drop",
+        ],
+        &["fopen", "fclose", "FILE"],
+    );
+}
+
+#[test]
 fn test_unsupported_file_ptr_ptr() {
     run_test(
         r#"
