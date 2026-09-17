@@ -10496,3 +10496,18 @@ pub fn c_string(arg: std::ffi::OsString) -> std::ffi::CString {
         &[],
     );
 }
+
+
+#[test]
+fn test_rewriter_converts_promoted_refs_in_raw_pointer_array() {
+    run_test(
+        r#"
+pub unsafe fn sum(user: *const i8, pass: *const i8) -> i8 {
+    let auth: [*const i8; 3] = [user, pass, std::ptr::null()];
+    *auth[0] + *auth[1]
+}
+"#,
+        &["Option<&i8>", "let auth: [*const i8; 3]"],
+        &[],
+    );
+}

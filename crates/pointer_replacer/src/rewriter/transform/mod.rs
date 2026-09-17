@@ -853,6 +853,24 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
                 self.simplify_promoted_ref_field_base(base, hir_base);
             }
+            ExprKind::Array(elements) => {
+                let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
+                    return;
+                };
+                let hir::ExprKind::Array(hir_elements) = hir_expr.kind else {
+                    return;
+                };
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                let ty::TyKind::Array(element_ty, _) = typeck.expr_ty(hir_expr).kind() else {
+                    return;
+                };
+                let ty::TyKind::RawPtr(_, mutability) = element_ty.kind() else {
+                    return;
+                };
+                for (element, hir_element) in elements.iter_mut().zip(hir_elements) {
+                    self.transform_rhs(element, hir_element, PtrKind::Raw(mutability.is_mut()));
+                }
+            }
             ExprKind::Struct(se) => {
                 self.rewrite_struct_literal_fields(expr.id, se);
             }
