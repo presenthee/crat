@@ -11362,6 +11362,45 @@ pub unsafe fn foo(mut p: *mut i32, out: *mut *mut i32) {
 }
 
 #[test]
+fn test_array_local_rewriter_prunes_member_depending_on_pruned_member() {
+    let code = r#"
+unsafe extern "C" {
+    fn strchr(s: *const i8, c: i32) -> *mut i8;
+}
+
+pub unsafe fn foo() -> i32 {
+    let mut s: [i8; 8] = [0; 8];
+    let mut tmp: *mut i8 = std::ptr::null_mut();
+    let mut value: *mut i8 = std::ptr::null_mut();
+    let mut independent: *mut i8 = s.as_mut_ptr().offset(1);
+    tmp = strchr(s.as_ptr(), 0);
+    if tmp.is_null() {
+        return 0;
+    }
+    value = tmp;
+    independent = independent.offset(1);
+    *independent as i32 + *value as i32
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(
+        changed,
+        "the independent cursor should still be rewritten: {s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut tmp: *mut i8"), "tmp stays raw: {s}");
+    assert!(
+        s.contains("let mut value: *mut i8"),
+        "the dependent value stays raw: {s}"
+    );
+    assert!(s.contains("value = tmp"), "the raw copy remains valid: {s}");
+    assert!(
+        s.contains("independent_idx"),
+        "independent group members can still be rewritten: {s}"
+    );
+}
+
+#[test]
 fn test_array_local_rewriter_skips_unsupported_assignment_source() {
     let code = r#"
 pub unsafe fn foo(mut p: *mut i32, r: *mut i32) {

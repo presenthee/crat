@@ -1541,14 +1541,45 @@ fn prune_unsupported_direct_place_uses(
         tcx,
         plan: &*plan,
         unsupported_hir_ids: FxHashSet::default(),
+        dependency_edges: Vec::new(),
         trace_enabled: trace.is_enabled(),
         dropped_reasons: Vec::new(),
     };
     visitor.visit_crate(krate);
     // move results out of the visitor so the immutable borrow on `plan` ends
     // before the mutable `plan.by_hir_id.retain(...)` below.
-    let unsupported_hir_ids = visitor.unsupported_hir_ids;
-    let dropped_reasons = visitor.dropped_reasons;
+    let mut unsupported_hir_ids = visitor.unsupported_hir_ids;
+    let dependency_edges = visitor.dependency_edges;
+    let mut dropped_reasons = visitor.dropped_reasons;
+    loop {
+        let mut changed = false;
+        for (dependent, dependencies) in &dependency_edges {
+            if unsupported_hir_ids.contains(dependent) {
+                continue;
+            }
+            let Some(dependency) = dependencies
+                .iter()
+                .find(|dependency| unsupported_hir_ids.contains(dependency))
+            else {
+                continue;
+            };
+            unsupported_hir_ids.insert(*dependent);
+            if trace.is_enabled() {
+                let dependency_name = plan
+                    .by_hir_id
+                    .get(dependency)
+                    .map_or("unknown", |rewrite| rewrite.source_name.as_str());
+                dropped_reasons.push((
+                    *dependent,
+                    format!("prune: dependency `{dependency_name}` was dropped"),
+                ));
+            }
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
     // record one prune drop per member still in the plan (a member can be flagged
     // by more than one site; only the first reason is traced).
     let mut traced_drops: FxHashSet<HirId> = FxHashSet::default();
@@ -2241,6 +2272,7 @@ struct UnsupportedDirectPlaceUseVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     plan: &'a RewritePlan,
     unsupported_hir_ids: FxHashSet<HirId>,
+    dependency_edges: Vec<(HirId, Vec<HirId>)>,
     // reasons for each prune drop, collected only when the trace is enabled
     // (so the offending assignment text is not pretty-printed otherwise).
     trace_enabled: bool,
@@ -2340,6 +2372,15 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
             allow_member_pointer_form: true,
         };
         let derivation = derive_index(rhs, Anchor::Member(rewrite), &ctx);
+        match &derivation {
+            Derivation::DependsOn(_, dependencies)
+            | Derivation::Conditional {
+                deps: dependencies, ..
+            } if !dependencies.is_empty() => {
+                self.dependency_edges.push((hir_id, dependencies.clone()));
+            }
+            _ => {}
+        }
         let unsupported = match &derivation {
             Derivation::Unsupported(_) => true,
             Derivation::Index(index) | Derivation::DependsOn(index, _) => {
