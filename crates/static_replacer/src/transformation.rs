@@ -340,11 +340,12 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     && (name == "as_mut_ptr"
                         || name == "as_ptr"
                         || name == "as_mut"
+                        || name == "as_ref"
                         || name == "take"
                         || name == "copy_from_slice"
                         || name == "fill")
                 {
-                    let x = self.borrow_static(def_id, hir_receiver.hir_id, true);
+                    let x = self.borrow_static(def_id, hir_receiver.hir_id, name != "as_ref");
                     *expr = expr!("{x}_ref.{name}()");
                 }
             }
@@ -640,6 +641,28 @@ pub unsafe fn write(n: isize, value: u32) {{ *PTR.offset(n) = value; }}
             };
             run_test(&code, includes, &["static mut", "PTR.offset(n)"]);
         }
+    }
+
+    #[test]
+    fn test_refcell_as_ref_uses_shared_borrow() {
+        run_test(
+            r#"
+static mut PTR: *mut u32 = core::ptr::null_mut();
+static mut OWNED: Option<Box<u32>> = None;
+pub unsafe fn set(p: *mut u32, owned: Option<Box<u32>>) {
+    PTR = p;
+    OWNED = owned;
+}
+fn consume(value: &u32) -> u32 { *value }
+pub unsafe fn read_pointer() -> u32 { consume(PTR.as_ref().unwrap()) }
+pub unsafe fn read_owned() -> u32 { consume(OWNED.as_ref().unwrap()) }
+"#,
+            &[
+                "PTR.with_borrow(|PTR_ref| consume(PTR_ref.as_ref().unwrap()))",
+                "OWNED.with_borrow(|OWNED_ref| consume(OWNED_ref.as_ref().unwrap()))",
+            ],
+            &["static mut", "consume(PTR.as_ref()", "consume(OWNED.as_ref()"],
+        );
     }
 
     #[test]
