@@ -10465,3 +10465,34 @@ pub unsafe fn pass(value: *mut Value) {
         &[],
     );
 }
+
+
+#[test]
+fn test_rewriter_preserves_reference_for_non_local_call_argument() {
+    run_test(
+        r#"
+pub unsafe fn replace_value() -> i32 {
+    let mut value = 0;
+    let reference = &mut value;
+    std::mem::replace(reference, 7);
+    value
+}
+"#,
+        &["let mut reference: Option<&mut i32>"],
+        &["map_or(std::ptr::null_mut"],
+    );
+}
+
+
+#[test]
+fn test_rewriter_leaves_ordinary_refs_at_non_local_call_boundaries() {
+    run_test(
+        r#"
+pub fn c_string(arg: std::ffi::OsString) -> std::ffi::CString {
+    std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(arg.as_os_str())).unwrap()
+}
+"#,
+        &["OsStrExt::as_bytes(arg.as_os_str())"],
+        &[],
+    );
+}

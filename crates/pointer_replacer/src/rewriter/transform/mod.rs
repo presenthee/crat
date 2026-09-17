@@ -1108,12 +1108,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 .and_then(|decs| decs.get(i).copied())
                                 .flatten()
                         })
-                        .or_else(|| {
-                            unwrap_ptr_from_mir_ty(ty).map(|(_, m)| {
-                                PtrKind::Raw(
-                                    self.get_mutability_decision(harg).unwrap_or(m.is_mut()),
-                                )
-                            })
+                        .or_else(|| match ty.kind() {
+                            ty::TyKind::RawPtr(_, m) => Some(PtrKind::Raw(
+                                self.get_mutability_decision(harg).unwrap_or(m.is_mut()),
+                            )),
+                            ty::TyKind::Ref(_, _, m)
+                                if self
+                                    .ptr_expr(arg, harg)
+                                    .and_then(|pe| self.ptr_source_kind(&pe))
+                                    .is_some() =>
+                            {
+                                Some(PtrKind::Ref(m.is_mut()))
+                            }
+                            _ => None,
                         });
                     let Some(param_kind) = param_kind else { continue };
 
