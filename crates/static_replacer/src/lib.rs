@@ -8,6 +8,7 @@ extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_span;
+extern crate rustc_trait_selection;
 
 mod return_escape;
 mod transformation;

@@ -13,6 +13,7 @@ use rustc_middle::{
     ty::{self, Ty, TyCtxt},
 };
 use rustc_span::{Symbol, sym};
+use rustc_trait_selection::infer::{InferCtxtExt, TyCtxtInferExt};
 use utils::{expr, item};
 
 use crate::return_escape;
@@ -47,7 +48,19 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
             continue;
         }
         if exprs.iter().all(|(_, mutated)| !*mutated) {
-            immutables.insert(def_id);
+            let ty = tcx.type_of(def_id).instantiate_identity();
+            let typing_env = ty::TypingEnv::post_analysis(tcx, def_id);
+            let infcx = tcx.infer_ctxt().build(typing_env.typing_mode);
+            if infcx
+                .type_implements_trait(
+                    tcx.lang_items().sync_trait().unwrap(),
+                    [ty],
+                    typing_env.param_env,
+                )
+                .must_apply_modulo_regions()
+            {
+                immutables.insert(def_id);
+            }
         } else if exprs.iter().all(|(e, _)| match e.kind {
             hir::ExprKind::AddrOf(_, _, _) | hir::ExprKind::MethodCall(_, _, _, _) => false,
             hir::ExprKind::Assign(mut lhs, _, _) | hir::ExprKind::AssignOp(_, mut lhs, _) => {
@@ -587,6 +600,23 @@ static mut X: u32 = 0;
 unsafe fn f() -> u32 { X }
 "#;
         run_test(code, &["static X"], &["static mut"]);
+    }
+
+    #[test]
+    fn test_immutable_static_requires_sync() {
+        run_test(
+            r#"
+struct Entry { ptr: *const i32 }
+static mut POINTERS: [*const i32; 1] = [core::ptr::null()];
+static mut ENTRY: Entry = Entry { ptr: core::ptr::null() };
+static mut COUNTS: [u32; 2] = [1, 2];
+unsafe fn pointer() -> *const i32 { POINTERS[0] }
+unsafe fn entry() -> *const i32 { ENTRY.ptr }
+unsafe fn count() -> u32 { COUNTS[0] }
+"#,
+            &["static mut POINTERS:", "static mut ENTRY:", "static COUNTS:"],
+            &["thread_local!"],
+        );
     }
 
     #[test]
