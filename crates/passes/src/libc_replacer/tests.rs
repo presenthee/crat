@@ -19,6 +19,31 @@ fn run_test(code: &str, includes: &[&str], excludes: &[&str]) -> super::Transfor
 }
 
 #[test]
+fn test_strlen_preserves_declared_return_type() {
+    for return_ty in ["u64", "usize"] {
+        let code = format!(
+            r#"
+type Size = {return_ty};
+extern "C" {{
+    fn strlen(s: *const i8) -> Size;
+}}
+pub unsafe fn raw_len(s: *const i8) -> Size {{
+    strlen(s).wrapping_add(1 as Size)
+}}
+pub unsafe fn slice_len(s: &[i8]) -> Size {{
+    strlen(s.as_ptr()).wrapping_add(1 as Size)
+}}
+"#
+        );
+        run_test(
+            &code,
+            &["CStr::from_ptr", "CStr::from_bytes_until_nul", "count_bytes()"],
+            &["strlen(s)", "strlen(s.as_ptr())"],
+        );
+    }
+}
+
+#[test]
 fn test_memcpy_autoref() {
     run_test(
         r#"
