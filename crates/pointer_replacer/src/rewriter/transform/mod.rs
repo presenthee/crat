@@ -4797,7 +4797,17 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     let source_mut = m && addr_source_mut;
-                    if !need_cast && !ty_updated && source_mut == m {
+                    if matches!(e.kind, ExprKind::Block(..) | ExprKind::Struct(..)) {
+                        // Raw address-of cannot borrow a temporary; retain the source borrow.
+                        *ptr = utils::expr!(
+                            "&{}({}) as *{} _ as *{} {}",
+                            if addr_source_mut { "mut " } else { "" },
+                            pprust::expr_to_string(e),
+                            if addr_source_mut { "mut" } else { "const" },
+                            if m { "mut" } else { "const" },
+                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                        );
+                    } else if !need_cast && !ty_updated && source_mut == m {
                         *ptr = utils::expr!(
                             "&raw {} ({})",
                             if source_mut { "mut" } else { "const" },
@@ -7795,7 +7805,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             },
             ExprKind::AddrOf(_, _, pointee) => {
                 let hir::ExprKind::AddrOf(_, _, hpointee) = hir_expr.kind else { panic!() };
-                let mut ptr_expr = self.ptr_expr(pointee, hpointee)?;
+                let mut ptr_expr = match self.ptr_expr(pointee, hpointee) {
+                    Some(pe) => pe,
+                    None if matches!(pointee.kind, ExprKind::Block(..) | ExprKind::Struct(..)) => {
+                        PtrExpr::new(
+                            pointee,
+                            hpointee,
+                            typeck.expr_ty(hpointee),
+                            PtrExprBaseKind::Other,
+                        )
+                    }
+                    None => return None,
+                };
                 if ptr_expr.addr_of {
                     None
                 } else {

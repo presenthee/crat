@@ -10710,3 +10710,163 @@ pub unsafe fn get(value: u64) -> *mut core::ffi::c_void {
 }
 
 // ===== as_ptr + Raw context tests (lines 549-565) =====
+
+
+#[test]
+fn test_addr_of_temporary_block_shared_slice() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+unsafe fn read(ptr: *const Item) -> i32 {
+    (*ptr.offset(0)).value
+}
+pub unsafe fn run() -> (i32, i32) {
+    let mut builds = 0;
+    let result = read(&mut {
+        builds += 1;
+        let value = Item { value: 42 };
+        value
+    });
+    (result, builds)
+}
+"#,
+        &["slice::from_ref", "&[crate::Item]"],
+        &["is_null", "from_raw_parts"],
+    );
+}
+
+
+#[test]
+fn test_addr_of_temporary_block_mutable_slice() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+unsafe fn write(ptr: *mut Item) -> i32 {
+    (*ptr.offset(0)).value += 1;
+    (*ptr.offset(0)).value
+}
+pub unsafe fn run() -> (i32, i32) {
+    let mut builds = 0;
+    let result = write(&mut {
+        builds += 1;
+        let value = Item { value: 42 };
+        value
+    });
+    (result, builds)
+}
+"#,
+        &["slice::from_mut", "&mut [crate::Item]"],
+        &["is_null", "from_raw_parts"],
+    );
+}
+
+
+#[test]
+fn test_addr_of_temporary_struct_shared_slice() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+unsafe fn read(ptr: *const Item) -> i32 {
+    (*ptr.offset(0)).value
+}
+pub unsafe fn run() -> i32 {
+    read(&mut Item { value: 42 })
+}
+"#,
+        &["slice::from_ref", "&[crate::Item]"],
+        &["is_null", "from_raw_parts"],
+    );
+}
+
+
+#[test]
+fn test_addr_of_temporary_struct_mutable_slice() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+unsafe fn write(ptr: *mut Item) -> i32 {
+    (*ptr.offset(0)).value += 1;
+    (*ptr.offset(0)).value
+}
+pub unsafe fn run() -> i32 {
+    write(&mut Item { value: 42 })
+}
+"#,
+        &["slice::from_mut", "&mut [crate::Item]"],
+        &["is_null", "from_raw_parts"],
+    );
+}
+
+
+#[test]
+fn test_addr_of_temporary_block_raw_call() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+extern "C" {
+    fn consume_mut(ptr: *mut Item);
+    fn consume_const(ptr: *const Item);
+}
+pub unsafe fn run() {
+    consume_mut(&mut { let value = Item { value: 42 }; value });
+    consume_const(&{ let value = Item { value: 42 }; value });
+}
+"#,
+        &["consume_mut", "consume_const"],
+        &[],
+    );
+}
+
+
+#[test]
+fn test_addr_of_temporary_struct_raw_call() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+extern "C" {
+    fn consume_mut(ptr: *mut Item);
+    fn consume_const(ptr: *const Item);
+}
+pub unsafe fn run() {
+    consume_mut(&mut Item { value: 42 });
+    consume_const(&Item { value: 42 });
+}
+"#,
+        &["consume_mut", "consume_const"],
+        &[],
+    );
+}
+
+
+#[test]
+fn test_addr_of_temporary_raw_casts() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+extern "C" { fn consume(ptr: *mut core::ffi::c_void); }
+pub unsafe fn run() {
+    consume(&mut Item { value: 42 } as *mut Item as *mut core::ffi::c_void);
+    consume(&{ let value = Item { value: 42 }; value }
+        as *const Item as *mut core::ffi::c_void);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+
+#[test]
+fn test_addr_of_temporary_mutable_borrow_to_const_raw() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+extern "C" { fn consume(ptr: *const Item); }
+pub unsafe fn run() {
+    consume(&mut Item { value: 42 });
+}
+"#,
+        &["&mut", "as *mut _ as *const"],
+        &[],
+    );
+}
