@@ -34,6 +34,8 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
     let mut visitor = HirVisitor {
         tcx,
         statics: FxHashMap::default(),
+        initializer_statics: FxHashSet::default(),
+        in_static_initializer: false,
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
@@ -44,7 +46,7 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
         if !statics.contains(&def_id) {
             continue;
         }
-        if returned_statics.contains(&def_id) {
+        if returned_statics.contains(&def_id) || visitor.initializer_statics.contains(&def_id) {
             continue;
         }
         if exprs.iter().all(|(_, mutated)| !*mutated) {
@@ -558,6 +560,8 @@ fn find_context<'a, 'tcx>(
 struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     statics: FxHashMap<LocalDefId, Vec<(&'tcx hir::Expr<'tcx>, bool)>>,
+    initializer_statics: FxHashSet<LocalDefId>,
+    in_static_initializer: bool,
 }
 
 impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
@@ -567,10 +571,24 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         self.tcx
     }
 
+    fn visit_body(&mut self, body: &hir::Body<'tcx>) {
+        let was_in_static_initializer = self.in_static_initializer;
+        self.in_static_initializer |= matches!(
+            self.tcx.def_kind(body.value.hir_id.owner),
+            DefKind::Static { .. }
+        );
+        intravisit::walk_body(self, body);
+        self.in_static_initializer = was_in_static_initializer;
+    }
+
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
         if let Some(def_id) = get_static_from_hir_expr(expr) {
-            let context = find_context(expr, self.tcx);
-            self.statics.entry(def_id).or_default().push(context);
+            if self.in_static_initializer {
+                self.initializer_statics.insert(def_id);
+            } else {
+                let context = find_context(expr, self.tcx);
+                self.statics.entry(def_id).or_default().push(context);
+            }
         }
 
         intravisit::walk_expr(self, expr);
@@ -616,6 +634,45 @@ unsafe fn count() -> u32 { COUNTS[0] }
 "#,
             &["static mut POINTERS:", "static mut ENTRY:", "static COUNTS:"],
             &["thread_local!"],
+        );
+    }
+
+    #[test]
+    fn test_preserve_static_initializer_dependencies() {
+        run_test(
+            r#"
+static mut FLAG: i32 = 0;
+static mut FLAG_POINTER: *mut i32 = &raw mut FLAG;
+static mut POINTER_TABLE: [*mut *mut i32; 1] = [&raw mut FLAG_POINTER];
+static mut NESTED_FLAG: i32 = 0;
+static mut NESTED_POINTER: *mut i32 = const { &raw mut NESTED_FLAG };
+static mut COUNT: u32 = 1;
+unsafe fn set(value: i32) { FLAG = value; }
+unsafe fn reset() { FLAG_POINTER = core::ptr::null_mut(); NESTED_FLAG = 1; }
+unsafe fn nested_pointer() -> *mut i32 { NESTED_POINTER }
+unsafe fn table_entry() -> *mut *mut i32 { POINTER_TABLE[0] }
+unsafe fn count() -> u32 { COUNT }
+"#,
+            &["static mut FLAG:", "static mut FLAG_POINTER:", "static mut NESTED_FLAG:", "&raw mut FLAG", "static COUNT:"],
+            &["thread_local!", "FLAG_ref", "FLAG_POINTER_ref"],
+        );
+    }
+
+    #[test]
+    fn test_preserve_static_address_in_aggregate_initializer() {
+        run_test(
+            r#"
+struct Entry { flag: *mut i32 }
+static mut FLAG: i32 = 0;
+static mut TABLE: [Entry; 1] = [{
+    let entry = Entry { flag: &raw mut FLAG };
+    entry
+}];
+unsafe fn set(value: i32) { FLAG = value; }
+unsafe fn pointer() -> *mut i32 { TABLE[0].flag }
+"#,
+            &["static mut FLAG:", "static mut TABLE:", "&raw mut FLAG"],
+            &["thread_local!", "with_borrow", "FLAG_ref"],
         );
     }
 
