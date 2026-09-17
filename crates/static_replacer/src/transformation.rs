@@ -146,21 +146,23 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                 static_item.mutability = Mutability::Not;
             } else if self.cells.contains(def_id) {
                 let name = static_item.ident.name;
+                let visibility = pprust::vis_to_string(&item.vis);
                 let ty = pprust::ty_to_string(&static_item.ty);
                 let init = pprust::expr_to_string(static_item.expr.as_ref().unwrap());
                 *item = item!(
                     "thread_local! {{
-                        static {name}: std::cell::Cell<{ty}> =
+                        {visibility} static {name}: std::cell::Cell<{ty}> =
                             const {{ std::cell::Cell::new({init}) }};
                     }}"
                 );
             } else if self.refcells.contains(def_id) {
                 let name = static_item.ident.name;
+                let visibility = pprust::vis_to_string(&item.vis);
                 let ty = pprust::ty_to_string(&static_item.ty);
                 let init = pprust::expr_to_string(static_item.expr.as_ref().unwrap());
                 *item = item!(
                     "thread_local! {{
-                        static {name}: std::cell::RefCell<{ty}> =
+                        {visibility} static {name}: std::cell::RefCell<{ty}> =
                             const {{ std::cell::RefCell::new({init}) }};
                     }}"
                 );
@@ -612,6 +614,39 @@ pub unsafe fn write(n: isize, value: u32) {{ *PTR.offset(n) = value; }}
                 &["std::cell::Cell", "PTR.get().offset(n)"][..]
             };
             run_test(&code, includes, &["static mut", "PTR.offset(n)"]);
+        }
+    }
+
+    #[test]
+    fn test_thread_local_preserves_static_visibility() {
+        for visibility in ["pub", "pub(crate)", "pub(super)", "pub(in crate::outer)"] {
+            let code = format!(
+                r#"
+mod outer {{
+    mod state {{
+        {visibility} static mut COUNT: u32 = 0;
+        {visibility} static mut VALUE: u32 = 0;
+    }}
+    use state::COUNT;
+    use state::VALUE;
+    pub unsafe fn update() -> u32 {{
+        COUNT += 1;
+        bump(&mut VALUE);
+        COUNT + VALUE
+    }}
+    fn bump(value: &mut u32) {{ *value += 1; }}
+}}
+"#
+            );
+            run_test(
+                &code,
+                &[
+                    &format!("{visibility} static COUNT"),
+                    &format!("{visibility} static VALUE"),
+                    "std::cell::Cell", "std::cell::RefCell",
+                ],
+                &["static mut"],
+            );
         }
     }
 

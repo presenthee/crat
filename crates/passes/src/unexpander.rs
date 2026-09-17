@@ -193,9 +193,10 @@ impl MutVisitor for AstVisitor<'_> {
                     && let StmtKind::Expr(init) = &stmt.kind
                 {
                     let name = const_item.ident.name;
+                    let visibility = pprust::vis_to_string(&item.vis);
                     let ty = pprust::ty_to_string(ty);
                     let init = pprust::expr_to_string(init);
-                    *item = item!("thread_local! {{ static {name}: {ty} = const {{ {init} }}; }}");
+                    *item = item!("thread_local! {{ {visibility} static {name}: {ty} = const {{ {init} }}; }}");
                 }
             }
             ItemKind::Mod(_, _, ModKind::Loaded(items, ..)) => {
@@ -625,6 +626,40 @@ mod tests {
             assert!(
                 !s.contains(exclude),
                 "Expected not to find `{exclude}` in:\n{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_thread_local_preserves_visibility() {
+        for visibility in ["pub", "pub(crate)", "pub(super)", "pub(in crate::outer)"] {
+            let code = format!(
+                r#"
+mod outer {{
+    mod state {{
+        thread_local! {{
+            {visibility} static COUNT: std::cell::Cell<u32> = const {{ std::cell::Cell::new(0) }};
+            {visibility} static VALUE: std::cell::RefCell<u32> = const {{ std::cell::RefCell::new(0) }};
+        }}
+    }}
+    use state::COUNT;
+    use state::VALUE;
+    pub fn update() -> u32 {{
+        COUNT.set(COUNT.get() + 1);
+        VALUE.with_borrow_mut(|value| *value += 1);
+        COUNT.get() + VALUE.with_borrow(|value| *value)
+    }}
+}}
+"#
+            );
+            run_test(
+                &code,
+                &[
+                    "thread_local!",
+                    &format!("{visibility} static COUNT"),
+                    &format!("{visibility} static VALUE"),
+                ],
+                &["LocalKey"],
             );
         }
     }
