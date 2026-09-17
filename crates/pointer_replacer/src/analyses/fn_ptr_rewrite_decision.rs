@@ -69,69 +69,13 @@ impl FnPtrRewriteDecision {
             individual_decisions.insert(did, decs);
         }
 
-        // --- Step 2: call-site alias check (Andersen overlap) ---
-
-        // forced_raw[rep][i] means: position i in this group's decisions must be None (raw pointer).
-        let mut forced_raw: FxHashMap<LocalDefId, FxHashSet<usize>> = FxHashMap::default();
-
-        for (caller, bb_to_slot) in &pre.indirect_calls {
-            let Some(bb_to_args) = pre.indirect_call_args.get(caller) else { continue };
-            for (bb, &slot_loc) in bb_to_slot {
-                let Some(arg_locs) = bb_to_args.get(bb) else { continue };
-
-                let reps: FxHashSet<LocalDefId> = solutions[slot_loc]
-                    .iter()
-                    .filter_map(|loc| pre.inv_fns.get(&loc))
-                    .filter_map(|did| fn_ptr_groups.fn_to_group.get(did))
-                    .copied()
-                    .collect();
-
-                if reps.is_empty() {
-                    continue;
-                }
-
-                for i in 0..arg_locs.len() {
-                    for j in 0..i {
-                        let (Some(loc_i), Some(loc_j)) = (arg_locs[i], arg_locs[j]) else {
-                            continue;
-                        };
-                        let mut sol = solutions[loc_i].clone();
-                        sol.intersect(&solutions[loc_j]);
-                        if !sol.is_empty() {
-                            for &rep in &reps {
-                                let positions = forced_raw.entry(rep).or_default();
-                                positions.insert(i);
-                                positions.insert(j);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         let direct_rewrite: FxHashSet<LocalDefId> =
             fn_ptr_groups.fn_to_group.keys().copied().collect();
         let needs_wrapper: FxHashSet<LocalDefId> = FxHashSet::default();
 
         // --- Step 3: annotation propagation for all groups ---
 
-        let mut effective_group_decisions: FxHashMap<LocalDefId, Vec<Option<PtrKind>>> =
-            FxHashMap::default();
-        for (&rep, decs) in &fn_ptr_groups.group_decisions {
-            let forced = forced_raw.get(&rep);
-            let modified_decs = decs
-                .iter()
-                .enumerate()
-                .map(|(i, &decision)| {
-                    if forced.is_some_and(|positions| positions.contains(&i)) {
-                        None
-                    } else {
-                        decision
-                    }
-                })
-                .collect();
-            effective_group_decisions.insert(rep, modified_decs);
-        }
+        let effective_group_decisions = &fn_ptr_groups.group_decisions;
         // explicit casts are ABI annotations too; use the common group
         // decision rather than each function's incompatible individual result.
         for (&did, &rep) in &fn_ptr_groups.fn_to_group {
@@ -140,7 +84,7 @@ impl FnPtrRewriteDecision {
             }
         }
 
-        // Build loc_decisions for all groups, applying forced_raw overrides.
+        // Build loc_decisions from the shared group decisions.
         let mut loc_decisions: FxHashMap<andersen::Loc, Vec<Option<PtrKind>>> =
             FxHashMap::default();
 
@@ -327,7 +271,7 @@ impl FnPtrRewriteDecision {
             let mut visitor = DirectFieldFnAssignmentVisitor {
                 tcx,
                 fn_to_group: &fn_ptr_groups.fn_to_group,
-                group_decisions: &effective_group_decisions,
+                group_decisions: effective_group_decisions,
                 candidates: &mut field_dec_candidates,
             };
             visitor.visit_body(tcx.hir_body_owned_by(fn_did));
@@ -345,7 +289,7 @@ impl FnPtrRewriteDecision {
             let mut visitor = DirectFieldFnAssignmentVisitor {
                 tcx,
                 fn_to_group: &fn_ptr_groups.fn_to_group,
-                group_decisions: &effective_group_decisions,
+                group_decisions: effective_group_decisions,
                 candidates: &mut field_dec_candidates,
             };
             visitor.visit_body(tcx.hir_body(body_id));

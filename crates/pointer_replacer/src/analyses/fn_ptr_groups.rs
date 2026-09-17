@@ -1,12 +1,12 @@
 use points_to::andersen;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     ExprKind, QPath,
     def::{DefKind, Res},
     def_id::LocalDefId,
     intravisit::{self, Visitor},
 };
-use rustc_middle::ty;
+use rustc_middle::{mir, ty};
 
 use crate::{
     rewriter::{
@@ -206,6 +206,100 @@ impl FnPtrGroups {
                     && raw_pointer_slots.contains(&hir_id)
                 {
                     group_decisions.get_mut(&rep).unwrap()[idx] = None;
+                }
+            }
+        }
+
+        // External callees keep their declared callback types. Constrain the
+        // shared group so definitions and every annotation retain that ABI.
+        let tcx = rust_program.tcx;
+        for &caller in &rust_program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+            for block in body.basic_blocks.iter() {
+                let mir::TerminatorKind::Call { func, args, .. } = &block.terminator().kind
+                else {
+                    continue;
+                };
+                let callee_ty = func.ty(&body.local_decls, tcx);
+                let ty::TyKind::FnDef(callee, _) = callee_ty.kind() else { continue };
+                if callee.as_local().is_some_and(|did| fn_set.contains_key(&did)) {
+                    continue;
+                }
+                // A generic parameter instantiated with a callback does not
+                // impose a fixed callback signature (for example, Option::unwrap).
+                let sig = tcx.fn_sig(*callee).skip_binder();
+                for (arg, &input_ty) in args.iter().zip(sig.inputs().skip_binder()) {
+                    let callback_ty = match input_ty.kind() {
+                        ty::TyKind::Adt(adt, generics) if utils::ir::is_option(adt.did(), tcx) => {
+                            generics.type_at(0)
+                        }
+                        _ => input_ty,
+                    };
+                    if !matches!(callback_ty.kind(), ty::TyKind::FnPtr(..)) {
+                        continue;
+                    }
+                    let Some(place) = arg.node.place() else { continue };
+                    let Some(&loc) = pre.vars.get(&andersen::Var::Local(caller, place.local))
+                    else {
+                        continue;
+                    };
+                    for target in solutions[loc].iter() {
+                        if let Some(rep) =
+                            pre.inv_fns.get(&target).and_then(|did| fn_to_group.get(did))
+                        {
+                            group_decisions.get_mut(rep).unwrap().fill(None);
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Step 3: call-site alias check (Andersen overlap) ---
+
+        // forced_raw[rep][i] means: position i in this group's decisions must be None (raw pointer).
+        let mut forced_raw: FxHashMap<LocalDefId, FxHashSet<usize>> = FxHashMap::default();
+
+        for (caller, bb_to_slot) in &pre.indirect_calls {
+            let Some(bb_to_args) = pre.indirect_call_args.get(caller) else { continue };
+            for (bb, &slot_loc) in bb_to_slot {
+                let Some(arg_locs) = bb_to_args.get(bb) else { continue };
+
+                let reps: FxHashSet<LocalDefId> = solutions[slot_loc]
+                    .iter()
+                    .filter_map(|loc| pre.inv_fns.get(&loc))
+                    .filter_map(|did| fn_to_group.get(did))
+                    .copied()
+                    .collect();
+
+                if reps.is_empty() {
+                    continue;
+                }
+
+                for i in 0..arg_locs.len() {
+                    for j in 0..i {
+                        let (Some(loc_i), Some(loc_j)) = (arg_locs[i], arg_locs[j]) else {
+                            continue;
+                        };
+                        let mut sol = solutions[loc_i].clone();
+                        sol.intersect(&solutions[loc_j]);
+                        if !sol.is_empty() {
+                            for &rep in &reps {
+                                let positions = forced_raw.entry(rep).or_default();
+                                positions.insert(i);
+                                positions.insert(j);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (rep, decisions) in &mut group_decisions {
+            if let Some(positions) = forced_raw.get(rep) {
+                for (i, decision) in decisions.iter_mut().enumerate() {
+                    if positions.contains(&i) {
+                        *decision = None;
+                    }
                 }
             }
         }

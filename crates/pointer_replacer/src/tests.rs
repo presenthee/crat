@@ -7812,6 +7812,118 @@ pub unsafe fn invoke(hooks: &Hooks, p: *mut i32) {
 }
 
 #[test]
+fn test_external_callback_direct_keeps_raw_signature() {
+    run_test(
+        r#"
+extern "C" { fn register(cb: unsafe extern "C" fn(*mut i32)); }
+unsafe extern "C" fn callback(p: *mut i32) { *p = 7; }
+pub unsafe fn setup() { register(callback); }
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_external_callback_option_cast_keeps_raw_signature() {
+    run_test(
+        r#"
+extern "C" { fn register(cb: Option<unsafe extern "C" fn(*mut i32)>); }
+unsafe extern "C" fn callback(p: *mut i32) { *p = 7; }
+pub unsafe fn setup() {
+    register(Some(callback as unsafe extern "C" fn(*mut i32)));
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_external_callback_forwarded_alias_keeps_raw_signature() {
+    run_test(
+        r#"
+type Callback = unsafe extern "C" fn(*mut i32);
+extern "C" { fn register(cb: Option<Callback>); }
+unsafe extern "C" fn callback(p: *mut i32) { *p = 7; }
+unsafe fn forward(cb: Option<Callback>) { register(cb); }
+pub unsafe fn setup() {
+    let cb: Option<Callback> = Some(callback as Callback);
+    forward(cb);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_external_callback_group_keeps_all_members_raw() {
+    run_test(
+        r#"
+type Callback = unsafe extern "C" fn(*mut i32);
+extern "C" { fn register(cb: Option<Callback>); }
+unsafe extern "C" fn first(p: *mut i32) { *p = 7; }
+unsafe extern "C" fn second(p: *mut i32) { *p = 9; }
+pub unsafe fn setup(flag: bool) {
+    let cb = if flag { Some(first as Callback) } else { Some(second as Callback) };
+    register(cb);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_external_callback_keeps_unrelated_local_group_rewritable() {
+    run_test(
+        r#"
+extern "C" { fn register(cb: Option<unsafe extern "C" fn(*mut i32)>); }
+unsafe extern "C" fn external_callback(p: *mut i32) { *p = 7; }
+unsafe extern "C" fn local_callback(p: *mut u64) { *p = 9; }
+unsafe fn invoke(cb: Option<unsafe extern "C" fn(*mut u64)>) -> u64 {
+    let mut value = 0;
+    cb.unwrap()(&mut value);
+    value
+}
+pub unsafe fn setup() -> u64 {
+    register(Some(external_callback as unsafe extern "C" fn(*mut i32)));
+    invoke(Some(local_callback as unsafe extern "C" fn(*mut u64)))
+}
+"#,
+        &["fn(&mut u64)"],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_ptr_aliased_call_keeps_target_and_callback_inputs_raw() {
+    run_test(
+        r#"
+pub unsafe fn copy(p: *mut i32, q: *mut i32) {
+    *p = *q;
+}
+
+pub unsafe fn dispatch(cb: unsafe fn(*mut i32, *mut i32), p: *mut i32, q: *mut i32) {
+    cb(p, q);
+}
+
+pub unsafe fn run() {
+    let mut x: i32 = 7;
+    let px = &raw mut x;
+    dispatch(copy as unsafe fn(*mut i32, *mut i32), px, px);
+}
+"#,
+        &[
+            "cb: unsafe fn(*mut i32, *mut i32)",
+            "copy as unsafe fn(*mut i32, *mut i32)",
+        ],
+        &["fn(&mut i32", "p: &mut i32", "q: &i32"],
+    );
+}
+
+#[test]
 fn test_fn_ptr_cast_rewrites_pointer_type_alias_inputs() {
     run_test(
         r#"
