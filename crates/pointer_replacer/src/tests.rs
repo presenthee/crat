@@ -10635,7 +10635,6 @@ pub unsafe fn pass_ref(callback: &unsafe extern "C" fn(*mut u8, *const i16, ...)
     );
 }
 
-
 #[test]
 fn test_variadic_null_fix_keeps_fixed_argument_inference() {
     run_test(
@@ -10647,6 +10646,66 @@ pub unsafe fn pass() {
 "#,
         &["consume(std::ptr::null_mut());"],
         &["null_mut::<"],
+    );
+}
+
+
+#[test]
+fn test_integer_to_raw_pointer_from_field() {
+    for integer_ty in ["u64", "usize", "i64"] {
+        for mutability in ["mut", "const"] {
+            let code = format!(
+                r#"
+#[repr(C)]
+pub struct Entry {{ pub inner: Inner }}
+#[repr(C)]
+pub struct Inner {{ pub value: {integer_ty} }}
+pub unsafe fn get(entry: *mut Entry) -> *{mutability} core::ffi::c_void {{
+    (*entry).inner.value as *{mutability} core::ffi::c_void
+}}
+"#
+            );
+            run_test(
+                &code,
+                &[&format!("entry.inner.value as *{mutability} core::ffi::c_void")],
+                &["(*entry).inner.value"],
+            );
+        }
+    }
+}
+
+
+#[test]
+fn test_integer_to_raw_pointer_from_local() {
+    for integer_ty in ["u64", "usize", "i64"] {
+        for mutability in ["mut", "const"] {
+            let code = format!(
+                r#"
+pub unsafe fn get(value: {integer_ty}) -> *{mutability} core::ffi::c_void {{
+    value as *{mutability} core::ffi::c_void
+}}
+"#
+            );
+            run_test(
+                &code,
+                &[&format!("value as *{mutability} core::ffi::c_void")],
+                &[],
+            );
+        }
+    }
+}
+
+
+#[test]
+fn test_integer_to_raw_pointer_preserves_intermediate_cast() {
+    run_test(
+        r#"
+pub unsafe fn get(value: u64) -> *mut core::ffi::c_void {
+    value as u32 as *mut core::ffi::c_void
+}
+"#,
+        &["value as u32 as *mut core::ffi::c_void"],
+        &[],
     );
 }
 

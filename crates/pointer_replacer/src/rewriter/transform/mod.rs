@@ -4542,6 +4542,22 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
         }
 
+        if rhs_ty.is_integral()
+            && let PtrCtx::Rhs(PtrKind::Raw(m)) = ctx
+            && let ty::TyKind::RawPtr(pointee, mutability) = lhs_ty.kind()
+        {
+            // Keep numeric casts and the already-rewritten child expression.
+            if mutability.is_mut() != m {
+                *ptr = utils::expr!(
+                    "({}) as *{} {}",
+                    pprust::expr_to_string(ptr),
+                    if m { "mut" } else { "const" },
+                    mir_ty_to_string(*pointee, self.tcx),
+                );
+            }
+            return PtrKind::Raw(m);
+        }
+
         let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx).unwrap_or_else(|| {
             panic!("{} {} {}", lhs_ty, rhs_ty, pprust::expr_to_string(ptr));
         });
