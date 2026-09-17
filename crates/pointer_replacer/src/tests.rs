@@ -1140,6 +1140,53 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 #[test]
+fn test_rewriter_removes_noop_path_statement_after_pointer_update() {
+    run_test(
+        r#"
+pub unsafe fn fill(mut values: *mut i32) {
+    loop {
+        *values = 1;
+        values = values.offset(1);
+        values;
+        if *values == 0 { break; }
+    }
+}
+"#,
+        &["values ="],
+        &["values;", "(values).offset"],
+    );
+}
+
+#[test]
+fn test_rewriter_reborrows_mutable_optional_ref_copied_before_reuse() {
+    run_test(
+        r#"
+pub struct Node {
+    pub next: *mut Node,
+}
+
+extern "C" {
+    fn alloc_node() -> *mut Node;
+}
+
+pub unsafe fn append(root: *mut Node) -> *mut Node {
+    if root.is_null() {
+        return alloc_node();
+    }
+    let mut alias = root;
+    while !(*alias).next.is_null() {
+        alias = (*alias).next;
+    }
+    (*alias).next = append((*alias).next);
+    root
+}
+"#,
+        &["let mut alias: Option<&mut crate::Node> = (root).as_mut()"],
+        &["let mut alias: Option<&mut crate::Node> = root;"],
+    );
+}
+
+#[test]
 fn test_non_null_param_to_ref() {
     run_test(
         r#"
@@ -1776,8 +1823,8 @@ pub unsafe fn make_buf(len: usize) -> *mut core::ffi::c_char {
 "#,
         &[
             "pub unsafe fn make_buf(len: usize) -> Box<[i8]>",
-            ".take(((1) * (len) /",
-            "std::mem::size_of::<i8>()) as",
+            ".wrapping_mul((len) as usize)",
+            "std::mem::size_of::<i8>())",
         ],
         &["Box::leak(", "Box::into_raw(", "calloc(1, len)"],
     );
@@ -1808,6 +1855,25 @@ pub unsafe fn foo() -> *mut i32 {
             "Box::into_raw(",
             "malloc(4 * std::mem::size_of::<i32>())",
         ],
+    );
+}
+
+#[test]
+fn test_rewriter_casts_wide_malloc_byte_count_before_size_division() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: u64) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn make_buf(len: u64) -> *mut i8 {
+    let p: *mut i8 = malloc(len) as *mut i8;
+    *p.offset(1) = 7;
+    p
+}
+"#,
+        &["(len) as usize", "std::mem::size_of::<i8>()"],
+        &["(len) / std::mem::size_of::<i8>()"],
     );
 }
 
@@ -2374,8 +2440,8 @@ pub unsafe fn clear_list(head: *mut Node) {
 }
         "#,
         &[
-            "let mut x: *mut crate::Node<'a> =",
-            "let mut y: *mut crate::Node<'a> = std::ptr::null_mut();",
+            "let mut x: *mut crate::Node<'_> =",
+            "let mut y: *mut crate::Node<'_> = std::ptr::null_mut();",
         ],
         &["Option<&crate::Node>"],
     );
@@ -3224,6 +3290,152 @@ pub unsafe fn container_from_b(i: *const i32) -> *const Pair {
             ".offset_by((-(4 as isize))",
         ],
         &["crate::slice_cursor::SliceCursor::from_raw_parts((i).as_ptr()"],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_reference_for_non_local_call_argument() {
+    run_test(
+        r#"
+pub unsafe fn replace_value() -> i32 {
+    let mut value = 0;
+    let reference = &mut value;
+    std::mem::replace(reference, 7);
+    value
+}
+"#,
+        &["let mut reference: Option<&mut i32>"],
+        &["map_or(std::ptr::null_mut"],
+    );
+}
+
+#[test]
+fn test_rewriter_leaves_ordinary_refs_at_non_local_call_boundaries() {
+    run_test(
+        r#"
+pub fn c_string(arg: std::ffi::OsString) -> std::ffi::CString {
+    std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(arg.as_os_str())).unwrap()
+}
+"#,
+        &["OsStrExt::as_bytes(arg.as_os_str())"],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_converts_promoted_refs_in_raw_pointer_array() {
+    run_test(
+        r#"
+pub unsafe fn sum(user: *const i8, pass: *const i8) -> i8 {
+    let auth: [*const i8; 3] = [user, pass, std::ptr::null()];
+    *auth[0] + *auth[1]
+}
+"#,
+        &["Option<&i8>", "let auth: [*const i8; 3]"],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_pointer_loaded_from_union_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub union Value {
+    pub ptr: *mut i8,
+    pub integer: i64,
+}
+
+pub unsafe fn load(value: *mut Value) -> *mut i8 {
+    let ptr = (*value).ptr;
+    ptr
+}
+"#,
+        &["pub ptr: *mut i8"],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_raw_pointer_slots_passed_by_address() {
+    run_test(
+        r#"
+#[repr(C)]
+pub union Value {
+    pub ptr: *mut i32,
+    pub integer: usize,
+}
+
+pub unsafe fn fill(out: *mut *mut i32) {
+    *out = core::ptr::null_mut();
+}
+
+pub unsafe fn run(value: *mut Value) {
+    let mut temp: *mut i32 = core::ptr::null_mut();
+    fill(&mut temp);
+    (*value).ptr = temp;
+}
+
+pub unsafe fn reset(mut temp: *mut i32, value: *mut Value) {
+    fill(&mut temp);
+    (*value).ptr = temp;
+}
+"#,
+        &[
+            "out: &mut *mut i32",
+            "let mut temp: *mut i32",
+            "(mut temp: *mut i32",
+        ],
+        &["(&mut temp).unwrap()"],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_raw_pointer_slots_in_callback_parameters() {
+    run_test(
+        r#"
+pub unsafe fn fill(out: *mut *mut i32) {
+    *out = core::ptr::null_mut();
+}
+
+pub unsafe fn reset(mut ptr: *mut i32) {
+    *ptr = 0;
+    fill(&mut ptr);
+}
+
+pub unsafe fn dispatch(cb: unsafe fn(*mut i32), ptr: *mut i32) {
+    cb(ptr);
+}
+
+pub unsafe fn run(ptr: *mut i32) {
+    dispatch(reset as unsafe fn(*mut i32), ptr);
+}
+"#,
+        &["cb: unsafe fn(*mut i32)", "reset as unsafe fn(*mut i32)"],
+        &["(&mut ptr).unwrap()"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_union_pointer_call_argument_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn consume(ptr: *mut i8);
+}
+
+#[repr(C)]
+pub union Value {
+    pub ptr: *mut i8,
+    pub integer: i64,
+}
+
+pub unsafe fn pass(value: *mut Value) {
+    consume((*value).ptr);
+}
+"#,
+        &["pub ptr: *mut i8", "consume("],
+        &[],
     );
 }
 
@@ -4307,6 +4519,614 @@ pub unsafe fn hold(nodes: &Vec<Node>) -> usize {
 }
 
 #[test]
+fn test_rewriter_propagates_lifetime_through_nested_struct_value() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+}
+
+pub unsafe fn touch_inner(mut x: i32) -> i32 {
+    let mut inner = Inner { value: &raw mut x };
+    *inner.value = 7;
+    x
+}
+
+pub fn outer_size() -> usize {
+    std::mem::size_of::<Outer>()
+}
+"#,
+        &[
+            "pub struct Inner<'a>",
+            "pub struct Outer<'a>",
+            "pub inner: Inner<'a>",
+            "size_of::<Outer<'_>>()",
+        ],
+        &["pub inner: Inner<'_>"],
+    );
+}
+
+#[test]
+fn test_rewriter_names_lifetimes_in_nested_raw_pointer_returns() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub value: *const i8 }
+#[repr(C)]
+pub struct Outer { pub inner: Inner }
+
+pub unsafe fn touch() -> i8 {
+    let arr = [1_i8, 2_i8];
+    let inner = Inner { value: arr.as_ptr() };
+    *inner.value.offset(1)
+}
+
+pub unsafe fn single() -> *mut Outer { core::ptr::null_mut() }
+pub unsafe fn double() -> *mut *mut Outer { core::ptr::null_mut() }
+pub unsafe fn triple() -> *const *mut *const Outer { core::ptr::null() }
+"#,
+        &[
+            "fn single<'a>() -> *mut crate::Outer<'a>",
+            "fn double<'a>() -> *mut *mut crate::Outer<'a>",
+            "fn triple<'a>() -> *const *mut *const crate::Outer<'a>",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_names_matching_nested_pointer_input_output_lifetimes() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub value: *const i8 }
+#[repr(C)]
+pub struct Outer { pub inner: Inner }
+
+pub unsafe fn touch() -> i8 {
+    let arr = [1_i8, 2_i8];
+    let inner = Inner { value: arr.as_ptr() };
+    *inner.value.offset(1)
+}
+
+pub unsafe fn select(first: *mut *mut Outer, other: *mut *mut Outer) -> *mut *mut Outer {
+    first
+}
+"#,
+        &[
+            "first: &'a mut *mut crate::Outer<'a>",
+            "crate::Outer<'crat_inner_1>",
+            "-> &'a mut *mut crate::Outer<'a>",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_names_nested_pointer_return_from_later_input() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub value: *const i8 }
+#[repr(C)]
+pub struct Outer { pub inner: Inner }
+
+pub unsafe fn touch() -> i8 {
+    let arr = [1_i8, 2_i8];
+    let inner = Inner { value: arr.as_ptr() };
+    *inner.value.offset(1)
+}
+
+pub unsafe fn select(first: *mut *mut Outer, other: *mut *mut Outer) -> *mut *mut Outer {
+    other
+}
+"#,
+        &[
+            "crate::Outer<'crat_inner_0>",
+            "other: &'a mut *mut crate::Outer<'a>",
+            "-> &'a mut *mut crate::Outer<'a>",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_names_nested_pointer_return_from_either_input() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub value: *const i8 }
+#[repr(C)]
+pub struct Outer { pub inner: Inner }
+
+pub unsafe fn touch() -> i8 {
+    let arr = [1_i8, 2_i8];
+    let inner = Inner { value: arr.as_ptr() };
+    *inner.value.offset(1)
+}
+
+pub unsafe fn select(first: *mut *mut Outer, other: *mut *mut Outer, flag: bool) -> *mut *mut Outer {
+    if flag { first } else { other }
+}
+"#,
+        &["crate::Outer<'a>", "-> &'a mut *mut crate::Outer<'a>"],
+        &["'crat_inner_"],
+    );
+}
+
+#[test]
+fn test_rewriter_updates_impl_for_struct_with_dependent_lifetime() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+}
+
+impl Copy for Inner {}
+impl Clone for Inner {
+    fn clone(&self) -> Self { *self }
+}
+impl Copy for Outer {}
+impl Clone for Outer {
+    fn clone(&self) -> Self { *self }
+}
+
+pub unsafe fn read() -> i32 {
+    let x = 7;
+    let inner = Inner { value: &raw const x };
+    *inner.value
+}
+"#,
+        &[
+            "impl<'a> Copy for Outer<'a>",
+            "impl<'a> Clone for Outer<'a>",
+        ],
+        &["impl Copy for Outer {"],
+    );
+}
+
+#[test]
+fn test_stored_pointer_lifetimes_direct() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Node { pub key: *const i8, pub next: *mut Node }
+#[repr(C)]
+pub struct Queue { pub head: *mut Node }
+pub unsafe fn seed() -> i8 {
+    let data = [7_i8];
+    let node = Node { key: data.as_ptr(), next: std::ptr::null_mut() };
+    *node.key.offset(0)
+}
+pub unsafe fn link(queue: *mut Queue, node: *mut Node) {
+    (*node).next = (*queue).head;
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_stored_pointer_lifetimes_atomic_temporary() {
+    run_test(
+        r#"
+#![feature(core_intrinsics)]
+#[repr(C)]
+pub struct Node { pub key: *const i8, pub next: *mut Node }
+#[repr(C)]
+pub struct Queue { pub head: *mut Node }
+pub unsafe fn seed() -> i8 {
+    let data = [7_i8];
+    let node = Node { key: data.as_ptr(), next: std::ptr::null_mut() };
+    *node.key.offset(0)
+}
+pub unsafe fn link(queue: *mut Queue, node: *mut Node) {
+    let next = (*queue).head;
+    (*node).next = next;
+    std::intrinsics::atomic_cxchg::<_,
+        { std::intrinsics::AtomicOrdering::SeqCst },
+        { std::intrinsics::AtomicOrdering::SeqCst }
+    >(&raw mut (*queue).head, next, node);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_stored_pointer_lifetimes_copy_chain() {
+    run_test(
+        r#"
+#![feature(core_intrinsics)]
+#[repr(C)]
+pub struct Node { pub key: *const i8, pub next: *mut Node }
+#[repr(C)]
+pub struct Queue { pub head: *mut Node }
+pub unsafe fn seed() -> i8 {
+    let data = [7_i8];
+    let node = Node { key: data.as_ptr(), next: std::ptr::null_mut() };
+    *node.key.offset(0)
+}
+pub unsafe fn link(queue: *mut Queue, node: *mut Node) {
+    let first = (*queue).head;
+    let second = first;
+    let next = second;
+    (*node).next = next;
+    std::intrinsics::atomic_cxchg::<_,
+        { std::intrinsics::AtomicOrdering::SeqCst },
+        { std::intrinsics::AtomicOrdering::SeqCst }
+    >(&raw mut (*queue).head, next, node);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_unrelated_struct_parameter_lifetimes_independent() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Left {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct Right {
+    pub data: *const u8,
+}
+
+pub unsafe fn seed() -> u8 {
+    let value = 7;
+    let left = Left { data: &raw const value };
+    let right = Right { data: &raw const value };
+    *left.data + *right.data
+}
+
+pub unsafe fn sum(left: *const Left, right: *const Right) -> u8 {
+    *(*left).data + *(*right).data
+}
+"#,
+        &[
+            "left: &crate::Left<'a>",
+            "right: &crate::Right<'crat_inner_1>",
+        ],
+        &["fn sum<'a>"],
+    );
+}
+
+#[test]
+fn test_rewriter_ties_promoted_struct_lifetimes_for_pointer_comparison() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn seed() -> i32 {
+    let mut value = 7;
+    let holder = Holder { data: &raw mut value };
+    *holder.data
+}
+
+pub unsafe fn same(a: *mut Holder, b: *mut Holder) -> bool {
+    a == b
+}
+"#,
+        &[
+            "fn same<'crat>",
+            "a: Option<&crate::Holder<'crat>>",
+            "b: Option<&crate::Holder<'crat>>",
+        ],
+        &["'crat_inner_1"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_fields_reachable_from_union_storage_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub data: *mut i32,
+}
+impl Copy for Inner {}
+impl Clone for Inner { fn clone(&self) -> Self { *self } }
+
+#[repr(C)]
+pub struct Wrapper {
+    pub inner: Inner,
+}
+impl Copy for Wrapper {}
+impl Clone for Wrapper { fn clone(&self) -> Self { *self } }
+
+#[repr(C)]
+pub union Storage {
+    pub wrapper: Wrapper,
+    pub bits: usize,
+}
+impl Copy for Storage {}
+impl Clone for Storage { fn clone(&self) -> Self { *self } }
+
+pub unsafe fn read(wrapper: *mut Wrapper) -> i32 {
+    *(*wrapper).inner.data
+}
+"#,
+        &["pub data: *mut i32", "pub union Storage"],
+        &["pub struct Inner<'", "Option<&mut i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_ties_slice_parameter_to_stored_struct_field_lifetime() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Reader {
+    pub data: *const u8,
+}
+
+pub unsafe fn init(reader: *mut Reader, data: *const u8) -> u8 {
+    (*reader).data = data;
+    *(*reader).data.offset(0)
+}
+"#,
+        &[
+            "fn init<'crat>",
+            "reader: &mut crate::Reader<'crat>",
+            "data: &'crat [u8]",
+        ],
+        &["Reader<'_>, mut data: &'crat"],
+    );
+}
+
+#[test]
+fn test_rewriter_ties_whole_struct_assignment_parameter_lifetimes() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub data: *const i32,
+}
+
+impl Copy for State {}
+impl Clone for State {
+    fn clone(&self) -> Self { *self }
+}
+
+pub unsafe fn seed() -> i32 {
+    let value = 7;
+    let state = State { data: &raw const value };
+    *state.data
+}
+
+pub unsafe fn copy(dest: *mut State, source: *const State) {
+    *dest = *source;
+}
+"#,
+        &[
+            "fn copy<'crat>",
+            "dest: &mut crate::State<'crat>",
+            "source: &crate::State<'crat>",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_related_parameters_use_return_lifetime() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Matrix {
+    pub values: [f32; 4],
+}
+
+pub unsafe fn assign(out: *mut Matrix, input: *const Matrix) -> *mut Matrix {
+    if out != input as *mut Matrix {
+        (*out).values = (*input).values;
+    }
+    out
+}
+"#,
+        &[
+            "fn assign<'a>",
+            "out: &'a mut crate::Matrix",
+            "input: Option<&'a crate::Matrix>",
+            "-> &'a mut crate::Matrix",
+        ],
+        &["'crat"],
+    );
+}
+
+#[test]
+fn test_rewriter_does_not_tie_snapshot_to_unpromoted_raw_source_field() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Reader {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct Snapshot {
+    pub data: *const u8,
+}
+
+unsafe fn advance_pointer(data: *mut *const u8) {
+    *data = (*data).offset(1);
+}
+
+pub unsafe fn advance(reader: *mut Reader) {
+    advance_pointer(&mut (*reader).data);
+}
+
+pub unsafe fn save(from: *const Reader, to: *mut Snapshot) {
+    (*to).data = (*from).data;
+}
+
+pub unsafe fn read(reader: *mut Reader) -> u8 {
+    let mut snapshot = Snapshot { data: std::ptr::null() };
+    save(reader, &raw mut snapshot);
+    advance(reader);
+    *snapshot.data
+}
+"#,
+        &["pub data: *const u8", "pub struct Snapshot<'"],
+        &[],
+    );
+}
+
+#[test]
+fn test_mutable_array_field_projection_through_promoted_struct_parameter() {
+    run_test(
+        r#"
+pub struct State {
+    pub values: [u32; 4],
+}
+
+pub unsafe fn initialize(state: *mut State) {
+    let p: *mut u32 = &mut *((*state).values.as_mut_ptr().offset(1));
+    *p = 7;
+}
+"#,
+        &["state: &mut crate::State"],
+        &["&mut ((*&*(state)).values)"],
+    );
+}
+
+#[test]
+fn test_shared_view_of_optional_mut_reference_does_not_reborrow_temporary() {
+    run_test(
+        r#"
+pub struct Queue {
+    pub values: [i32; 2],
+}
+
+unsafe fn first(queue: *const Queue) -> *const i32 {
+    (*queue).values.as_ptr()
+}
+
+unsafe fn update(queue: *mut Queue) {
+    (*queue).values[1] = 2;
+}
+
+pub unsafe fn read(queue: *mut Queue) -> i32 {
+    update(queue);
+    let value = first(queue);
+    *value
+}
+"#,
+        &[],
+        &[".as_deref()).as_deref()"],
+    );
+}
+
+#[test]
+fn test_nullable_struct_input_returning_interior_pointer_stays_raw() {
+    run_test(
+        r#"
+pub struct State {
+    pub values: [i32; 4],
+}
+
+pub unsafe fn first(state: *mut State) -> *mut i32 {
+    if state.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*state).values.as_mut_ptr()
+}
+"#,
+        &["state: *mut crate::State"],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_adds_named_lifetime_to_promoted_struct_alias() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub value: *mut i32,
+}
+
+pub type HolderAlias = Holder;
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let holder: HolderAlias = Holder { value: &raw mut x };
+    *holder.value
+}
+"#,
+        &[
+            "pub type HolderAlias<'a> = Holder<'a>",
+            "let holder: HolderAlias<'_>",
+        ],
+        &["pub type HolderAlias = Holder<'_>"],
+    );
+}
+
+#[test]
+fn test_rewriter_transforms_struct_literal_through_type_alias_constructor() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub value: *mut i32,
+}
+
+pub type HolderAlias = Holder;
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let mut holder = Holder { value: &raw mut x };
+    *holder.value = 7;
+    x
+}
+
+pub fn empty() {
+    let _holder: HolderAlias = HolderAlias { value: std::ptr::null_mut() };
+}
+"#,
+        &["HolderAlias { value: None }"],
+        &["HolderAlias { value: std::ptr::null_mut() }"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_reassigned_pointer_parameter_raw() {
+    run_test(
+        r#"
+pub unsafe fn replace(p: *mut i32) -> *mut i32 {
+    p
+}
+
+pub unsafe fn read(mut p: *mut i32) -> i32 {
+    p = replace(p);
+    *p
+}
+"#,
+        &["pub unsafe fn read(mut p: *mut i32)"],
+        &["pub unsafe fn read(mut p: Option<&mut i32>)"],
+    );
+}
+
+#[test]
 fn test_rewriter_demotes_multiple_mutable_struct_fields_from_same_local() {
     run_test(
         r#"
@@ -4416,6 +5236,34 @@ pub unsafe fn mark_if_linked(node: *mut Node) -> i32 {
 }
 
 #[test]
+fn test_cross_nominal_raw_struct_cast_demotes_pointer_field() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub chars: *mut u32,
+}
+
+#[repr(C)]
+pub struct Other {
+    pub chars: *mut u32,
+}
+
+extern "C" {
+    fn bridge(p: *mut Other);
+}
+
+pub unsafe fn read(a: *mut Holder, i: usize) -> u32 {
+    bridge(a as *mut Other);
+    *(*a).chars.offset(i as isize)
+}
+"#,
+        &["pub chars: *mut u32", "*(*a).chars.offset(i as isize)"],
+        &["pub chars: &mut [u32]"],
+    );
+}
+
+#[test]
 fn test_rewriter_preserves_address_taken_field_base_for_promoted_struct_param() {
     run_test(
         r#"
@@ -4450,10 +5298,10 @@ pub unsafe fn vm_init(vm: *mut VM) {
 "#,
         &[
             "pub unsafe fn vm_init(mut vm: &mut crate::VM)",
-            "init_vec((Some(&mut (*vm).stack)).unwrap())",
+            "&raw mut (vm.stack)",
             "vm.steps = 0",
         ],
-        &["&raw mut (vm.stack)", "&mut *(&raw mut"],
+        &[],
     );
 }
 
@@ -5252,6 +6100,59 @@ pub unsafe fn foo() {
 }
 
 #[test]
+fn test_rewriter_uses_inferred_lifetime_in_raw_allocator_bridge() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Node {
+    pub value: i32,
+    pub next: *mut Node,
+}
+
+pub static mut STACK: *mut Node = core::ptr::null_mut();
+
+pub unsafe fn alloc(size: usize) -> *mut core::ffi::c_void {
+    let p = malloc(size);
+    if p.is_null() {
+        std::process::abort();
+    }
+    p
+}
+
+pub unsafe fn push(value: i32) {
+    let mut temp: *mut Node = core::ptr::null_mut();
+    temp = alloc(core::mem::size_of::<Node>()) as *mut Node;
+    (*temp).next = STACK;
+    (*temp).value = value;
+    STACK = temp;
+}
+
+pub unsafe fn pop() -> i32 {
+    if STACK.is_null() {
+        return 0;
+    }
+    let temp = STACK;
+    STACK = (*temp).next;
+    let value = (*temp).value;
+    free(temp as *mut core::ffi::c_void);
+    value
+}
+"#,
+        &[
+            "pub next: Option<&'a mut Node<'a>>",
+            "Box::leak(Box::new(",
+            "as *mut crate::Node<'_>",
+        ],
+        &["as *mut crate::Node<'a>"],
+    );
+}
+
+#[test]
 fn test_rewriter_generalizes_wrapper_returning_allocated_local() {
     run_test(
         r#"
@@ -5991,7 +6892,8 @@ pub unsafe fn multiply_with_log(a: i32, b: i32) -> (i32, *mut i8) {
             "pub unsafe fn multiply_with_log(a: i32, b: i32) -> (i32, *mut i8)",
             "let mut log_msg: *mut i8 = std::ptr::null_mut();",
             "log_msg =",
-            "create_result_string(bytemuck::cast_slice",
+            "create_result_string(unsafe",
+            "std::slice::from_raw_parts",
         ],
         &[
             "Option<&mut i8>",
@@ -7061,6 +7963,158 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_addr_of_temporary_block_shared_slice() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+unsafe fn read(ptr: *const Item) -> i32 {
+    (*ptr.offset(0)).value
+}
+pub unsafe fn run() -> (i32, i32) {
+    let mut builds = 0;
+    let result = read(&mut {
+        builds += 1;
+        let value = Item { value: 42 };
+        value
+    });
+    (result, builds)
+}
+"#,
+        &["slice::from_ref", "&[crate::Item]"],
+        &["is_null", "from_raw_parts"],
+    );
+}
+
+#[test]
+fn test_addr_of_temporary_block_mutable_slice() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+unsafe fn write(ptr: *mut Item) -> i32 {
+    (*ptr.offset(0)).value += 1;
+    (*ptr.offset(0)).value
+}
+pub unsafe fn run() -> (i32, i32) {
+    let mut builds = 0;
+    let result = write(&mut {
+        builds += 1;
+        let value = Item { value: 42 };
+        value
+    });
+    (result, builds)
+}
+"#,
+        &["slice::from_mut", "&mut [crate::Item]"],
+        &["is_null", "from_raw_parts"],
+    );
+}
+
+#[test]
+fn test_addr_of_temporary_struct_shared_slice() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+unsafe fn read(ptr: *const Item) -> i32 {
+    (*ptr.offset(0)).value
+}
+pub unsafe fn run() -> i32 {
+    read(&mut Item { value: 42 })
+}
+"#,
+        &["slice::from_ref", "&[crate::Item]"],
+        &["is_null", "from_raw_parts"],
+    );
+}
+
+#[test]
+fn test_addr_of_temporary_struct_mutable_slice() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+unsafe fn write(ptr: *mut Item) -> i32 {
+    (*ptr.offset(0)).value += 1;
+    (*ptr.offset(0)).value
+}
+pub unsafe fn run() -> i32 {
+    write(&mut Item { value: 42 })
+}
+"#,
+        &["slice::from_mut", "&mut [crate::Item]"],
+        &["is_null", "from_raw_parts"],
+    );
+}
+
+#[test]
+fn test_addr_of_temporary_block_raw_call() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+extern "C" {
+    fn consume_mut(ptr: *mut Item);
+    fn consume_const(ptr: *const Item);
+}
+pub unsafe fn run() {
+    consume_mut(&mut { let value = Item { value: 42 }; value });
+    consume_const(&{ let value = Item { value: 42 }; value });
+}
+"#,
+        &["consume_mut", "consume_const"],
+        &[],
+    );
+}
+
+#[test]
+fn test_addr_of_temporary_struct_raw_call() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+extern "C" {
+    fn consume_mut(ptr: *mut Item);
+    fn consume_const(ptr: *const Item);
+}
+pub unsafe fn run() {
+    consume_mut(&mut Item { value: 42 });
+    consume_const(&Item { value: 42 });
+}
+"#,
+        &["consume_mut", "consume_const"],
+        &[],
+    );
+}
+
+#[test]
+fn test_addr_of_temporary_raw_casts() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+extern "C" { fn consume(ptr: *mut core::ffi::c_void); }
+pub unsafe fn run() {
+    consume(&mut Item { value: 42 } as *mut Item as *mut core::ffi::c_void);
+    consume(&{ let value = Item { value: 42 }; value }
+        as *const Item as *mut core::ffi::c_void);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_addr_of_temporary_mutable_borrow_to_const_raw() {
+    run_test(
+        r#"
+pub struct Item { pub value: i32 }
+extern "C" { fn consume(ptr: *const Item); }
+pub unsafe fn run() {
+    consume(&mut Item { value: 42 });
+}
+"#,
+        &["&mut", "as *mut _ as *const"],
+        &[],
+    );
+}
+
 /// addr_of with Slice context, bytemuck cast: same-size numerics (c_int vs c_uint)
 /// with .offset() usage. Output: `std::slice::from_mut(bytemuck::cast_mut(&mut (x)))`.
 #[test]
@@ -7251,6 +8305,84 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 "#,
         &["is_empty", "&mut [i32]"],
         &["is_null"],
+    );
+}
+
+/// a cast around a projected slice pointer must not hide its promoted base
+/// from null-check rewriting.
+#[test]
+fn test_is_null_projected_cast_slice() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut values: [libc::c_int; 4] = [0; 4];
+    let mut p: *mut libc::c_int = values.as_mut_ptr();
+    *p.offset(1 as isize) = 10 as libc::c_int;
+    if !((p.offset(1 as isize) as *mut libc::c_int).is_null()) {
+        return *p.offset(1 as isize);
+    }
+    return 0 as libc::c_int;
+}
+"#,
+        &["&mut [i32]", "is_empty"],
+        &["is_null", ").offset(1 as isize) as *mut i32"],
+    );
+}
+
+#[test]
+fn test_address_taken_pointer_field_stays_raw_for_nested_pointer_parameter() {
+    run_test(
+        r#"
+pub struct Context {
+    pub next: *const u8,
+}
+
+unsafe fn advance(next: *mut *const u8) {
+    *next = (*next).offset(1);
+}
+
+pub unsafe fn read(context: *mut Context) -> u8 {
+    let before = *(*context).next;
+    advance(&mut (*context).next);
+    before + *(*context).next
+}
+"#,
+        &["pub next: *const u8", "&raw mut (context.next)"],
+        &[
+            "pub next: &[u8]",
+            "pub next: crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_fields_stay_raw_across_nominal_struct_pointer_cast() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Number {
+    pub len: usize,
+    pub data: *mut u32,
+}
+
+#[repr(C)]
+pub struct AllocatorNumber {
+    pub len: usize,
+    pub data: *mut u32,
+}
+
+unsafe fn reserve(number: *mut AllocatorNumber) {
+    (*number).len = 1;
+}
+
+pub unsafe fn set(number: *mut Number) {
+    reserve(number as *mut AllocatorNumber);
+    *(*number).data = 7;
+}
+"#,
+        &["pub data: *mut u32"],
+        &["pub data: Option<&mut u32>", "pub data: &mut [u32]"],
     );
 }
 
@@ -7587,6 +8719,121 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 "#,
         &["as usize"],
+        &[],
+    );
+}
+
+#[test]
+fn test_variadic_null_pointer_arguments_keep_pointee_types() {
+    run_test(
+        r#"
+extern "C" { fn consume(fixed: *mut i8, ...); }
+pub unsafe fn pass() {
+    consume(
+        0 as *mut i8,
+        0 as *mut core::ffi::c_void,
+        0 as *const i32,
+        std::ptr::null_mut::<u8>(),
+        std::ptr::null::<u16>(),
+        0 as *mut *const i64,
+    );
+}
+"#,
+        &[
+            "consume(std::ptr::null_mut(),",
+            "std::ptr::null_mut::<std::ffi::c_void>()",
+            "std::ptr::null::<i32>()",
+            "std::ptr::null_mut::<u8>()",
+            "std::ptr::null::<u16>()",
+            "std::ptr::null_mut::<*const i64>()",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_variadic_null_pointer_arguments_through_fn_pointer() {
+    run_test(
+        r#"
+pub unsafe fn pass(callback: unsafe extern "C" fn(*mut u8, *const i16, ...)) {
+    callback(0 as *mut u8, 0 as *const i16, 0 as *mut u8, 0 as *const i16);
+}
+pub unsafe fn pass_ref(callback: &unsafe extern "C" fn(*mut u8, *const i16, ...)) {
+    callback(0 as *mut u8, 0 as *const i16, 0 as *mut u8, 0 as *const i16);
+}
+"#,
+        &["std::ptr::null_mut::<u8>()", "std::ptr::null::<i16>()"],
+        &[],
+    );
+}
+
+#[test]
+fn test_variadic_null_fix_keeps_fixed_argument_inference() {
+    run_test(
+        r#"
+extern "C" { fn consume(value: *mut core::ffi::c_void); }
+pub unsafe fn pass() {
+    consume(0 as *mut core::ffi::c_void);
+}
+"#,
+        &["consume(std::ptr::null_mut());"],
+        &["null_mut::<"],
+    );
+}
+
+#[test]
+fn test_integer_to_raw_pointer_from_field() {
+    for integer_ty in ["u64", "usize", "i64"] {
+        for mutability in ["mut", "const"] {
+            let code = format!(
+                r#"
+#[repr(C)]
+pub struct Entry {{ pub inner: Inner }}
+#[repr(C)]
+pub struct Inner {{ pub value: {integer_ty} }}
+pub unsafe fn get(entry: *mut Entry) -> *{mutability} core::ffi::c_void {{
+    (*entry).inner.value as *{mutability} core::ffi::c_void
+}}
+"#
+            );
+            run_test(
+                &code,
+                &[&format!("entry.inner.value as *{mutability} core::ffi::c_void")],
+                &["(*entry).inner.value"],
+            );
+        }
+    }
+}
+
+#[test]
+fn test_integer_to_raw_pointer_from_local() {
+    for integer_ty in ["u64", "usize", "i64"] {
+        for mutability in ["mut", "const"] {
+            let code = format!(
+                r#"
+pub unsafe fn get(value: {integer_ty}) -> *{mutability} core::ffi::c_void {{
+    value as *{mutability} core::ffi::c_void
+}}
+"#
+            );
+            run_test(
+                &code,
+                &[&format!("value as *{mutability} core::ffi::c_void")],
+                &[],
+            );
+        }
+    }
+}
+
+#[test]
+fn test_integer_to_raw_pointer_preserves_intermediate_cast() {
+    run_test(
+        r#"
+pub unsafe fn get(value: u64) -> *mut core::ffi::c_void {
+    value as u32 as *mut core::ffi::c_void
+}
+"#,
+        &["value as u32 as *mut core::ffi::c_void"],
         &[],
     );
 }
@@ -7962,7 +9209,7 @@ pub unsafe fn foo(info: *mut Info) {
     consume((*info).addr.as_mut_ptr().offset(pos as isize));
 }
 "#,
-        &["consume(&mut ((*info).addr)[(pos as isize) as usize..]);"],
+        &["consume(&mut (info.addr)[(pos as isize) as usize..]);"],
         &["from_raw_parts_mut", ".addr.as_mut_ptr().offset"],
     );
 }
@@ -7995,7 +9242,7 @@ pub unsafe fn transform(m: *mut Md5) -> u32 {
             "unpack(&",
             "buffer)[",
             "10 as core::ffi::c_int",
-            "* 4 as core::ffi::c_int",
+            "4 as core::ffi::c_int",
             "as usize..])",
         ],
         &["from_raw_parts", ".buffer.as_mut_ptr().offset"],
@@ -8223,6 +9470,625 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_static_i8_bytestr_slice_uses_const_compatible_cast() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub name: *const i8,
+}
+
+impl Copy for Entry {}
+impl Clone for Entry {
+    fn clone(&self) -> Self { *self }
+}
+
+static mut ENTRIES: [Entry; 1] = [Entry {
+    name: b"name\0" as *const u8 as *const i8,
+}];
+
+pub unsafe fn read_name() -> i8 {
+    let entry = ENTRIES[0];
+    *entry.name.offset(0) + *entry.name.offset(1)
+}
+"#,
+        &["std::slice::from_raw_parts", "*const i8"],
+        &["bytemuck::cast_slice"],
+    );
+}
+
+#[test]
+fn test_mutable_bytestr_argument_uses_writable_copy() {
+    run_test(
+        r#"
+pub unsafe fn overwrite(p: *mut i8) {
+    *p.offset(0) = b'X' as i8;
+    *p.offset(1) = b'Y' as i8;
+}
+pub unsafe fn caller() {
+    overwrite(b"ab\0" as *const u8 as *const i8 as *mut i8);
+}
+"#,
+        &["Box::leak", "to_vec().into_boxed_slice()"],
+        &[],
+    );
+}
+
+#[test]
+fn test_bytestr_conditional_cast_drops_obsolete_raw_cast() {
+    run_test(
+        r#"
+pub unsafe fn first(flag: bool) -> i8 {
+    let fmt: *mut i8 = (if flag {
+        b"a\0" as *const u8 as *const i8
+    } else {
+        b"b\0" as *const u8 as *const i8
+    }) as *mut i8;
+    *fmt
+}
+"#,
+        &["let fmt: &i8", "std::slice::from_raw_parts"],
+        &["as *mut i8"],
+    );
+}
+
+#[test]
+fn test_casted_raw_pointer_deref_keeps_pointee_cast() {
+    run_test(
+        r#"
+pub unsafe fn read(ptr: *mut core::ffi::c_void) -> u32 {
+    *(ptr as *mut u32)
+}
+"#,
+        &["*(ptr as *mut u32)"],
+        &["*ptr"],
+    );
+}
+
+#[test]
+fn test_transmuted_fn_ptr_local_call_uses_declared_raw_signature() {
+    run_test(
+        r#"
+pub type Erased = Option<unsafe fn()>;
+pub type Concrete = Option<unsafe fn(*mut i32)>;
+
+pub struct Hooks {
+    pub callback: Erased,
+}
+
+pub unsafe fn target(p: *mut i32) {
+    *p = 7;
+}
+
+pub unsafe fn install(hooks: &mut Hooks) {
+    hooks.callback = std::mem::transmute::<Concrete, Erased>(
+        Some(target as unsafe fn(*mut i32)),
+    );
+}
+
+pub unsafe fn invoke(hooks: &Hooks, p: *mut i32) {
+    let callback: Concrete = std::mem::transmute::<Erased, Concrete>(hooks.callback);
+    callback.unwrap()(p);
+}
+"#,
+        &["callback.unwrap()((p).as_mut_ptr())"],
+        &["callback.unwrap()((p).as_mut())"],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_cast() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+pub unsafe fn setup(p: *mut Outer) { let cb = callback as unsafe extern "C" fn(*mut Outer); cb(p); }
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_local() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+pub unsafe fn setup(p: *mut Outer) { let cb: unsafe extern "C" fn(*mut Outer) = callback; cb(p); }
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_option_parameter() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+unsafe fn dispatch(cb: Option<unsafe extern "C" fn(*mut Outer)>, p: *mut Outer) { cb.unwrap()(p); }
+pub unsafe fn setup(p: *mut Outer) { dispatch(Some(callback), p); }
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_alias() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+type Callback = unsafe extern "C" fn(*mut Outer);
+unsafe fn dispatch(cb: Callback, p: *mut Outer) { cb(p); }
+pub unsafe fn setup(p: *mut Outer) { dispatch(callback as Callback, p); }
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_field() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+pub struct Hooks { pub callback: Option<unsafe extern "C" fn(*mut Outer)>, pub inner: Inner }
+pub unsafe fn setup(p: *mut Outer, hooks: *mut Hooks) {
+    (*hooks).callback = Some(callback);
+    (*hooks).callback.unwrap()(p);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_static() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+static mut CALLBACK: unsafe extern "C" fn(*mut Outer) = callback;
+pub unsafe fn setup() { let _callback = CALLBACK; }
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_group() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+unsafe extern "C" fn second(p: *mut Outer) { (*p).count += 2; }
+pub unsafe fn setup(p: *mut Outer, flag: bool) {
+    let cb: unsafe extern "C" fn(*mut Outer) = if flag { callback } else { second };
+    cb(p);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_independent_inputs() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+unsafe extern "C" fn both(p: *mut Outer, q: *mut Outer) { (*p).count += 1; (*q).count += 2; }
+pub unsafe fn setup(p: *mut Outer, q: *mut Outer) {
+    let cb = both as unsafe extern "C" fn(*mut Outer, *mut Outer);
+    cb(p, q);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_connected_group() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+unsafe extern "C" fn connected(p: *mut Outer, q: *mut Outer) {
+    (*p).inner.left = (*q).inner.left;
+}
+unsafe extern "C" fn independent(p: *mut Outer, q: *mut Outer) {
+    (*p).count += 1;
+    (*p).count += (*q).count;
+}
+pub unsafe fn setup(flag: bool) {
+    let _cb: unsafe extern "C" fn(*mut Outer, *mut Outer) =
+        if flag { connected } else { independent };
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_pointer_alias() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+type OuterPtr<T> = *mut T;
+pub unsafe fn setup(p: OuterPtr<Outer>) {
+    let cb = callback as unsafe extern "C" fn(OuterPtr<Outer>);
+    cb(p);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_existing_binder() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+unsafe extern "C" fn with_ref(p: *mut Outer, _x: &i32) { (*p).count += 1; }
+pub unsafe fn setup(p: *mut Outer) {
+    let _cb = with_ref as for<'crat_cb_0> unsafe extern "C" fn(*mut Outer, &'crat_cb_0 i32);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_nested() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+pub unsafe fn setup(cb: unsafe extern "C" fn(*mut Outer, unsafe extern "C" fn(*mut Outer))) {
+    let _copy: unsafe extern "C" fn(*mut Outer, unsafe extern "C" fn(*mut Outer)) = cb;
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_unused_binder() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+pub unsafe fn setup() {
+    let _cb = callback as for<'crat_cb_1> unsafe extern "C" fn(*mut Outer);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_callback_promoted_lifetimes_generic_pointee() {
+    // Exercise callback rendering through the existing ownership-analysis fallback.
+    run_test_with_config(
+        r#"
+#[repr(C)]
+pub struct Inner { pub left: *const i8, pub right: *const i8, }
+#[repr(C)]
+pub struct Outer { pub inner: Inner, pub count: i32 }
+pub unsafe fn seed() -> i8 {
+    let left = [3_i8]; let right = [4_i8];
+    let inner = Inner { left: left.as_ptr(), right: right.as_ptr(), };
+    *inner.left.offset(0) + *inner.right.offset(0)
+}
+unsafe extern "C" fn callback(p: *mut Outer) { (*p).count += 1; }
+#[repr(C)]
+pub struct Holder<T> { pub marker: *const i8, pub inner: T, pub count: i32 }
+pub unsafe fn seed_holder() -> i8 {
+    let values = [9_i8];
+    let holder = Holder { marker: values.as_ptr(), inner: 0_i32, count: 0 };
+    *holder.marker.offset(0)
+}
+unsafe extern "C" fn with_holder(p: *mut Holder<Inner>) { (*p).count += 1; }
+pub unsafe fn setup(p: *mut Holder<Inner>) {
+    let cb = with_holder as unsafe extern "C" fn(*mut Holder<Inner>);
+    cb(p);
+}
+"#,
+        &Config { force_ownership_analysis_failure: true, ..Config::default() },
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_external_callback_direct_keeps_raw_signature() {
+    run_test(
+        r#"
+extern "C" { fn register(cb: unsafe extern "C" fn(*mut i32)); }
+unsafe extern "C" fn callback(p: *mut i32) { *p = 7; }
+pub unsafe fn setup() { register(callback); }
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_external_callback_option_cast_keeps_raw_signature() {
+    run_test(
+        r#"
+extern "C" { fn register(cb: Option<unsafe extern "C" fn(*mut i32)>); }
+unsafe extern "C" fn callback(p: *mut i32) { *p = 7; }
+pub unsafe fn setup() {
+    register(Some(callback as unsafe extern "C" fn(*mut i32)));
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_external_callback_forwarded_alias_keeps_raw_signature() {
+    run_test(
+        r#"
+type Callback = unsafe extern "C" fn(*mut i32);
+extern "C" { fn register(cb: Option<Callback>); }
+unsafe extern "C" fn callback(p: *mut i32) { *p = 7; }
+unsafe fn forward(cb: Option<Callback>) { register(cb); }
+pub unsafe fn setup() {
+    let cb: Option<Callback> = Some(callback as Callback);
+    forward(cb);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_external_callback_group_keeps_all_members_raw() {
+    run_test(
+        r#"
+type Callback = unsafe extern "C" fn(*mut i32);
+extern "C" { fn register(cb: Option<Callback>); }
+unsafe extern "C" fn first(p: *mut i32) { *p = 7; }
+unsafe extern "C" fn second(p: *mut i32) { *p = 9; }
+pub unsafe fn setup(flag: bool) {
+    let cb = if flag { Some(first as Callback) } else { Some(second as Callback) };
+    register(cb);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_external_callback_keeps_unrelated_local_group_rewritable() {
+    run_test(
+        r#"
+extern "C" { fn register(cb: Option<unsafe extern "C" fn(*mut i32)>); }
+unsafe extern "C" fn external_callback(p: *mut i32) { *p = 7; }
+unsafe extern "C" fn local_callback(p: *mut u64) { *p = 9; }
+unsafe fn invoke(cb: Option<unsafe extern "C" fn(*mut u64)>) -> u64 {
+    let mut value = 0;
+    cb.unwrap()(&mut value);
+    value
+}
+pub unsafe fn setup() -> u64 {
+    register(Some(external_callback as unsafe extern "C" fn(*mut i32)));
+    invoke(Some(local_callback as unsafe extern "C" fn(*mut u64)))
+}
+"#,
+        &["fn(&mut u64)"],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_ptr_aliased_call_keeps_target_and_callback_inputs_raw() {
+    run_test(
+        r#"
+pub unsafe fn copy(p: *mut i32, q: *mut i32) {
+    *p = *q;
+}
+
+pub unsafe fn dispatch(cb: unsafe fn(*mut i32, *mut i32), p: *mut i32, q: *mut i32) {
+    cb(p, q);
+}
+
+pub unsafe fn run() {
+    let mut x: i32 = 7;
+    let px = &raw mut x;
+    dispatch(copy as unsafe fn(*mut i32, *mut i32), px, px);
+}
+"#,
+        &[
+            "cb: unsafe fn(*mut i32, *mut i32)",
+            "copy as unsafe fn(*mut i32, *mut i32)",
+        ],
+        &["fn(&mut i32", "p: &mut i32", "q: &i32"],
+    );
+}
+
+#[test]
+fn test_fn_ptr_parameter_rewrites_pointer_type_alias_inputs() {
+    run_test(
+        r#"
+pub type Num = *mut i32;
+
+pub unsafe extern "C" fn read(value: Num) -> i32 {
+    *value
+}
+
+pub unsafe fn apply(op: Option<unsafe extern "C" fn(Num) -> i32>, value: Num) -> i32 {
+    op.unwrap()(value)
+}
+
+pub unsafe fn apply_direct(op: unsafe extern "C" fn(Num) -> i32, value: Num) -> i32 {
+    op(value)
+}
+
+pub unsafe fn run(value: Num) -> i32 {
+    apply(Some(read as unsafe extern "C" fn(Num) -> i32), value)
+}
+
+pub unsafe fn run_direct(value: Num) -> i32 {
+    apply_direct(read as unsafe extern "C" fn(Num) -> i32, value)
+}
+"#,
+        &[
+            "pub type Num = *mut i32",
+            "op: Option<unsafe extern \"C\" fn(&i32) -> i32>",
+            "op: unsafe extern \"C\" fn(&i32) -> i32",
+        ],
+        &["fn(Num) -> i32"],
+    );
+}
+
+#[test]
+fn test_fn_ptr_cast_rewrites_pointer_type_alias_inputs() {
+    run_test(
+        r#"
+pub type IntPtr = *mut i32;
+
+pub unsafe fn target(p: IntPtr) {
+    *p = 7;
+}
+
+pub unsafe fn install() {
+    let _erased = std::mem::transmute::<_, unsafe fn()>(
+        target as unsafe fn(IntPtr),
+    );
+}
+"#,
+        &["target as unsafe fn(&mut i32)"],
+        &["target as unsafe fn(IntPtr)"],
+    );
+}
+
 // ===== Fallthrough tests (lines 734-755): struct field pointer access =====
 
 /// Fallthrough + OptRef: struct field `s.data` is a `*mut c_int` → `PtrExprBaseKind::Other`.
@@ -8342,8 +10208,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(0 as isize);
 }
 "#,
-        &["let _x", "from_raw_parts_mut"],
-        &["as *mut _"],
+        &["let _x", "from_raw_parts_mut", "as *mut _"],
+        &[],
     );
 }
 
@@ -8392,6 +10258,50 @@ pub unsafe extern "C" fn foo() {
 }
 
 #[test]
+fn test_negative_offset_from_struct_field_address_stays_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub prefix: [i32; 4],
+    pub fields: [i32; 4],
+}
+
+pub unsafe fn read_prefix(info: &mut Info) -> i32 {
+    *(&mut info.fields[0] as *mut i32).offset(-(3 as isize))
+}
+"#,
+        &["as *mut i32).offset(-(3 as isize))"],
+        &["18446744073709551613", "slice::from_mut", "slice::from_ref"],
+    );
+}
+
+#[test]
+fn test_flexible_array_member_pointer_uses_allocated_tail() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Stream {
+    pub count: i32,
+    pub buffer: [f64; 0],
+}
+
+pub unsafe fn update(stream: *mut Stream, index: i32, value: f64) -> f64 {
+    let buffer: *mut f64 = (*stream).buffer.as_mut_ptr();
+    *buffer.offset(index as isize) = value;
+    *buffer.offset(index as isize)
+}
+"#,
+        &[
+            "SliceCursorMut<'_, f64>",
+            "SliceCursorMut::from_raw_parts_mut",
+            "1_000_000",
+        ],
+        &["SliceCursorMut::new(&mut stream.buffer)"],
+    );
+}
+
+#[test]
 fn test_param_byte_cast_offset_rewrites_to_slice_cursor() {
     run_test(
         r#"
@@ -8424,7 +10334,7 @@ pub unsafe extern "C" fn caller(info: *mut Info, offset: i32, value: u32) {
 }
 
 #[test]
-fn test_raw_local_noop_cast_call_does_not_demote_cursor_callee() {
+fn test_foreign_struct_escape_demotes_later_array_field_pointer() {
     run_test(
         r#"
 #[repr(C)]
@@ -8448,15 +10358,12 @@ pub unsafe extern "C" fn caller(v_info: *mut core::ffi::c_void, offset: i32, val
 }
 "#,
         &[
-            "crate::slice_cursor::SliceCursorMut<'_, u32>",
-            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
-            "as *mut u8, 1_000_000",
-            "set_type(if (leaf_addr).is_null()",
-            "SliceCursorMut::from_raw_parts_mut((leaf_addr),",
+            "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
+            "let mut leaf_addr: *mut u32",
+            "set_type(leaf_addr as *mut u32, offset, value)",
         ],
         &[
-            "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
-            "*(addr as *mut u8).offset",
+            "crate::slice_cursor::SliceCursorMut<'_, u32>",
             "bytemuck::cast_slice_mut",
         ],
     );
@@ -8735,6 +10642,58 @@ pub unsafe fn drive() -> u8 {
 }
 
 #[test]
+fn test_raw_field_caller_keeps_dynamic_backward_cursor_input_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub values: *mut u16,
+}
+
+pub unsafe fn store(values: *mut u16, links: *const i32) {
+    *values.offset(*links.offset(1) as isize) = 7;
+}
+
+pub unsafe fn drive(state: *mut State, links: *const i32) {
+    store((*state).values, links);
+}
+"#,
+        &["pub unsafe fn store(mut values: *mut u16"],
+        &[
+            "pub unsafe fn store(values: crate::slice_cursor::SliceCursorMut",
+            "SliceCursorMut::from_raw_parts_mut((*state).values",
+        ],
+    );
+}
+
+#[test]
+fn test_local_loaded_from_raw_abi_field_stays_raw() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("update".to_string());
+    run_test_with_config(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub values: *mut u32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn update(state: *mut State, index: usize, value: u32) {
+    let values: *mut u32 = (*state).values;
+    *values.offset(index as isize) = value;
+}
+"#,
+        &config,
+        &[
+            "pub values: *mut u32",
+            "let mut values: *mut u32",
+            "*values.offset(index as isize) = value",
+        ],
+        &["let values: &mut [u32]", "from_raw_parts_mut(state.values"],
+    );
+}
+
+#[test]
 fn test_array_pointer_caller_keeps_negative_cursor_input_cursor() {
     run_test(
         r#"
@@ -8766,7 +10725,10 @@ pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) {
     *p.offset(a).offset(b) = 1;
 }
 "#,
-        &["(p)[((a) as isize).wrapping_add((b) as isize)] = 1"],
+        &[
+            "let __crat_index = ((a) as isize).wrapping_add((b) as isize);",
+            "(p)[__crat_index] = 1",
+        ],
         &["(p).as_deref_mut().offset_by"],
     );
 }
@@ -8946,8 +10908,8 @@ pub unsafe fn copy_tail(
     );
 }
 "#,
-        &["&((*src).data)[("],
-        &["&mut ((*src).data)"],
+        &["&(src.data)[("],
+        &["&mut (src.data)"],
     );
 }
 
@@ -9999,35 +11961,7 @@ mod ownership_analysis {
         let pre = andersen::pre_analyze(&config, &tss, tcx);
         let points_to = andersen::analyze(&config, &pre, &tss, tcx);
 
-        let mut param_aliases = FxHashMap::default();
-        for def_id in tcx.hir_body_owners() {
-            let Some(calls) = pre.call_args.get(&def_id) else {
-                continue;
-            };
-            let mut aliases: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
-            let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
-            for call_args in calls {
-                for i in 0..body.arg_count {
-                    for j in 0..i {
-                        let Some(arg_i) = call_args[i] else { continue };
-                        let Some(arg_j) = call_args[j] else { continue };
-                        let mut sol_i = points_to[arg_i].clone();
-                        sol_i.intersect(&points_to[arg_j]);
-                        if !sol_i.is_empty() {
-                            let i = Local::from_usize(i + 1);
-                            let j = Local::from_usize(j + 1);
-                            aliases.entry(i).or_default().insert(j);
-                            aliases.entry(j).or_default().insert(i);
-                        }
-                    }
-                }
-            }
-            if !aliases.is_empty() {
-                param_aliases.insert(def_id, aliases);
-            }
-        }
-
-        param_aliases
+        crate::rewriter::find_param_aliases(&pre, &points_to, tcx)
     }
 
     fn analyze_program<'tcx>(
@@ -10164,6 +12098,51 @@ pub unsafe fn foo() -> *mut i32 {
                         .get(&Local::from_u32(2))
                         .is_some_and(|locals| locals.contains(&Local::from_u32(1)))
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn c_variadic_aliases_only_compare_fixed_params() {
+        run_compiler(
+            r#"
+#![feature(c_variadic)]
+
+pub unsafe extern "C" fn variadic_sink(
+    a: *mut i32,
+    b: *mut i32,
+    mut args: ...,
+) {
+    let _ = (a, b, &mut args);
+}
+
+pub unsafe fn call_variadic() {
+    let mut x = 7i32;
+    let p: *mut i32 = &mut x;
+    variadic_sink(p, p);
+    variadic_sink(p, p, p);
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let variadic_sink = find_function(&program, "variadic_sink").expect_local();
+                let aliases = compute_param_aliases(tcx);
+                let variadic_aliases = aliases
+                    .get(&variadic_sink)
+                    .expect("expected alias cluster for variadic_sink");
+
+                assert_eq!(variadic_aliases.len(), 2);
+                assert!(
+                    variadic_aliases
+                        .get(&Local::from_u32(1))
+                        .is_some_and(|locals| locals.contains(&Local::from_u32(2)))
+                );
+                assert!(
+                    variadic_aliases
+                        .get(&Local::from_u32(2))
+                        .is_some_and(|locals| locals.contains(&Local::from_u32(1)))
+                );
+                assert!(!variadic_aliases.contains_key(&Local::from_u32(3)));
             },
         );
     }

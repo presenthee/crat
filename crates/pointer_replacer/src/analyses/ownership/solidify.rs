@@ -273,7 +273,7 @@ impl<'tcx> WholeProgramResults<'tcx> {
                                     };
                                     if adt_def.is_union() {
                                         ownership = &[];
-                                        continue;
+                                        break;
                                     }
                                     let Range { start, end } =
                                         struct_fields.field(&adt_def.did(), f.index());
@@ -286,6 +286,10 @@ impl<'tcx> WholeProgramResults<'tcx> {
                                 }
                                 _ => unreachable!(),
                             }
+                        }
+
+                        if ownership.is_empty() {
+                            continue;
                         }
 
                         let ownership =

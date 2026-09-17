@@ -391,7 +391,18 @@ impl MutVisitor for TransformVisitor<'_> {
                 }
                 "strlen" => {
                     let [arg] = args.as_slice() else { panic!() };
-                    *expr = self.transform_strlen(arg);
+                    let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
+                        return;
+                    };
+                    let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                    let return_ty = typeck.expr_ty(hir_expr);
+                    let replacement = self.transform_strlen(arg);
+                    *expr = if return_ty == self.tcx.types.usize {
+                        replacement
+                    } else {
+                        let ty = utils::ir::mir_ty_to_string(return_ty, self.tcx);
+                        expr!("({} as {ty})", pprust::expr_to_string(&replacement))
+                    };
                 }
                 "strcmp" => {
                     let [arg1, arg2] = args.as_slice() else { panic!() };

@@ -514,7 +514,24 @@ impl SigDecisions {
                 .enumerate()
             {
                 let aliases = aliases.and_then(|aliases| aliases.get(&param));
-                let info = decision_maker.decide_with_info(param, param_decl, aliases);
+                let mut info = decision_maker.decide_with_info(param, param_decl, aliases);
+                if let Some(hir_id) = param_hir_id(rust_program.tcx, *did, idx)
+                    && param_is_assigned_call_result(rust_program.tcx, *did, hir_id)
+                    && let Some((_, mutability)) =
+                        super::transform::unwrap_ptr_from_mir_ty(param_decl.ty)
+                {
+                    let before = info.kind;
+                    let after = Some(PtrKind::Raw(mutability.is_mut()));
+                    if before != after {
+                        info.events.push(DecisionInfoEvent {
+                            before,
+                            after,
+                            reason: DecisionReason::RawCallResult,
+                            detail: Some("parameter is rebound to a call result".to_string()),
+                        });
+                        info.kind = after;
+                    }
+                }
                 if let Some(diagnostics) = diagnostics.as_deref_mut()
                     && let Some(hir_id) = param_hir_id(rust_program.tcx, *did, idx)
                 {
@@ -767,6 +784,66 @@ fn record_param_decisions(
             reason,
             None,
         );
+    }
+}
+
+fn param_is_assigned_call_result(tcx: TyCtxt<'_>, did: LocalDefId, param_hir_id: HirId) -> bool {
+    struct AssignmentVisitor {
+        param_hir_id: HirId,
+        found: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for AssignmentVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.found {
+                return;
+            }
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind {
+                let lhs = unwrap_hir_casts_and_drops(lhs);
+                let rhs = unwrap_hir_casts_and_drops(rhs);
+                let rhs_is_non_null_call = if let hir::ExprKind::Call(callee, _) = rhs.kind {
+                    let callee = unwrap_hir_casts_and_drops(callee);
+                    !matches!(
+                        callee.kind,
+                        hir::ExprKind::Path(hir::QPath::Resolved(_, path))
+                            if path.segments.last().is_some_and(|segment| {
+                                matches!(segment.ident.name.as_str(), "null" | "null_mut")
+                            })
+                    )
+                } else {
+                    false
+                };
+                if matches!(lhs.kind, hir::ExprKind::Path(hir::QPath::Resolved(_, path)) if path.res == Res::Local(self.param_hir_id))
+                    && rhs_is_non_null_call
+                {
+                    self.found = true;
+                    return;
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+        return false;
+    };
+    let hir::ItemKind::Fn { body, .. } = item.kind else {
+        return false;
+    };
+    let mut visitor = AssignmentVisitor {
+        param_hir_id,
+        found: false,
+    };
+    visitor.visit_body(tcx.hir_body(body));
+    visitor.found
+}
+
+fn unwrap_hir_casts_and_drops<'a, 'tcx>(mut expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'tcx> {
+    loop {
+        match expr.kind {
+            hir::ExprKind::Cast(inner, _) | hir::ExprKind::DropTemps(inner) => expr = inner,
+            _ => return expr,
+        }
     }
 }
 

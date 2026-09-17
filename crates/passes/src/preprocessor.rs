@@ -670,7 +670,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
         {
             if matches!(mode, hir::BindingMode(hir::ByRef::Yes(_), _))
                 && (matches!(e.kind, ExprKind::Unary(UnOp::Deref, _))
-                    || (matches!(e.kind, ExprKind::Field(_, _))
+                    || (matches!(e.kind, ExprKind::Field(_, _) | ExprKind::Index(_, _, _))
                         && !self.non_pointer_uses.contains(&id)))
             {
                 self.let_ref_exprs.insert(id, e.clone());
@@ -2092,6 +2092,28 @@ pub unsafe extern "C" fn f(mut p: *mut libc::c_uint) {
 }
             "#,
             &["*p.offset(0 as libc::c_int as isize)"],
+            &["fresh0"],
+        );
+    }
+
+    #[test]
+    fn test_let_ref_indexed_place() {
+        run_test(
+            r#"
+#![feature(derive_clone_copy)]
+
+#[derive(Copy, Clone)]
+struct FdSet {
+    fds_bits: [i64; 16],
+}
+
+pub unsafe fn f(i: usize) {
+    let mut fds = [FdSet { fds_bits: [0; 16] }; 1];
+    let ref mut fresh0 = (*fds.as_mut_ptr()).fds_bits[i];
+    *fresh0 |= 1;
+}
+            "#,
+            &["fds_bits[i] |= 1;"],
             &["fresh0"],
         );
     }

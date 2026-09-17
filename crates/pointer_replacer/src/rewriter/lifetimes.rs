@@ -3,7 +3,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
 use rustc_middle::{
     mir::{Local, RETURN_PLACE},
-    ty::TyCtxt,
+    ty::{self, TyCtxt},
 };
 use rustc_span::{DUMMY_SP, Ident, Symbol, def_id::LocalDefId};
 
@@ -25,6 +25,7 @@ pub struct FnLifetimePlan {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StructLifetimePlan {
     pub field_lifetimes: FxHashMap<usize, Symbol>,
+    pub dependent_structs: Vec<LocalDefId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -37,7 +38,7 @@ impl LifetimePlans {
     pub fn new(input: &RustProgram<'_>, analysis: &Analysis) -> Self {
         Self {
             functions: function_lifetime_plans(input, analysis),
-            structs: struct_lifetime_plans(input.tcx, analysis),
+            structs: struct_lifetime_plans(input, analysis),
         }
     }
 }
@@ -222,9 +223,10 @@ fn mir_arg_local_to_input_index(local: Local) -> Option<usize> {
 }
 
 fn struct_lifetime_plans(
-    tcx: TyCtxt<'_>,
+    input: &RustProgram<'_>,
     analysis: &Analysis,
 ) -> FxHashMap<LocalDefId, StructLifetimePlan> {
+    let tcx = input.tcx;
     let mut fields_by_struct: FxHashMap<LocalDefId, Vec<StructFieldSlot>> = FxHashMap::default();
     for field in analysis
         .borrow_promotion_result
@@ -252,7 +254,58 @@ fn struct_lifetime_plans(
         plans.insert(struct_did, plan);
     }
 
+    // Keep the dependency graph in the plan. The rewriter resolves it after
+    // final pointer-kind downgrades, so unused field lifetime candidates do
+    // not accidentally make containing structs generic.
+    for &struct_did in &input.structs {
+        let struct_ty = tcx.type_of(struct_did).skip_binder();
+        let ty::TyKind::Adt(adt_def, args) = struct_ty.kind() else {
+            continue;
+        };
+        let mut dependencies = FxHashSet::default();
+        for field in adt_def.all_fields() {
+            collect_local_struct_dependencies(field.ty(tcx, args), &mut dependencies);
+        }
+        dependencies.remove(&struct_did);
+        if !dependencies.is_empty() {
+            let plan = plans.entry(struct_did).or_default();
+            let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
+            dependencies.sort_by_key(|did| tcx.def_path_str(*did));
+            plan.dependent_structs.extend(dependencies);
+        }
+    }
+
     plans
+}
+
+fn collect_local_struct_dependencies(
+    ty: rustc_middle::ty::Ty<'_>,
+    out: &mut FxHashSet<LocalDefId>,
+) {
+    match ty.kind() {
+        rustc_middle::ty::TyKind::Adt(adt_def, args) => {
+            if adt_def.did().is_local() && adt_def.is_struct() && !adt_def.is_union() {
+                out.insert(adt_def.did().expect_local());
+            }
+            for arg in args.iter() {
+                if let rustc_middle::ty::GenericArgKind::Type(ty) = arg.kind() {
+                    collect_local_struct_dependencies(ty, out);
+                }
+            }
+        }
+        rustc_middle::ty::TyKind::RawPtr(inner, _)
+        | rustc_middle::ty::TyKind::Ref(_, inner, _)
+        | rustc_middle::ty::TyKind::Slice(inner)
+        | rustc_middle::ty::TyKind::Array(inner, _) => {
+            collect_local_struct_dependencies(*inner, out);
+        }
+        rustc_middle::ty::TyKind::Tuple(elements) => {
+            for element in elements.iter() {
+                collect_local_struct_dependencies(element, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

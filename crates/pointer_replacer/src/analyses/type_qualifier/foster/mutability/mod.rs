@@ -158,6 +158,11 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     &mut rhs_deref,
                 );
 
+                // Untracked places, including union fields, have no qualifier variables.
+                if lhs.is_empty() || rhs.is_empty() {
+                    return;
+                }
+
                 // type safety
                 assert_eq!(
                     lhs.end.index() - lhs.start.index(),

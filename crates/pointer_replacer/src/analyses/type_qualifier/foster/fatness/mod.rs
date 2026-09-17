@@ -153,6 +153,11 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                 let lhs = place_vars(lhs, local_decls, locals, struct_fields);
                 let rhs = place_vars(rhs, local_decls, locals, struct_fields);
 
+                // Untracked places, including union fields, have no qualifier variables.
+                if lhs.is_empty() || rhs.is_empty() {
+                    return;
+                }
+
                 // type safety
                 assert_eq!(
                     lhs.end.index() - lhs.start.index(),

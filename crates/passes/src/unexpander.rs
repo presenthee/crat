@@ -193,9 +193,10 @@ impl MutVisitor for AstVisitor<'_> {
                     && let StmtKind::Expr(init) = &stmt.kind
                 {
                     let name = const_item.ident.name;
+                    let visibility = pprust::vis_to_string(&item.vis);
                     let ty = pprust::ty_to_string(ty);
                     let init = pprust::expr_to_string(init);
-                    *item = item!("thread_local! {{ static {name}: {ty} = const {{ {init} }}; }}");
+                    *item = item!("thread_local! {{ {visibility} static {name}: {ty} = const {{ {init} }}; }}");
                 }
             }
             ItemKind::Mod(_, _, ModKind::Loaded(items, ..)) => {
@@ -351,9 +352,6 @@ fn expanded_assert_condition(stmt: &Stmt) -> Option<Expr> {
     if else_expr.is_some() {
         return None;
     }
-    let ExprKind::Unary(UnOp::Not, condition) = &unwrap_paren(condition).kind else {
-        return None;
-    };
     let [panic_stmt] = then_block.stmts.as_slice() else {
         return None;
     };
@@ -381,7 +379,15 @@ fn expanded_assert_condition(stmt: &Stmt) -> Option<Expr> {
     if !lit.symbol.as_str().starts_with("assertion failed:") {
         return None;
     }
-    Some(unwrap_paren(condition).clone())
+    if let ExprKind::Unary(UnOp::Not, condition) = &unwrap_paren(condition).kind {
+        Some(unwrap_paren(condition).clone())
+    } else {
+        // Earlier passes may wrap the failure condition in a borrowing closure.
+        Some(Expr {
+            kind: ExprKind::Unary(UnOp::Not, condition.clone()),
+            ..utils::ast::dummy_expr()
+        })
+    }
 }
 
 fn unwrap_addr_of(expr: &Expr) -> &Expr {
@@ -625,6 +631,40 @@ mod tests {
     }
 
     #[test]
+    fn test_thread_local_preserves_visibility() {
+        for visibility in ["pub", "pub(crate)", "pub(super)", "pub(in crate::outer)"] {
+            let code = format!(
+                r#"
+mod outer {{
+    mod state {{
+        thread_local! {{
+            {visibility} static COUNT: std::cell::Cell<u32> = const {{ std::cell::Cell::new(0) }};
+            {visibility} static VALUE: std::cell::RefCell<u32> = const {{ std::cell::RefCell::new(0) }};
+        }}
+    }}
+    use state::COUNT;
+    use state::VALUE;
+    pub fn update() -> u32 {{
+        COUNT.set(COUNT.get() + 1);
+        VALUE.with_borrow_mut(|value| *value += 1);
+        COUNT.get() + VALUE.with_borrow(|value| *value)
+    }}
+}}
+"#
+            );
+            run_test(
+                &code,
+                &[
+                    "thread_local!",
+                    &format!("{visibility} static COUNT"),
+                    &format!("{visibility} static VALUE"),
+                ],
+                &["LocalKey"],
+            );
+        }
+    }
+
+    #[test]
     fn test_offset_of() {
         run_test(
             r#"
@@ -680,6 +720,28 @@ fn f(x: i32) {
 }
             "#,
             &["assert!(x != 0);"],
+            &["panicking", "assertion failed"],
+        )
+    }
+
+    #[test]
+    fn test_assert_with_borrowed_failure_condition() {
+        run_test(
+            r#"
+#![feature(panic_internals)]
+thread_local! {
+    static VALUE: std::cell::RefCell<i32> = const { std::cell::RefCell::new(1) };
+}
+fn f() {
+    if VALUE.with_borrow_mut(|value| {
+        *value += 1;
+        *value != 2
+    }) {
+        ::core::panicking::panic("assertion failed: *value == 2")
+    };
+}
+            "#,
+            &["assert!(!VALUE.with_borrow_mut", "*value += 1;", "*value != 2"],
             &["panicking", "assertion failed"],
         )
     }

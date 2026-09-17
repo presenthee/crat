@@ -134,7 +134,20 @@ fn solve_body<'tcx>(
     precision: Precision,
     ctxt: SolveBodyCtxt<'_, 'tcx>,
 ) -> anyhow::Result<(FnSummary, Precision)> {
-    if precision == 0 {
+    const MAX_BODY_LOCATIONS: usize = 10_000;
+    let body_locations = body
+        .basic_blocks
+        .iter()
+        .map(|block| block.statements.len() + usize::from(block.terminator.is_some()))
+        .sum::<usize>();
+    if precision == 0 || body_locations > MAX_BODY_LOCATIONS {
+        if verbose() && body_locations > MAX_BODY_LOCATIONS {
+            println!(
+                "Skipping ownership analysis for {} ({} MIR locations)",
+                ctxt.crate_ctxt.tcx.def_path_str(body.source.def_id()),
+                body_locations,
+            );
+        }
         return Ok((
             FnSummary {
                 fn_body_sig: rustc_index::IndexVec::new(),

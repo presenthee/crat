@@ -1,7 +1,7 @@
 use points_to::andersen::{self, Var};
 use rustc_abi::FieldIdx;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{HirId, def_id::LocalDefId};
+use rustc_hir::{HirId, def_id::LocalDefId, intravisit::Visitor};
 use rustc_middle::ty;
 use utils::ty_shape::{TyShape, TyShapes};
 
@@ -19,10 +19,11 @@ pub struct FnPtrRewriteDecision {
     pub direct_rewrite: FxHashSet<LocalDefId>,
     #[allow(dead_code)] // used in Phase 2 wrapper generation
     pub needs_wrapper: FxHashSet<LocalDefId>,
-    /// Per-parameter individual decisions per fn-ptr function (ignoring group consensus).
-    pub individual_decisions: FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
     /// Annotation-site decisions for direct_rewrite functions only.
     pub annotation_decisions: FxHashMap<HirId, Vec<Option<PtrKind>>>,
+    /// Callback groups supplying each annotation's lifetime relationships.
+    pub annotation_groups: FxHashMap<HirId, FxHashSet<LocalDefId>>,
+    pub field_groups: FxHashMap<(LocalDefId, FieldIdx), FxHashSet<LocalDefId>>,
     /// Struct-field fn-ptr decisions for direct_rewrite functions only.
     pub field_decisions: FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
 }
@@ -42,8 +43,9 @@ impl FnPtrRewriteDecision {
             return FnPtrRewriteDecision {
                 direct_rewrite: FxHashSet::default(),
                 needs_wrapper: FxHashSet::default(),
-                individual_decisions: FxHashMap::default(),
                 annotation_decisions: FxHashMap::default(),
+                annotation_groups: FxHashMap::default(),
+                field_groups: FxHashMap::default(),
                 field_decisions: FxHashMap::default(),
             };
         }
@@ -72,56 +74,26 @@ impl FnPtrRewriteDecision {
             individual_decisions.insert(did, decs);
         }
 
-        // --- Step 2: call-site alias check (Andersen overlap) ---
-
-        // forced_raw[rep][i] means: position i in this group's decisions must be None (raw pointer).
-        let mut forced_raw: FxHashMap<LocalDefId, FxHashSet<usize>> = FxHashMap::default();
-
-        for (caller, bb_to_slot) in &pre.indirect_calls {
-            let Some(bb_to_args) = pre.indirect_call_args.get(caller) else { continue };
-            for (bb, &slot_loc) in bb_to_slot {
-                let Some(arg_locs) = bb_to_args.get(bb) else { continue };
-
-                let reps: FxHashSet<LocalDefId> = solutions[slot_loc]
-                    .iter()
-                    .filter_map(|loc| pre.inv_fns.get(&loc))
-                    .filter_map(|did| fn_ptr_groups.fn_to_group.get(did))
-                    .copied()
-                    .collect();
-
-                if reps.is_empty() {
-                    continue;
-                }
-
-                for i in 0..arg_locs.len() {
-                    for j in 0..i {
-                        let (Some(loc_i), Some(loc_j)) = (arg_locs[i], arg_locs[j]) else {
-                            continue;
-                        };
-                        let mut sol = solutions[loc_i].clone();
-                        sol.intersect(&solutions[loc_j]);
-                        if !sol.is_empty() {
-                            for &rep in &reps {
-                                let positions = forced_raw.entry(rep).or_default();
-                                positions.insert(i);
-                                positions.insert(j);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         let direct_rewrite: FxHashSet<LocalDefId> =
             fn_ptr_groups.fn_to_group.keys().copied().collect();
         let needs_wrapper: FxHashSet<LocalDefId> = FxHashSet::default();
 
         // --- Step 3: annotation propagation for all groups ---
 
-        // Build loc_decisions for all groups, applying forced_raw overrides.
+        let effective_group_decisions = &fn_ptr_groups.group_decisions;
+        // explicit casts are ABI annotations too; use the common group
+        // decision rather than each function's incompatible individual result.
+        for (&did, &rep) in &fn_ptr_groups.fn_to_group {
+            if let Some(decs) = effective_group_decisions.get(&rep) {
+                individual_decisions.insert(did, decs.clone());
+            }
+        }
+
+        // Build loc_decisions from the shared group decisions.
         let mut loc_decisions: FxHashMap<andersen::Loc, Vec<Option<PtrKind>>> =
             FxHashMap::default();
 
+        let mut loc_groups: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
         for (v, pointees) in solutions.iter_enumerated() {
             let maybe_rep = pointees
                 .iter()
@@ -130,21 +102,10 @@ impl FnPtrRewriteDecision {
                 .next()
                 .copied();
             if let Some(rep) = maybe_rep
-                && let Some(decs) = fn_ptr_groups.group_decisions.get(&rep)
+                && let Some(decs) = effective_group_decisions.get(&rep)
             {
-                let forced = forced_raw.get(&rep);
-                let modified_decs: Vec<Option<PtrKind>> = decs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &d)| {
-                        if forced.is_some_and(|f| f.contains(&i)) {
-                            None
-                        } else {
-                            d
-                        }
-                    })
-                    .collect();
-                loc_decisions.insert(v, modified_decs);
+                loc_decisions.insert(v, decs.clone());
+                loc_groups.entry(v).or_default().insert(rep);
             }
         }
 
@@ -152,7 +113,8 @@ impl FnPtrRewriteDecision {
         let mut field_dec_candidates: FxHashMap<(LocalDefId, FieldIdx), Vec<Vec<Option<PtrKind>>>> =
             FxHashMap::default();
 
-        let build_field_candidates =
+        let mut field_groups: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+        let mut build_field_candidates =
             |field_dec_candidates: &mut FxHashMap<
                 (LocalDefId, FieldIdx),
                 Vec<Vec<Option<PtrKind>>>,
@@ -170,6 +132,8 @@ impl FnPtrRewriteDecision {
                     let field_loc = base_loc + offset;
                     if let Some(decs) = loc_decisions.get(&field_loc) {
                         let fi = FieldIdx::from_usize(field_idx);
+                    field_groups.entry((struct_did, fi)).or_default()
+                        .extend(loc_groups[&field_loc].iter().copied());
                         field_dec_candidates
                             .entry((struct_did, fi))
                             .or_default()
@@ -210,6 +174,141 @@ impl FnPtrRewriteDecision {
             build_field_candidates(&mut field_dec_candidates, struct_did, base_loc, ty);
         }
 
+        // Andersen locations can lose the connection between a callback field
+        // and a direct function assignment when the struct is reached through
+        // a raw parameter or heap allocation. Recover that explicit source
+        // relation from HIR so aliases used by callback fields receive the same
+        // annotation decision as the assigned function.
+        struct DirectFieldFnAssignmentVisitor<'a, 'tcx> {
+            tcx: rustc_middle::ty::TyCtxt<'tcx>,
+            fn_to_group: &'a FxHashMap<LocalDefId, LocalDefId>,
+            group_decisions: &'a FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
+            candidates: &'a mut FxHashMap<(LocalDefId, FieldIdx), Vec<Vec<Option<PtrKind>>>>,
+            groups: &'a mut FxHashMap<(LocalDefId, FieldIdx), FxHashSet<LocalDefId>>,
+        }
+
+        impl<'tcx> DirectFieldFnAssignmentVisitor<'_, 'tcx> {
+            fn assigned_local_fn(expr: &'tcx rustc_hir::Expr<'tcx>) -> Option<LocalDefId> {
+                use rustc_hir::{
+                    ExprKind,
+                    def::{DefKind, Res},
+                };
+
+                match expr.kind {
+                    ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) => {
+                        Self::assigned_local_fn(inner)
+                    }
+                    ExprKind::Call(_, [arg]) => Self::assigned_local_fn(arg),
+                    ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
+                        Res::Def(DefKind::Fn | DefKind::AssocFn, did) => did.as_local(),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+
+            fn field_slot(
+                &self,
+                base: &'tcx rustc_hir::Expr<'tcx>,
+                field_name: rustc_span::Symbol,
+            ) -> Option<(LocalDefId, FieldIdx)> {
+                let typeck = self.tcx.typeck(base.hir_id.owner);
+                let mut base_ty = typeck.expr_ty_adjusted(base);
+                while let ty::TyKind::Ref(_, inner, _) = base_ty.kind() {
+                    base_ty = *inner;
+                }
+                let ty::TyKind::Adt(adt_def, _) = base_ty.kind() else { return None };
+                if !adt_def.is_struct() {
+                    return None;
+                }
+                let struct_did = adt_def.did().as_local()?;
+                self.field_slot_for_struct(struct_did, field_name)
+            }
+
+            fn field_slot_for_struct(
+                &self,
+                struct_did: LocalDefId,
+                field_name: rustc_span::Symbol,
+            ) -> Option<(LocalDefId, FieldIdx)> {
+                let adt_def = self.tcx.adt_def(struct_did);
+                let field_idx = adt_def
+                    .all_fields()
+                    .position(|field| field.name == field_name)
+                    .map(FieldIdx::from_usize)?;
+                Some((struct_did, field_idx))
+            }
+
+            fn record_candidate(
+                &mut self,
+                field_slot: (LocalDefId, FieldIdx),
+                rhs: &'tcx rustc_hir::Expr<'tcx>,
+            ) {
+                let Some(fn_did) = Self::assigned_local_fn(rhs) else { return };
+                let Some(rep) = self.fn_to_group.get(&fn_did) else { return };
+                let Some(decs) = self.group_decisions.get(rep) else { return };
+                self.groups.entry(field_slot).or_default().insert(*rep);
+                self.candidates
+                    .entry(field_slot)
+                    .or_default()
+                    .push(decs.clone());
+            }
+        }
+
+        impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for DirectFieldFnAssignmentVisitor<'_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) -> Self::Result {
+                if let rustc_hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                    && let rustc_hir::ExprKind::Field(base, field_ident) = lhs.kind
+                    && let Some(field_slot) = self.field_slot(base, field_ident.name)
+                {
+                    self.record_candidate(field_slot, rhs);
+                }
+                if let rustc_hir::ExprKind::Struct(qpath, fields, _) = expr.kind
+                    && let rustc_hir::QPath::Resolved(_, path) = qpath
+                    && let rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Struct, did) = path.res
+                    && let Some(struct_did) = did.as_local()
+                {
+                    for field in fields {
+                        if let Some(field_slot) =
+                            self.field_slot_for_struct(struct_did, field.ident.name)
+                        {
+                            self.record_candidate(field_slot, field.expr);
+                        }
+                    }
+                }
+                rustc_hir::intravisit::walk_expr(self, expr);
+            }
+        }
+
+        for &fn_did in rust_program.functions.iter() {
+            let mut visitor = DirectFieldFnAssignmentVisitor {
+                tcx,
+                fn_to_group: &fn_ptr_groups.fn_to_group,
+                group_decisions: effective_group_decisions,
+                candidates: &mut field_dec_candidates,
+                groups: &mut field_groups,
+            };
+            visitor.visit_body(tcx.hir_body_owned_by(fn_did));
+        }
+        for maybe_owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else {
+                continue;
+            };
+            let rustc_hir::OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            let rustc_hir::ItemKind::Static(_, _, _, body_id) = item.kind else {
+                continue;
+            };
+            let mut visitor = DirectFieldFnAssignmentVisitor {
+                tcx,
+                fn_to_group: &fn_ptr_groups.fn_to_group,
+                group_decisions: effective_group_decisions,
+                candidates: &mut field_dec_candidates,
+                groups: &mut field_groups,
+            };
+            visitor.visit_body(tcx.hir_body(body_id));
+        }
+
         let mut field_decisions: FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>> =
             FxHashMap::default();
         for ((struct_did, fi), candidates) in field_dec_candidates {
@@ -238,6 +337,8 @@ impl FnPtrRewriteDecision {
         // --- Step 3c+3d: build annotation_decisions ---
         let mut annotation_decisions: FxHashMap<HirId, Vec<Option<PtrKind>>> = FxHashMap::default();
 
+        let mut annotation_groups: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+
         // 3c: type aliases
         for &struct_did in rust_program.structs.iter() {
             let hir_item = rust_program.tcx.hir_expect_item(struct_did);
@@ -259,6 +360,8 @@ impl FnPtrRewriteDecision {
                 annotation_decisions
                     .entry(alias_hir_id)
                     .or_insert_with(|| decs.clone());
+                annotation_groups.entry(alias_hir_id).or_default()
+                    .extend(field_groups[&(struct_did, fi)].iter().copied());
             }
         }
 
@@ -271,7 +374,53 @@ impl FnPtrRewriteDecision {
                     && let Some(decs) = loc_decisions.get(&loc)
                 {
                     annotation_decisions.insert(*hir_id, decs.clone());
+                    annotation_groups.entry(*hir_id).or_default()
+                        .extend(loc_groups[&loc].iter().copied());
                 }
+            }
+        }
+
+        // a named callback alias can be used directly as a parameter type,
+        // without first appearing in a struct field. Propagate the parameter's
+        // points-to decision back to that alias so its definition stays in sync
+        // with rewritten functions and explicit casts.
+        for &fn_did in rust_program.functions.iter() {
+            let hir_item = rust_program.tcx.hir_expect_item(fn_did);
+            let rustc_hir::ItemKind::Fn { sig, body, .. } = hir_item.kind else {
+                continue;
+            };
+            let body = rust_program.tcx.hir_body(body);
+            for (input_ty, param) in sig.decl.inputs.iter().zip(body.params) {
+                let rustc_hir::PatKind::Binding(_, binding_hir_id, _, _) = param.pat.kind else {
+                    continue;
+                };
+                let Some(decs) = annotation_decisions.get(&binding_hir_id).cloned() else {
+                    continue;
+                };
+                let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(None, path)) = input_ty.kind
+                else {
+                    continue;
+                };
+                let rustc_hir::def::Res::Def(rustc_hir::def::DefKind::TyAlias, def_id) = path.res
+                else {
+                    continue;
+                };
+                let Some(alias_did) = def_id.as_local() else {
+                    continue;
+                };
+                let alias_hir_id = rust_program.tcx.local_def_id_to_hir_id(alias_did);
+                let groups = annotation_groups.get(&binding_hir_id).cloned().unwrap_or_default();
+                annotation_groups.entry(alias_hir_id).or_default().extend(groups);
+                annotation_decisions
+                    .entry(alias_hir_id)
+                    .and_modify(|existing| {
+                        for (old, new) in existing.iter_mut().zip(&decs) {
+                            if *old != *new {
+                                *old = None;
+                            }
+                        }
+                    })
+                    .or_insert(decs);
             }
         }
 
@@ -289,13 +438,16 @@ impl FnPtrRewriteDecision {
             };
             let hir_id = rust_program.tcx.local_def_id_to_hir_id(static_did);
             annotation_decisions.insert(hir_id, decs.clone());
+            annotation_groups.entry(hir_id).or_default()
+                .extend(loc_groups[&base_loc].iter().copied());
         }
 
         FnPtrRewriteDecision {
             direct_rewrite,
             needs_wrapper,
-            individual_decisions,
             annotation_decisions,
+            annotation_groups,
+            field_groups,
             field_decisions,
         }
     }

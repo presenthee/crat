@@ -1,6 +1,12 @@
 use points_to::andersen;
-use rustc_hash::FxHashMap;
-use rustc_hir::def_id::LocalDefId;
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    ExprKind, QPath,
+    def::{DefKind, Res},
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
+use rustc_middle::{mir, ty};
 
 use crate::{
     rewriter::{
@@ -67,6 +73,67 @@ impl FnPtrGroups {
             }
         }
 
+        // Points-to locations do not always connect callbacks that meet only
+        // through heap fields, comparisons, or static initializer tables. An
+        // explicit cast still states the common ABI directly. Group local
+        // functions cast to the same original fn-ptr type so their rewritten
+        // signatures cannot diverge from that shared annotation.
+        struct ExplicitCastGroupCollector<'tcx> {
+            tcx: rustc_middle::ty::TyCtxt<'tcx>,
+            by_type: FxHashMap<ty::Ty<'tcx>, Vec<LocalDefId>>,
+        }
+
+        impl<'tcx> Visitor<'tcx> for ExplicitCastGroupCollector<'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) -> Self::Result {
+                if let ExprKind::Cast(inner, _) = expr.kind
+                    && let ExprKind::Path(QPath::Resolved(_, path)) = inner.kind
+                    && let Res::Def(DefKind::Fn | DefKind::AssocFn, did) = path.res
+                    && let Some(local_did) = did.as_local()
+                {
+                    let typeck = self.tcx.typeck(expr.hir_id.owner);
+                    let fn_ptr_ty = typeck.expr_ty_adjusted(expr);
+                    if matches!(fn_ptr_ty.kind(), ty::TyKind::FnPtr(..)) {
+                        let functions = self.by_type.entry(fn_ptr_ty).or_default();
+                        if !functions.contains(&local_did) {
+                            functions.push(local_did);
+                        }
+                    }
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let mut cast_groups = ExplicitCastGroupCollector {
+            tcx: rust_program.tcx,
+            by_type: FxHashMap::default(),
+        };
+        for &did in rust_program.functions.iter() {
+            cast_groups.visit_body(rust_program.tcx.hir_body_owned_by(did));
+        }
+        for maybe_owner in rust_program.tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else {
+                continue;
+            };
+            let rustc_hir::OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            let rustc_hir::ItemKind::Static(_, _, _, body_id) = item.kind else {
+                continue;
+            };
+            cast_groups.visit_body(rust_program.tcx.hir_body(body_id));
+        }
+        for functions in cast_groups.by_type.values() {
+            let indices: Vec<_> = functions
+                .iter()
+                .filter_map(|did| did_to_idx.get(did).copied())
+                .collect();
+            if let Some((&first, rest)) = indices.split_first() {
+                for &other in rest {
+                    uf.union(first, other);
+                }
+            }
+        }
+
         let mut fn_to_group: FxHashMap<LocalDefId, LocalDefId> = FxHashMap::default();
         for &did in &participants {
             let idx = did_to_idx[&did];
@@ -128,6 +195,113 @@ impl FnPtrGroups {
                 .collect();
 
             group_decisions.insert(*rep, joint_inputs);
+        }
+
+        let raw_pointer_slots =
+            crate::rewriter::collect_raw_pointer_slot_bindings(rust_program);
+        for (&did, &rep) in &fn_to_group {
+            let body = rust_program.tcx.hir_body_owned_by(did);
+            for (idx, param) in body.params.iter().enumerate() {
+                if let rustc_hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind
+                    && raw_pointer_slots.contains(&hir_id)
+                {
+                    group_decisions.get_mut(&rep).unwrap()[idx] = None;
+                }
+            }
+        }
+
+        // External callees keep their declared callback types. Constrain the
+        // shared group so definitions and every annotation retain that ABI.
+        let tcx = rust_program.tcx;
+        for &caller in &rust_program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+            for block in body.basic_blocks.iter() {
+                let mir::TerminatorKind::Call { func, args, .. } = &block.terminator().kind
+                else {
+                    continue;
+                };
+                let callee_ty = func.ty(&body.local_decls, tcx);
+                let ty::TyKind::FnDef(callee, _) = callee_ty.kind() else { continue };
+                if callee.as_local().is_some_and(|did| fn_set.contains_key(&did)) {
+                    continue;
+                }
+                // A generic parameter instantiated with a callback does not
+                // impose a fixed callback signature (for example, Option::unwrap).
+                let sig = tcx.fn_sig(*callee).skip_binder();
+                for (arg, &input_ty) in args.iter().zip(sig.inputs().skip_binder()) {
+                    let callback_ty = match input_ty.kind() {
+                        ty::TyKind::Adt(adt, generics) if utils::ir::is_option(adt.did(), tcx) => {
+                            generics.type_at(0)
+                        }
+                        _ => input_ty,
+                    };
+                    if !matches!(callback_ty.kind(), ty::TyKind::FnPtr(..)) {
+                        continue;
+                    }
+                    let Some(place) = arg.node.place() else { continue };
+                    let Some(&loc) = pre.vars.get(&andersen::Var::Local(caller, place.local))
+                    else {
+                        continue;
+                    };
+                    for target in solutions[loc].iter() {
+                        if let Some(rep) =
+                            pre.inv_fns.get(&target).and_then(|did| fn_to_group.get(did))
+                        {
+                            group_decisions.get_mut(rep).unwrap().fill(None);
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Step 3: call-site alias check (Andersen overlap) ---
+
+        // forced_raw[rep][i] means: position i in this group's decisions must be None (raw pointer).
+        let mut forced_raw: FxHashMap<LocalDefId, FxHashSet<usize>> = FxHashMap::default();
+
+        for (caller, bb_to_slot) in &pre.indirect_calls {
+            let Some(bb_to_args) = pre.indirect_call_args.get(caller) else { continue };
+            for (bb, &slot_loc) in bb_to_slot {
+                let Some(arg_locs) = bb_to_args.get(bb) else { continue };
+
+                let reps: FxHashSet<LocalDefId> = solutions[slot_loc]
+                    .iter()
+                    .filter_map(|loc| pre.inv_fns.get(&loc))
+                    .filter_map(|did| fn_to_group.get(did))
+                    .copied()
+                    .collect();
+
+                if reps.is_empty() {
+                    continue;
+                }
+
+                for i in 0..arg_locs.len() {
+                    for j in 0..i {
+                        let (Some(loc_i), Some(loc_j)) = (arg_locs[i], arg_locs[j]) else {
+                            continue;
+                        };
+                        let mut sol = solutions[loc_i].clone();
+                        sol.intersect(&solutions[loc_j]);
+                        if !sol.is_empty() {
+                            for &rep in &reps {
+                                let positions = forced_raw.entry(rep).or_default();
+                                positions.insert(i);
+                                positions.insert(j);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (rep, decisions) in &mut group_decisions {
+            if let Some(positions) = forced_raw.get(rep) {
+                for (i, decision) in decisions.iter_mut().enumerate() {
+                    if positions.contains(&i) {
+                        *decision = None;
+                    }
+                }
+            }
         }
 
         FnPtrGroups {
@@ -438,6 +612,162 @@ pub unsafe fn make_holder() -> Holder {
         assert!(
             rewritten.contains("cb: unsafe fn(&i32)"),
             "expected Holder.cb annotation rewritten to unsafe fn(&i32), got:\n{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+    }
+
+    #[test]
+    fn optional_struct_fn_ptr_field_annotation_is_rewritten() {
+        let code = r#"
+pub unsafe fn f(p: *const i32) -> i32 { *p }
+pub struct Holder {
+    cb: Option<unsafe fn(*const i32) -> i32>,
+}
+pub unsafe fn make_holder() -> Holder {
+    Holder { cb: Some(f as unsafe fn(*const i32) -> i32) }
+}
+"#;
+        let rewritten = rewrite(code);
+        assert!(
+            rewritten.contains("cb: Option<unsafe fn(&i32)"),
+            "expected the wrapped Holder.cb annotation to be rewritten:\n{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+    }
+
+    #[test]
+    fn aliased_optional_struct_fn_ptr_field_annotation_is_rewritten() {
+        let code = r#"
+pub type Callback = Option<unsafe fn(*const i32) -> i32>;
+pub struct Holder {
+    cb: Callback,
+}
+pub unsafe fn f(p: *const i32) -> i32 { *p }
+pub unsafe fn initialize(holder: *mut Holder) {
+    (*holder).cb = Some(f as unsafe fn(*const i32) -> i32);
+}
+"#;
+        let rewritten = rewrite(code);
+        assert!(
+            rewritten.contains("type Callback = Option<unsafe fn(&i32)"),
+            "expected the wrapped fn-ptr type alias to be rewritten:\n{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+    }
+
+    #[test]
+    fn functions_cast_to_same_callback_type_keep_a_common_signature() {
+        let code = r#"
+pub type Callback = Option<unsafe fn(*const i32) -> i32>;
+pub struct Holder {
+    cb: Callback,
+}
+pub unsafe fn nullable(p: *const i32) -> i32 {
+    if p.is_null() { 0 } else { *p }
+}
+pub unsafe fn nonnull(p: *const i32) -> i32 { *p }
+pub unsafe fn initialize(holder: *mut Holder, choose: bool) {
+    (*holder).cb = if choose {
+        Some(nullable as unsafe fn(*const i32) -> i32)
+    } else {
+        Some(nonnull as unsafe fn(*const i32) -> i32)
+    };
+}
+"#;
+        let rewritten = rewrite(code);
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+        assert!(
+            rewritten.contains("fn nullable(p: *const i32)")
+                && rewritten.contains("fn nonnull(p: *const i32)"),
+            "incompatible individual decisions must conservatively share the raw callback ABI:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    fn optional_fn_ptr_parameter_annotation_is_rewritten() {
+        let code = r#"
+pub unsafe fn f(p: *const i32) -> i32 { *p }
+pub unsafe fn call_it(cb: Option<unsafe fn(*const i32) -> i32>, p: *const i32) -> i32 {
+    cb.unwrap()(p)
+}
+pub unsafe fn use_it(p: *const i32) -> i32 {
+    call_it(Some(f as unsafe fn(*const i32) -> i32), p)
+}
+"#;
+        let rewritten = rewrite(code);
+        assert!(
+            rewritten.contains("cb: Option<unsafe fn(&i32)"),
+            "expected the wrapped callback parameter annotation to be rewritten:\n{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+    }
+
+    #[test]
+    fn callback_alias_used_as_parameter_is_rewritten() {
+        let code = r#"
+pub type Comparator = Option<unsafe extern "C" fn(*const i32, *const i32) -> i32>;
+pub unsafe extern "C" fn compare(a: *const i32, b: *const i32) -> i32 { *a - *b }
+pub unsafe extern "C" fn sort(cmp: Comparator, a: *const i32, b: *const i32) -> i32 {
+    cmp.unwrap()(a, b)
+}
+pub unsafe fn use_sort(a: *const i32, b: *const i32) -> i32 {
+    sort(Some(compare as unsafe extern "C" fn(*const i32, *const i32) -> i32), a, b)
+}
+"#;
+        let rewritten = rewrite(code);
+        assert!(
+            rewritten.contains("type Comparator = Option<unsafe extern \"C\" fn(&i32, &i32)"),
+            "expected a callback alias used by a parameter to be rewritten:\n{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+    }
+
+    #[test]
+    fn static_initializer_alone_marks_explicitly_cast_function_as_fn_ptr() {
+        let code = r#"
+pub unsafe extern "C" fn f(p: *const i32) -> i32 { *p }
+pub struct Holder {
+    cb: unsafe extern "C" fn(*const i32) -> i32,
+}
+pub static HOLDER: Holder = Holder {
+    cb: f as unsafe extern "C" fn(*const i32) -> i32,
+};
+"#;
+        let rewritten = rewrite(code);
+        assert!(
+            rewritten.contains("pub unsafe extern \"C\" fn f(p: &i32)"),
+            "expected the function stored in a static to participate in fn-ptr rewriting:\n{rewritten}"
+        );
+        assert!(
+            rewritten.contains("cb: unsafe extern \"C\" fn(&i32)"),
+            "expected the static's fn-ptr annotation to match the rewritten function:\n{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+    }
+
+    #[test]
+    fn static_struct_literal_propagates_to_wrapped_callback_alias() {
+        let code = r#"
+pub type Callback = Option<unsafe fn(*const i32) -> i32>;
+pub struct Holder {
+    cb: Callback,
+}
+pub unsafe fn f(p: *const i32) -> i32 { *p }
+pub static HOLDERS: [Holder; 1] = [Holder {
+    cb: Some(f as unsafe fn(*const i32) -> i32),
+}];
+"#;
+        let rewritten = rewrite(code);
+        assert!(
+            rewritten.contains("type Callback = Option<unsafe fn(&i32)"),
+            "expected the callback alias used by a static struct literal to be rewritten:\n{rewritten}"
         );
         ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
             .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));

@@ -3,7 +3,7 @@ use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
         Const, ConstOperand, ConstValue, Operand, Place, RETURN_PLACE, Rvalue, Statement,
-        StatementKind, Terminator, TerminatorKind,
+        StatementKind, Terminator, TerminatorKind, VarDebugInfoContents,
         interpret::{GlobalAlloc, Scalar},
     },
     ty::{TyCtxt, TyKind},
@@ -12,7 +12,7 @@ use rustc_span::def_id::LocalDefId;
 
 type StaticSources = Vec<FxHashSet<LocalDefId>>;
 
-pub(crate) fn statics_returned_by_non_raw_address(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
+pub(crate) fn statics_with_escaping_non_raw_addresses(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
     let mut result = FxHashSet::default();
 
     for def_id in tcx.hir_body_owners() {
@@ -21,10 +21,6 @@ pub(crate) fn statics_returned_by_non_raw_address(tcx: TyCtxt<'_>) -> FxHashSet<
         }
 
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
-        if body.local_decls[RETURN_PLACE].ty.is_raw_ptr() {
-            continue;
-        }
-
         let mut state = vec![FxHashSet::default(); body.local_decls.len()];
         loop {
             let mut changed = false;
@@ -39,7 +35,18 @@ pub(crate) fn statics_returned_by_non_raw_address(tcx: TyCtxt<'_>) -> FxHashSet<
             }
         }
 
-        result.extend(state[RETURN_PLACE.index()].iter().copied());
+        if !body.local_decls[RETURN_PLACE].ty.is_raw_ptr() {
+            result.extend(state[RETURN_PLACE.index()].iter().copied());
+        }
+        // Check named reference bindings while keeping temporary call-argument borrows eligible.
+        for info in &body.var_debug_info {
+            if let VarDebugInfoContents::Place(place) = &info.value
+                && let Some(local) = place.as_local()
+                && body.local_decls[local].ty.is_ref()
+            {
+                result.extend(state[local.index()].iter().copied());
+            }
+        }
     }
 
     result

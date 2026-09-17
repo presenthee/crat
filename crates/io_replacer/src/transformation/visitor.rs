@@ -159,6 +159,11 @@ impl<'tcx, 'a> TransformVisitor<'tcx, 'a, '_> {
                 pot.ty = self.type_arena.ref_(pot.ty);
                 Some(pot)
             }
+            ExprKind::AddrOf(BorrowKind::Raw, Mutability::Mut, e) => {
+                let mut pot = self.bound_expr_pot(e)?;
+                pot.ty = self.type_arena.ptr(pot.ty);
+                Some(pot)
+            }
             ExprKind::Unary(UnOp::Deref, e) => {
                 let mut pot = self.bound_expr_pot(e)?;
                 let (StreamType::Ref(ty) | StreamType::Ptr(ty)) = pot.ty else { panic!() };
@@ -182,7 +187,7 @@ impl<'tcx, 'a> TransformVisitor<'tcx, 'a, '_> {
     fn bound_expr_origins(&self, expr: &Expr) -> Option<BitSet8<Origin>> {
         match &expr.kind {
             ExprKind::Index(e, _, _)
-            | ExprKind::AddrOf(BorrowKind::Ref, Mutability::Mut, e)
+            | ExprKind::AddrOf(BorrowKind::Ref | BorrowKind::Raw, Mutability::Mut, e)
             | ExprKind::Unary(UnOp::Deref, e) => self.bound_expr_origins(e),
             ExprKind::Paren(e) => self
                 .bound_origins(expr.span)

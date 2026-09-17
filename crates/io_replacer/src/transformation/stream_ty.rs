@@ -79,7 +79,7 @@ impl<'a> TypeArena<'a> {
     }
 
     #[inline]
-    fn ptr(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
+    pub(super) fn ptr(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
         self.arena.alloc(StreamType::Ptr(ty))
     }
 
