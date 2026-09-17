@@ -64,6 +64,8 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     impl_self_lifetimes: Vec<(LocalDefId, Vec<Symbol>)>,
     ast_to_hir: AstToHir,
     fn_ptr_rewrite: FnPtrRewriteDecision,
+    callback_groups: FxHashMap<LocalDefId, Vec<LocalDefId>>,
+    callback_lifetime_names: FxHashSet<Symbol>,
     pub bytemuck: Cell<bool>,
     bytemuck_derives: RefCell<BytemuckDerivePlan>,
     bytemuck_classifier: RefCell<BytemuckTypeClassifier<'tcx>>,
@@ -120,6 +122,20 @@ impl LocalRawParamSummary {
 
 impl MutVisitor for TransformVisitor<'_, '_> {
     fn visit_crate(&mut self, krate: &mut Crate) {
+        struct LifetimeNames<'a>(&'a mut FxHashSet<Symbol>);
+        impl MutVisitor for LifetimeNames<'_> {
+            fn visit_generic_param(&mut self, param: &mut GenericParam) {
+                if matches!(param.kind, GenericParamKind::Lifetime) {
+                    self.0.insert(param.ident.name);
+                }
+                mut_visit::walk_generic_param(self, param);
+            }
+
+            fn visit_lifetime(&mut self, lifetime: &mut Lifetime) {
+                self.0.insert(lifetime.ident.name);
+            }
+        }
+        LifetimeNames(&mut self.callback_lifetime_names).visit_crate(krate);
         mut_visit::walk_crate(self, krate);
         if self.slice_cursor.get() {
             CursorProjectionSimplifier::default().visit_crate(krate);
@@ -178,9 +194,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 self.fn_ptr_rewrite.field_decisions.get(&(struct_did, fi))
                         {
                             let decs = decs.clone();
-                            if rewrite_bare_fn_inputs(bare_fn, &decs) {
-                                self.slice_cursor.set(true);
-                            }
+                            let groups =
+                                self.fn_ptr_rewrite.field_groups[&(struct_did, fi)].clone();
+                            let field_did =
+                                self.tcx.adt_def(struct_did).non_enum_variant().fields[fi].did;
+                            self.rewrite_callback_inputs(
+                                bare_fn,
+                                &decs,
+                                Some(self.tcx.type_of(field_did).skip_binder()),
+                                &groups,
+                            );
                         }
                     }
                     let lifetimes = self.ordered_struct_lifetimes(struct_did);
@@ -197,63 +220,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     .tcx
                     .mir_drops_elaborated_and_const_checked(def_id)
                     .borrow();
-                let sig_dec = self.sig_decs.data.get(&def_id).unwrap();
-                let mut input_lifetimes = sig_dec.input_lifetimes.clone();
-                let related_params = self.assignment_related_param_indices(def_id);
-                let related_lifetime = sig_dec
-                    .output_lifetime
-                    .unwrap_or_else(|| Symbol::intern("crat"));
-                if !related_params.is_empty() {
-                    for &param_index in &related_params {
-                        let pointee_has_promoted_lifetimes = mir_body
-                            .local_decls
-                            .get(rustc_middle::mir::Local::from_u32((param_index + 1) as u32))
-                            .and_then(|decl| unwrap_ptr_from_mir_ty(decl.ty))
-                            .is_some_and(|(inner_ty, _)| {
-                                !self.lifetimes_for_ty(inner_ty).is_empty()
-                            });
-                        if !pointee_has_promoted_lifetimes
-                            && let Some(input_lifetime) = input_lifetimes.get_mut(param_index)
-                        {
-                            *input_lifetime = Some(related_lifetime);
-                        }
-                    }
-                }
-                let mut input_inner_lifetimes = vec![None; sig_dec.input_decs.len()];
-                let mut used_inner_lifetimes = FxHashSet::default();
-                for (param_index, local_decl) in mir_body
-                    .local_decls
-                    .iter()
-                    .skip(1)
-                    .take(sig_dec.input_decs.len())
-                    .enumerate()
-                {
-                    let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(local_decl.ty) else {
-                        continue;
-                    };
-                    let Some(default_lifetime) = self.lifetimes_for_ty(inner_ty).first().copied()
-                    else {
-                        continue;
-                    };
-                    let lifetime = if related_params.contains(&param_index) {
-                        related_lifetime
-                    } else if used_inner_lifetimes.insert(default_lifetime) {
-                        default_lifetime
-                    } else {
-                        Symbol::intern(&format!("crat_inner_{param_index}"))
-                    };
-                    used_inner_lifetimes.insert(lifetime);
-                    input_inner_lifetimes[param_index] = Some(lifetime);
-                }
-                let return_inner_ty = mir_body
-                    .local_decls
-                    .get(rustc_middle::mir::Local::from_u32(0))
-                    .and_then(|decl| unwrap_ptr_from_mir_ty(decl.ty).map(|(inner, _)| inner));
-                let output_inner_lifetime = return_inner_ty.and_then(|inner_ty| {
-                    sig_dec
-                        .output_lifetime
-                        .or_else(|| self.lifetimes_for_ty(inner_ty).first().copied())
-                });
+                let sig_dec = self.sig_decs.data.get(&def_id).unwrap().clone();
+                let (input_lifetimes, input_inner_lifetimes, output_inner_lifetime) =
+                    self.signature_lifetimes(def_id);
 
                 if !sig_dec.signature_locked {
                     let mut planned_lifetimes = Vec::new();
@@ -424,9 +393,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                     self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
                             {
                                 let decs = decs.clone();
-                                if rewrite_bare_fn_inputs(bare_fn, &decs) {
-                                    self.slice_cursor.set(true);
-                                }
+                                let groups = self.fn_ptr_rewrite.annotation_groups[&hir_id].clone();
+                                self.rewrite_callback_inputs(
+                                    bare_fn,
+                                    &decs,
+                                    Some(local_decl.ty),
+                                    &groups,
+                                );
                             }
                             continue;
                         }
@@ -552,9 +525,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             .get(&(struct_def_id, fi))
                     {
                         let decs = decs.clone();
-                        if rewrite_bare_fn_inputs(bare_fn, &decs) {
-                            self.slice_cursor.set(true);
-                        }
+                        let groups = self.fn_ptr_rewrite.field_groups[&(struct_def_id, fi)].clone();
+                        let field_did =
+                            self.tcx.adt_def(struct_def_id).non_enum_variant().fields[fi].did;
+                        self.rewrite_callback_inputs(
+                            bare_fn,
+                            &decs,
+                            Some(self.tcx.type_of(field_did).skip_binder()),
+                            &groups,
+                        );
                     }
                 }
             }
@@ -565,9 +544,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let decs = decs.clone();
                     if let Some(ty) = &mut ty_alias.ty
                         && let Some(bare_fn) = find_bare_fn_in_ty_mut(ty)
-                        && rewrite_bare_fn_inputs(bare_fn, &decs)
                     {
-                        self.slice_cursor.set(true);
+                        let groups = self.fn_ptr_rewrite.annotation_groups[&alias_hir_id].clone();
+                        self.rewrite_callback_inputs(
+                            bare_fn,
+                            &decs,
+                            Some(self.tcx.type_of(alias_def_id).skip_binder()),
+                            &groups,
+                        );
                     }
                 }
                 let lifetimes = self.lifetimes_for_ty(self.tcx.type_of(alias_def_id).skip_binder());
@@ -586,9 +570,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&static_hir_id)
                 {
                     let decs = decs.clone();
-                    if rewrite_bare_fn_inputs(bare_fn, &decs) {
-                        self.slice_cursor.set(true);
-                    }
+                    let groups = self.fn_ptr_rewrite.annotation_groups[&static_hir_id].clone();
+                    self.rewrite_callback_inputs(
+                        bare_fn,
+                        &decs,
+                        Some(self.tcx.type_of(static_def_id).skip_binder()),
+                        &groups,
+                    );
                 }
             }
             _ => {}
@@ -693,6 +681,18 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 
     fn visit_local(&mut self, local: &mut Local) {
+        // Handle fn-ptr typed locals: rewrite BareFn type annotations
+        if let Some(ty) = &mut local.ty
+            && let Some(bare_fn) = find_bare_fn_in_ty_mut(ty)
+            && let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+            && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+            && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
+        {
+            let decs = decs.clone();
+            let groups = self.fn_ptr_rewrite.annotation_groups[&hir_id].clone();
+            let callback_ty = self.tcx.typeck(hir_id.owner).pat_ty(let_stmt.pat);
+            self.rewrite_callback_inputs(bare_fn, &decs, Some(callback_ty), &groups);
+        }
         mut_visit::walk_local(self, local);
 
         if let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
@@ -814,22 +814,37 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
             }
         }
-
-        // Handle fn-ptr typed locals: rewrite BareFn type annotations
-        if let Some(ty) = &mut local.ty
-            && let TyKind::BareFn(bare_fn) = &mut ty.kind
-            && let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
-            && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
-            && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
-        {
-            let decs = decs.clone();
-            if rewrite_bare_fn_inputs(bare_fn, &decs) {
-                self.slice_cursor.set(true);
-            }
-        }
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
+        match &mut expr.kind {
+            ExprKind::Cast(_, cast_ty) => {
+                if let TyKind::BareFn(bare_fn) = &mut cast_ty.kind
+                    && let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+                    && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind
+                {
+                    let inner = utils::hir::unwrap_drop_temps(hir_inner);
+                    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = inner.kind
+                        && let hir::def::Res::Def(_, def_id) = path.res
+                        && let Some(local_did) = def_id.as_local()
+                        && self.fn_ptr_rewrite.direct_rewrite.contains(&local_did)
+                        && let Some(sig_dec) = self.sig_decs.data.get(&local_did)
+                    {
+                        let decs = sig_dec.input_decs.clone();
+                        let groups = self
+                            .callback_groups
+                            .iter()
+                            .filter_map(|(&group, members)| {
+                                members.contains(&local_did).then_some(group)
+                            })
+                            .collect();
+                        let callback_ty = self.tcx.typeck(hir_expr.hir_id.owner).expr_ty(hir_expr);
+                        self.rewrite_callback_inputs(bare_fn, &decs, Some(callback_ty), &groups);
+                    }
+                }
+            }
+            _ => {}
+        }
         mut_visit::walk_expr(self, expr);
         let expr_id = expr.id;
 
@@ -1434,42 +1449,21 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 }
             }
-            ExprKind::Cast(_, cast_ty) => {
-                if let TyKind::BareFn(bare_fn) = &mut cast_ty.kind
-                    && let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
-                    && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind
-                {
-                    let inner = utils::hir::unwrap_drop_temps(hir_inner);
-                    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = inner.kind
-                        && let hir::def::Res::Def(_, def_id) = path.res
-                        && let Some(local_did) = def_id.as_local()
-                        && self.fn_ptr_rewrite.direct_rewrite.contains(&local_did)
-                        && let Some(sig_dec) = self.sig_decs.data.get(&local_did)
-                    {
-                        let decs = sig_dec.input_decs.clone();
-                        let mut used_slice_cursor = rewrite_bare_fn_inputs(bare_fn, &decs);
-                        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
-                        if let ty::TyKind::FnPtr(fn_sig, _) = typeck.expr_ty(hir_expr).kind() {
-                            used_slice_cursor |= rewrite_aliased_bare_fn_inputs(
-                                bare_fn,
-                                &decs,
-                                fn_sig.inputs().skip_binder(),
-                                self.tcx,
-                            );
-                        }
-                        if used_slice_cursor {
-                            self.slice_cursor.set(true);
-                        }
-                    }
-                }
-            }
+
             _ => {}
         }
     }
 
     fn visit_ty(&mut self, ty: &mut Ty) {
-        mut_visit::walk_ty(self, ty);
-        self.add_struct_lifetime_args_to_ty(ty);
+        if let TyKind::BareFn(bare_fn) = &mut ty.kind {
+            self.rewrite_callback_inputs(bare_fn, &[], None, &FxHashSet::default());
+            let enclosing = std::mem::take(&mut self.impl_self_lifetimes);
+            mut_visit::walk_ty(self, ty);
+            self.impl_self_lifetimes = enclosing;
+        } else {
+            mut_visit::walk_ty(self, ty);
+            self.add_struct_lifetime_args_to_ty(ty);
+        }
     }
 }
 
@@ -2222,6 +2216,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let borrowed_raw_params =
             collect_borrowed_raw_params(rust_program.tcx, &initial_sig_decs, &sig_decs);
 
+        let mut callback_groups: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        for (&did, &group) in &fn_ptr_groups.fn_to_group {
+            callback_groups.entry(group).or_default().push(did);
+        }
         let mut visitor = TransformVisitor {
             tcx: rust_program.tcx,
             analysis,
@@ -2242,6 +2240,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             impl_self_lifetimes: Vec::new(),
             ast_to_hir,
             fn_ptr_rewrite,
+            callback_groups,
+            callback_lifetime_names: FxHashSet::default(),
             bytemuck: Cell::new(false),
             bytemuck_derives: RefCell::new(BytemuckDerivePlan::default()),
             bytemuck_classifier: RefCell::new(BytemuckTypeClassifier::new(rust_program.tcx)),
@@ -3096,6 +3096,245 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             })
     }
 
+    fn rewrite_callback_inputs(
+        &mut self,
+        bare_fn: &mut BareFnTy,
+        decisions: &[Option<PtrKind>],
+        callback_ty: Option<ty::Ty<'tcx>>,
+        groups: &FxHashSet<LocalDefId>,
+    ) {
+        let callback_ty = callback_ty.map(|ty| match ty.kind() {
+            ty::TyKind::Adt(adt, args) if is_option(adt.did(), self.tcx) => args.type_at(0),
+            _ => ty,
+        });
+        let input_tys = callback_ty.and_then(|ty| match ty.kind() {
+            ty::TyKind::FnPtr(sig, _) => Some(sig.inputs().skip_binder()),
+            _ => None,
+        });
+        // Each input has an outer borrow slot and an inner struct slot. Merge
+        // only equalities required by actual functions in this callback group.
+        let n = bare_fn.decl.inputs.len();
+        let mut classes: Vec<_> = (0..2 * n).collect();
+        let mut outer_lifetimes = vec![false; n];
+        for group in groups {
+            for &did in &self.callback_groups[group] {
+                let (outer, inner, _) = self.signature_lifetimes(did);
+                let mut first = FxHashMap::default();
+                for (i, (outer, inner)) in outer.into_iter().zip(inner).take(n).enumerate() {
+                    outer_lifetimes[i] |= outer.is_some();
+                    for (slot, lifetime) in [(2 * i, outer), (2 * i + 1, inner)] {
+                        let Some(lifetime) = lifetime else { continue };
+                        if let Some(&previous) = first.get(&lifetime) {
+                            let from = classes[slot];
+                            let to = classes[previous];
+                            for class in &mut classes {
+                                if *class == from {
+                                    *class = to;
+                                }
+                            }
+                        } else {
+                            first.insert(lifetime, slot);
+                        }
+                    }
+                }
+            }
+        }
+        let mut names = FxHashMap::default();
+        for &class in &classes {
+            names.entry(class).or_insert_with(|| {
+                let mut index = self.callback_lifetime_names.len();
+                loop {
+                    let name = Symbol::intern(&format!("'crat_cb_{index}"));
+                    if self.callback_lifetime_names.insert(name) {
+                        break Symbol::intern(name.as_str().trim_start_matches('\''));
+                    }
+                    index += 1;
+                }
+            });
+        }
+        struct InnerLifetimes<'a, 'b, 'tcx> {
+            transform: &'a TransformVisitor<'b, 'tcx>,
+            lifetime: Symbol,
+            changed: bool,
+        }
+        impl MutVisitor for InnerLifetimes<'_, '_, '_> {
+            fn visit_ty(&mut self, ty: &mut Ty) {
+                // A nested callback owns its own lifetime binders.
+                if matches!(ty.kind, TyKind::BareFn(..)) {
+                    return;
+                }
+                // Rewrite generic arguments before replacing this path discards
+                // their original AST/HIR mapping.
+                mut_visit::walk_ty(self, ty);
+                if let Some((did, lifetimes)) = self.transform.struct_lifetimes_for_ty(ty) {
+                    let args = vec![format!("'{}", self.lifetime); lifetimes.len()];
+                    self.transform
+                        .add_struct_lifetime_args_to_ty_with_args(ty, did, &lifetimes, &args);
+                    self.changed = true;
+                }
+            }
+        }
+        let mut used = FxHashSet::default();
+        let mut pointees = vec![None; n];
+        for (i, param) in bare_fn.decl.inputs.iter_mut().enumerate() {
+            let lifetime = names[&classes[2 * i + 1]];
+            let mut visitor = InnerLifetimes {
+                transform: self,
+                lifetime,
+                changed: false,
+            };
+            visitor.visit_ty(&mut param.ty);
+            if visitor.changed {
+                used.insert(lifetime);
+            }
+            if let Some(input_ty) = input_tys.and_then(|inputs| inputs.get(i))
+                && let ty::TyKind::RawPtr(inner, _) = input_ty.kind()
+                && !matches!(param.ty.kind, TyKind::Ptr(..))
+                && decisions.get(i).copied().flatten().is_some()
+                && !self.signature_pointee_lifetimes(*inner).is_empty()
+            {
+                pointees[i] = Some(self.ty_name_with_lifetime(*inner, Some(lifetime)));
+                used.insert(lifetime);
+            }
+        }
+        if let Some(input_tys) = input_tys
+            && rewrite_aliased_bare_fn_inputs(bare_fn, decisions, input_tys, self.tcx, &pointees)
+        {
+            self.slice_cursor.set(true);
+        }
+        if rewrite_bare_fn_inputs(bare_fn, decisions) {
+            self.slice_cursor.set(true);
+        }
+        if used.is_empty() {
+            return;
+        }
+        for (i, param) in bare_fn.decl.inputs.iter_mut().enumerate() {
+            if !outer_lifetimes[i] {
+                continue;
+            }
+            let lifetime = names[&classes[2 * i]];
+            struct BorrowLifetime(Symbol, bool);
+            impl MutVisitor for BorrowLifetime {
+                fn visit_ty(&mut self, ty: &mut Ty) {
+                    match &mut ty.kind {
+                        TyKind::Ref(lifetime, _) => {
+                            if lifetime.is_none() {
+                                let TyKind::Ref(new, _) = utils::ty!("&'{} ()", self.0).kind else {
+                                    unreachable!()
+                                };
+                                *lifetime = new;
+                                self.1 = true;
+                            }
+                        }
+                        TyKind::BareFn(..) | TyKind::Ptr(..) => {}
+                        _ => mut_visit::walk_ty(self, ty),
+                    }
+                }
+            }
+            let mut visitor = BorrowLifetime(lifetime, false);
+            visitor.visit_ty(&mut param.ty);
+            if visitor.1 {
+                used.insert(lifetime);
+            }
+        }
+        let mut lifetimes: Vec<_> = used.into_iter().collect();
+        lifetimes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let binders = lifetimes
+            .iter()
+            .map(|name| format!("'{name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let TyKind::BareFn(generated) = utils::ty!("for<{binders}> fn()").kind else {
+            unreachable!()
+        };
+        bare_fn.generic_params.extend(generated.generic_params);
+    }
+
+    fn signature_lifetimes(
+        &self,
+        def_id: LocalDefId,
+    ) -> (Vec<Option<Symbol>>, Vec<Option<Symbol>>, Option<Symbol>) {
+        let sig_dec = &self.sig_decs.data[&def_id];
+        let mir_body = self
+            .tcx
+            .mir_drops_elaborated_and_const_checked(def_id)
+            .borrow();
+        let mut input_lifetimes = sig_dec.input_lifetimes.clone();
+        let related_params = self.assignment_related_param_indices(def_id);
+        let related_lifetime = sig_dec
+            .output_lifetime
+            .unwrap_or_else(|| Symbol::intern("crat"));
+        if !related_params.is_empty() {
+            for &param_index in &related_params {
+                let pointee_has_promoted_lifetimes = mir_body
+                    .local_decls
+                    .get(rustc_middle::mir::Local::from_u32((param_index + 1) as u32))
+                    .and_then(|decl| unwrap_ptr_from_mir_ty(decl.ty))
+                    .is_some_and(|(inner_ty, _)| {
+                        !self.signature_pointee_lifetimes(inner_ty).is_empty()
+                    });
+                if !pointee_has_promoted_lifetimes
+                    && let Some(input_lifetime) = input_lifetimes.get_mut(param_index)
+                {
+                    *input_lifetime = Some(related_lifetime);
+                }
+            }
+        }
+        let mut input_inner_lifetimes = vec![None; sig_dec.input_decs.len()];
+        let mut used_inner_lifetimes: FxHashSet<_> = sig_dec.output_lifetime.into_iter().collect();
+        for (param_index, local_decl) in mir_body
+            .local_decls
+            .iter()
+            .skip(1)
+            .take(sig_dec.input_decs.len())
+            .enumerate()
+        {
+            let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(local_decl.ty) else {
+                continue;
+            };
+            let Some(default_lifetime) =
+                self.signature_pointee_lifetimes(inner_ty).first().copied()
+            else {
+                continue;
+            };
+            let lifetime = if related_params.contains(&param_index)
+                || sig_dec.output_lifetime.is_some_and(|output_lifetime| {
+                    sig_dec.input_lifetimes.get(param_index).copied().flatten()
+                        == Some(output_lifetime)
+                }) {
+                related_lifetime
+            } else if used_inner_lifetimes.insert(default_lifetime) {
+                default_lifetime
+            } else {
+                Symbol::intern(&format!("crat_inner_{param_index}"))
+            };
+            used_inner_lifetimes.insert(lifetime);
+            input_inner_lifetimes[param_index] = Some(lifetime);
+        }
+        let return_inner_ty = mir_body
+            .local_decls
+            .get(rustc_middle::mir::Local::from_u32(0))
+            .and_then(|decl| unwrap_ptr_from_mir_ty(decl.ty).map(|(inner, _)| inner));
+        let output_inner_lifetime = return_inner_ty.and_then(|inner_ty| {
+            sig_dec
+                .output_lifetime
+                .or_else(|| self.signature_pointee_lifetimes(inner_ty).first().copied())
+        });
+
+        (
+            input_lifetimes,
+            input_inner_lifetimes,
+            output_inner_lifetime,
+        )
+    }
+
+    fn signature_pointee_lifetimes(&self, mut ty: ty::Ty<'tcx>) -> Vec<Symbol> {
+        while let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(ty) {
+            ty = inner_ty;
+        }
+        self.lifetimes_for_ty(ty)
+    }
+
     fn lifetimes_for_ty(&self, ty: ty::Ty<'tcx>) -> Vec<Symbol> {
         let ty::TyKind::Adt(adt_def, _) = ty.kind() else {
             return vec![];
@@ -3497,7 +3736,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn raw_bridge_expr(&self, lhs_inner_ty: ty::Ty<'tcx>, m: bool, info: &RawBridgeInfo) -> Expr {
-        let ty = self.ty_name(lhs_inner_ty);
+        let ty = self.anonymous_ty_name(lhs_inner_ty);
         let default_expr = self.default_value_expr(lhs_inner_ty);
         let default_expr_str = pprust::expr_to_string(&default_expr);
         match info {
@@ -8348,10 +8587,16 @@ fn rewrite_aliased_bare_fn_inputs<'tcx>(
     decisions: &[Option<PtrKind>],
     input_tys: &[ty::Ty<'tcx>],
     tcx: TyCtxt<'tcx>,
+    pointees: &[Option<String>],
 ) -> bool {
     let mut used_slice_cursor = false;
-    for ((param, decision), input_ty) in
-        bare_fn.decl.inputs.iter_mut().zip(decisions).zip(input_tys)
+    for (i, ((param, decision), input_ty)) in bare_fn
+        .decl
+        .inputs
+        .iter_mut()
+        .zip(decisions)
+        .zip(input_tys)
+        .enumerate()
     {
         let Some(kind) = decision else { continue };
         if matches!(param.ty.kind, TyKind::Ptr(..)) {
@@ -8360,7 +8605,10 @@ fn rewrite_aliased_bare_fn_inputs<'tcx>(
         let ty::TyKind::RawPtr(inner_ty, _) = input_ty.kind() else {
             continue;
         };
-        let inner_str = mir_ty_to_string(*inner_ty, tcx);
+        let inner_str = pointees
+            .get(i)
+            .and_then(|s| s.clone())
+            .unwrap_or_else(|| mir_ty_to_string(*inner_ty, tcx));
         let new_ty = match kind {
             PtrKind::Ref(m) => {
                 let m = if *m { "mut " } else { "" };

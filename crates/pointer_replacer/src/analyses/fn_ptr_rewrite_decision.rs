@@ -21,6 +21,9 @@ pub struct FnPtrRewriteDecision {
     pub needs_wrapper: FxHashSet<LocalDefId>,
     /// Annotation-site decisions for direct_rewrite functions only.
     pub annotation_decisions: FxHashMap<HirId, Vec<Option<PtrKind>>>,
+    /// Callback groups supplying each annotation's lifetime relationships.
+    pub annotation_groups: FxHashMap<HirId, FxHashSet<LocalDefId>>,
+    pub field_groups: FxHashMap<(LocalDefId, FieldIdx), FxHashSet<LocalDefId>>,
     /// Struct-field fn-ptr decisions for direct_rewrite functions only.
     pub field_decisions: FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
 }
@@ -41,6 +44,8 @@ impl FnPtrRewriteDecision {
                 direct_rewrite: FxHashSet::default(),
                 needs_wrapper: FxHashSet::default(),
                 annotation_decisions: FxHashMap::default(),
+                annotation_groups: FxHashMap::default(),
+                field_groups: FxHashMap::default(),
                 field_decisions: FxHashMap::default(),
             };
         }
@@ -88,6 +93,7 @@ impl FnPtrRewriteDecision {
         let mut loc_decisions: FxHashMap<andersen::Loc, Vec<Option<PtrKind>>> =
             FxHashMap::default();
 
+        let mut loc_groups: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
         for (v, pointees) in solutions.iter_enumerated() {
             let maybe_rep = pointees
                 .iter()
@@ -99,6 +105,7 @@ impl FnPtrRewriteDecision {
                 && let Some(decs) = effective_group_decisions.get(&rep)
             {
                 loc_decisions.insert(v, decs.clone());
+                loc_groups.entry(v).or_default().insert(rep);
             }
         }
 
@@ -106,7 +113,8 @@ impl FnPtrRewriteDecision {
         let mut field_dec_candidates: FxHashMap<(LocalDefId, FieldIdx), Vec<Vec<Option<PtrKind>>>> =
             FxHashMap::default();
 
-        let build_field_candidates =
+        let mut field_groups: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+        let mut build_field_candidates =
             |field_dec_candidates: &mut FxHashMap<
                 (LocalDefId, FieldIdx),
                 Vec<Vec<Option<PtrKind>>>,
@@ -124,6 +132,8 @@ impl FnPtrRewriteDecision {
                     let field_loc = base_loc + offset;
                     if let Some(decs) = loc_decisions.get(&field_loc) {
                         let fi = FieldIdx::from_usize(field_idx);
+                    field_groups.entry((struct_did, fi)).or_default()
+                        .extend(loc_groups[&field_loc].iter().copied());
                         field_dec_candidates
                             .entry((struct_did, fi))
                             .or_default()
@@ -174,6 +184,7 @@ impl FnPtrRewriteDecision {
             fn_to_group: &'a FxHashMap<LocalDefId, LocalDefId>,
             group_decisions: &'a FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
             candidates: &'a mut FxHashMap<(LocalDefId, FieldIdx), Vec<Vec<Option<PtrKind>>>>,
+            groups: &'a mut FxHashMap<(LocalDefId, FieldIdx), FxHashSet<LocalDefId>>,
         }
 
         impl<'tcx> DirectFieldFnAssignmentVisitor<'_, 'tcx> {
@@ -235,6 +246,7 @@ impl FnPtrRewriteDecision {
                 let Some(fn_did) = Self::assigned_local_fn(rhs) else { return };
                 let Some(rep) = self.fn_to_group.get(&fn_did) else { return };
                 let Some(decs) = self.group_decisions.get(rep) else { return };
+                self.groups.entry(field_slot).or_default().insert(*rep);
                 self.candidates
                     .entry(field_slot)
                     .or_default()
@@ -273,6 +285,7 @@ impl FnPtrRewriteDecision {
                 fn_to_group: &fn_ptr_groups.fn_to_group,
                 group_decisions: effective_group_decisions,
                 candidates: &mut field_dec_candidates,
+                groups: &mut field_groups,
             };
             visitor.visit_body(tcx.hir_body_owned_by(fn_did));
         }
@@ -291,6 +304,7 @@ impl FnPtrRewriteDecision {
                 fn_to_group: &fn_ptr_groups.fn_to_group,
                 group_decisions: effective_group_decisions,
                 candidates: &mut field_dec_candidates,
+                groups: &mut field_groups,
             };
             visitor.visit_body(tcx.hir_body(body_id));
         }
@@ -323,6 +337,8 @@ impl FnPtrRewriteDecision {
         // --- Step 3c+3d: build annotation_decisions ---
         let mut annotation_decisions: FxHashMap<HirId, Vec<Option<PtrKind>>> = FxHashMap::default();
 
+        let mut annotation_groups: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+
         // 3c: type aliases
         for &struct_did in rust_program.structs.iter() {
             let hir_item = rust_program.tcx.hir_expect_item(struct_did);
@@ -344,6 +360,8 @@ impl FnPtrRewriteDecision {
                 annotation_decisions
                     .entry(alias_hir_id)
                     .or_insert_with(|| decs.clone());
+                annotation_groups.entry(alias_hir_id).or_default()
+                    .extend(field_groups[&(struct_did, fi)].iter().copied());
             }
         }
 
@@ -356,6 +374,8 @@ impl FnPtrRewriteDecision {
                     && let Some(decs) = loc_decisions.get(&loc)
                 {
                     annotation_decisions.insert(*hir_id, decs.clone());
+                    annotation_groups.entry(*hir_id).or_default()
+                        .extend(loc_groups[&loc].iter().copied());
                 }
             }
         }
@@ -389,6 +409,8 @@ impl FnPtrRewriteDecision {
                     continue;
                 };
                 let alias_hir_id = rust_program.tcx.local_def_id_to_hir_id(alias_did);
+                let groups = annotation_groups.get(&binding_hir_id).cloned().unwrap_or_default();
+                annotation_groups.entry(alias_hir_id).or_default().extend(groups);
                 annotation_decisions
                     .entry(alias_hir_id)
                     .and_modify(|existing| {
@@ -416,12 +438,16 @@ impl FnPtrRewriteDecision {
             };
             let hir_id = rust_program.tcx.local_def_id_to_hir_id(static_did);
             annotation_decisions.insert(hir_id, decs.clone());
+            annotation_groups.entry(hir_id).or_default()
+                .extend(loc_groups[&base_loc].iter().copied());
         }
 
         FnPtrRewriteDecision {
             direct_rewrite,
             needs_wrapper,
             annotation_decisions,
+            annotation_groups,
+            field_groups,
             field_decisions,
         }
     }
