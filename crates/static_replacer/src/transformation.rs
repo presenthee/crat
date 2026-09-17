@@ -464,6 +464,13 @@ fn find_context<'a, 'tcx>(
                                 expr = parent;
                                 mutated = true;
                             }
+                            "offset" | "offset_from"
+                                if (method == "offset_from"
+                                    || get_static_from_hir_expr(receiver).is_some())
+                                    && tcx
+                                        .typeck(receiver.hir_id.owner)
+                                        .expr_ty(receiver)
+                                        .is_raw_ptr() => {}
                             "as_ptr" | "offset" => {
                                 expr = parent;
                             }
@@ -561,6 +568,51 @@ unsafe fn f(x: u32) { X = X + x; }
             &["thread_local", "std::cell::Cell", ".get()", ".set"],
             &["static mut"],
         );
+    }
+
+    #[test]
+    fn test_cell_raw_pointer_offset_from() {
+        for pointer_kind in ["mut", "const"] {
+            let code = format!(
+                r#"
+static mut CURSOR: *{pointer_kind} u8 = 0 as *{pointer_kind} u8;
+unsafe fn set_cursor(p: *{pointer_kind} u8) {{ CURSOR = p; }}
+unsafe fn distance(base: *{pointer_kind} u8) -> isize {{ CURSOR.offset_from(base) }}
+"#
+            );
+            run_test(
+                &code,
+                &["std::cell::Cell", "CURSOR.get().offset_from(base)", "CURSOR.set(p)"],
+                &["static mut", "RefCell"],
+            );
+        }
+    }
+
+    #[test]
+    fn test_raw_pointer_offset_reads_cell_and_refcell_values() {
+        for borrow_slot in [false, true] {
+            let slot_use = if borrow_slot {
+                "unsafe fn reset(p: *mut u32) { replace(&mut PTR, p); }
+fn replace(slot: &mut *mut u32, p: *mut u32) { *slot = p; }"
+            } else {
+                ""
+            };
+            let code = format!(
+                r#"
+static mut PTR: *mut u32 = core::ptr::null_mut();
+pub unsafe fn set(p: *mut u32) {{ PTR = p; }}
+pub unsafe fn at(n: isize) -> *mut u32 {{ PTR.offset(n) }}
+pub unsafe fn write(n: isize, value: u32) {{ *PTR.offset(n) = value; }}
+{slot_use}
+"#
+            );
+            let includes = if borrow_slot {
+                &["std::cell::RefCell", "PTR.with_borrow(", ".offset(n)"][..]
+            } else {
+                &["std::cell::Cell", "PTR.get().offset(n)"][..]
+            };
+            run_test(&code, includes, &["static mut", "PTR.offset(n)"]);
+        }
     }
 
     #[test]
