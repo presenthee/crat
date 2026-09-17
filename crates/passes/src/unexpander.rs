@@ -351,9 +351,6 @@ fn expanded_assert_condition(stmt: &Stmt) -> Option<Expr> {
     if else_expr.is_some() {
         return None;
     }
-    let ExprKind::Unary(UnOp::Not, condition) = &unwrap_paren(condition).kind else {
-        return None;
-    };
     let [panic_stmt] = then_block.stmts.as_slice() else {
         return None;
     };
@@ -381,7 +378,15 @@ fn expanded_assert_condition(stmt: &Stmt) -> Option<Expr> {
     if !lit.symbol.as_str().starts_with("assertion failed:") {
         return None;
     }
-    Some(unwrap_paren(condition).clone())
+    if let ExprKind::Unary(UnOp::Not, condition) = &unwrap_paren(condition).kind {
+        Some(unwrap_paren(condition).clone())
+    } else {
+        // Earlier passes may wrap the failure condition in a borrowing closure.
+        Some(Expr {
+            kind: ExprKind::Unary(UnOp::Not, condition.clone()),
+            ..utils::ast::dummy_expr()
+        })
+    }
 }
 
 fn unwrap_addr_of(expr: &Expr) -> &Expr {
@@ -680,6 +685,28 @@ fn f(x: i32) {
 }
             "#,
             &["assert!(x != 0);"],
+            &["panicking", "assertion failed"],
+        )
+    }
+
+    #[test]
+    fn test_assert_with_borrowed_failure_condition() {
+        run_test(
+            r#"
+#![feature(panic_internals)]
+thread_local! {
+    static VALUE: std::cell::RefCell<i32> = const { std::cell::RefCell::new(1) };
+}
+fn f() {
+    if VALUE.with_borrow_mut(|value| {
+        *value += 1;
+        *value != 2
+    }) {
+        ::core::panicking::panic("assertion failed: *value == 2")
+    };
+}
+            "#,
+            &["assert!(!VALUE.with_borrow_mut", "*value += 1;", "*value != 2"],
             &["panicking", "assertion failed"],
         )
     }
