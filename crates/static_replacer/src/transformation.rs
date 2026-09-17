@@ -83,6 +83,7 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
         cells,
         refcells,
         borrows: FxHashMap::default(),
+        static_paths: FxHashMap::default(),
     };
     visitor.visit_crate(&mut krate);
 
@@ -95,26 +96,48 @@ struct AstVisitor<'tcx> {
     immutables: FxHashSet<LocalDefId>,
     cells: FxHashSet<LocalDefId>,
     refcells: FxHashSet<LocalDefId>,
-    borrows: FxHashMap<Symbol, bool>,
+    borrows: FxHashMap<LocalDefId, StaticBorrow>,
+    static_paths: FxHashMap<HirId, String>,
+}
+
+struct StaticBorrow {
+    path: String,
+    name: String,
+    is_mut: bool,
 }
 
 impl<'tcx> AstVisitor<'tcx> {
+    fn borrow_static(&mut self, def_id: LocalDefId, hir_id: HirId, is_mut: bool) -> String {
+        let mut name = self.tcx.item_name(def_id.to_def_id()).to_string();
+        if self.borrows.values().any(|borrow| borrow.name == name) {
+            name = format!("{name}_{}", def_id.local_def_index.as_u32());
+        }
+        let borrow = self.borrows.entry(def_id).or_insert_with(|| StaticBorrow {
+            path: self.static_paths[&hir_id].clone(),
+            name,
+            is_mut: false,
+        });
+        borrow.is_mut |= is_mut;
+        borrow.name.clone()
+    }
+
     fn introduce_borrow(&mut self, expr: &mut Expr) {
-        for (x, is_mut) in self.borrows.drain() {
+        for (_, borrow) in self.borrows.drain() {
+            let StaticBorrow { path, name, is_mut } = borrow;
             let method = if is_mut {
                 "with_borrow_mut"
             } else {
                 "with_borrow"
             };
             let e = pprust::expr_to_string(expr);
-            *expr = expr!("{x}.{method}(|{x}_ref| {e})");
+            *expr = expr!("{path}.{method}(|{name}_ref| {e})");
         }
     }
 
     fn has_only_new_shared_borrows(&self, had_previous_borrows: bool) -> bool {
         !had_previous_borrows
             && !self.borrows.is_empty()
-            && self.borrows.values().all(|is_mut| !*is_mut)
+            && self.borrows.values().all(|borrow| !borrow.is_mut)
     }
 
     fn hir_expr_type_contains_ref_or_raw_ptr(&self, expr: &hir::Expr<'_>) -> bool {
@@ -171,6 +194,11 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
+        if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+            && get_static_from_hir_expr(hir_expr).is_some()
+        {
+            self.static_paths.insert(hir_expr.hir_id, pprust::expr_to_string(expr));
+        }
         let had_previous_borrows = !self.borrows.is_empty();
         mut_visit::walk_expr(self, expr);
 
@@ -178,7 +206,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
         match &mut expr.kind {
             ExprKind::Path(_, _) => {
                 if let Some(def_id) = get_static_from_hir_expr(hir_expr) {
-                    let x = self.tcx.item_name(def_id.to_def_id());
+                    let x = self.static_paths[&hir_expr.hir_id].clone();
                     if self.cells.contains(&def_id) {
                         if !find_context(hir_expr, self.tcx).1 {
                             *expr = expr!("{x}.get()");
@@ -187,7 +215,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         && let (ctx, is_mut) = find_context(hir_expr, self.tcx)
                         && matches!(ctx.kind, hir::ExprKind::Path(..))
                     {
-                        *self.borrows.entry(x).or_default() |= is_mut;
+                        let x = self.borrow_static(def_id, hir_expr.hir_id, is_mut);
                         *expr = expr!("*{x}_ref");
                     }
                 }
@@ -197,7 +225,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     panic!("{hir_expr:?}");
                 };
                 if let Some(def_id) = get_static_from_hir_expr(hir_base) {
-                    let x = self.tcx.item_name(def_id.to_def_id());
+                    let x = self.static_paths[&hir_base.hir_id].clone();
                     if self.cells.contains(&def_id) {
                         if !find_context(hir_expr, self.tcx).1 {
                             let idx = pprust::expr_to_string(idx);
@@ -205,7 +233,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         }
                     } else if self.refcells.contains(&def_id) {
                         let is_mut = find_context(hir_expr, self.tcx).1;
-                        *self.borrows.entry(x).or_default() |= is_mut;
+                        let x = self.borrow_static(def_id, hir_base.hir_id, is_mut);
                         **base = expr!("{x}_ref");
                     }
                 }
@@ -218,8 +246,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     && self.refcells.contains(&def_id)
                 {
                     let m = find_context(hir_expr, self.tcx).1;
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    *self.borrows.entry(x).or_default() |= m;
+                    let x = self.borrow_static(def_id, hir_base.hir_id, m);
                     **e = expr!("{x}_ref");
                 }
             }
@@ -228,19 +255,19 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     panic!("{hir_expr:?}");
                 };
                 if let Some(def_id) = get_static_from_hir_expr(hir_lhs) {
-                    let x = self.tcx.item_name(def_id.to_def_id());
+                    let x = self.static_paths[&hir_lhs.hir_id].clone();
                     if self.cells.contains(&def_id) {
                         let rhs = pprust::expr_to_string(rhs);
                         *expr = expr!("{x}.set({rhs})");
                     } else if self.refcells.contains(&def_id) {
-                        *self.borrows.entry(x).or_default() |= true;
+                        let x = self.borrow_static(def_id, hir_lhs.hir_id, true);
                         **lhs = expr!("*{x}_ref");
                     }
                 } else if let hir::ExprKind::Index(hir_base, _, _) = hir_lhs.kind
                     && let Some(def_id) = get_static_from_hir_expr(hir_base)
                     && self.cells.contains(&def_id)
                 {
-                    let x = self.tcx.item_name(def_id.to_def_id());
+                    let x = self.static_paths[&hir_base.hir_id].clone();
                     let rhs = pprust::expr_to_string(rhs);
                     let ExprKind::Index(_, idx, _) = &lhs.kind else { panic!("{lhs:?}") };
                     let idx = pprust::expr_to_string(idx);
@@ -264,19 +291,19 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     AssignOpKind::ShrAssign => ">>",
                 };
                 if let Some(def_id) = get_static_from_hir_expr(hir_lhs) {
-                    let x = self.tcx.item_name(def_id.to_def_id());
+                    let x = self.static_paths[&hir_lhs.hir_id].clone();
                     if self.cells.contains(&def_id) {
                         let rhs = pprust::expr_to_string(rhs);
                         *expr = expr!("{x}.set({x}.get() {op} ({rhs}))");
                     } else if self.refcells.contains(&def_id) {
-                        *self.borrows.entry(x).or_default() |= true;
+                        let x = self.borrow_static(def_id, hir_lhs.hir_id, true);
                         **lhs = expr!("*{x}_ref");
                     }
                 } else if let hir::ExprKind::Index(hir_base, _, _) = hir_lhs.kind
                     && let Some(def_id) = get_static_from_hir_expr(hir_base)
                     && self.cells.contains(&def_id)
                 {
-                    let x = self.tcx.item_name(def_id.to_def_id());
+                    let x = self.static_paths[&hir_base.hir_id].clone();
                     let rhs = pprust::expr_to_string(rhs);
                     let ExprKind::Index(_, idx, _) = &lhs.kind else { panic!("{lhs:?}") };
                     let idx = pprust::expr_to_string(idx);
@@ -295,8 +322,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                 if let Some(def_id) = get_static_from_hir_expr(hir_e)
                     && self.refcells.contains(&def_id)
                 {
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    *self.borrows.entry(x).or_default() |= mutability.is_mut();
+                    let x = self.borrow_static(def_id, hir_e.hir_id, mutability.is_mut());
                     *expr = match (kind, mutability) {
                         (BorrowKind::Ref, _) => expr!("{x}_ref"),
                         (BorrowKind::Raw, Mutability::Not) => expr!("({x}_ref as *const _)"),
@@ -318,8 +344,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         || name == "copy_from_slice"
                         || name == "fill")
                 {
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    *self.borrows.entry(x).or_default() |= true;
+                    let x = self.borrow_static(def_id, hir_receiver.hir_id, true);
                     *expr = expr!("{x}_ref.{name}()");
                 }
             }
@@ -648,6 +673,54 @@ mod outer {{
                 &["static mut"],
             );
         }
+    }
+
+    #[test]
+    fn test_cell_preserves_qualified_and_aliased_paths() {
+        run_test(
+            r#"
+mod state {
+    pub static mut COUNT: u32 = 0;
+    pub static mut COUNTS: [u32; 2] = [0; 2];
+}
+use state::COUNT as OTHER;
+pub unsafe fn update() -> u32 {
+    state::COUNT = 2;
+    OTHER += 3;
+    state::COUNTS[0] = state::COUNT;
+    state::COUNTS[1] += OTHER;
+    state::COUNTS[0] + state::COUNTS[1] + OTHER
+}
+"#,
+            &["state::COUNT.set(2)", "OTHER.set(OTHER.get()", "state::COUNTS.with("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_preserves_qualified_paths_and_distinct_globals() {
+        run_test(
+            r#"
+mod left {
+    pub struct State { pub value: u32 }
+    pub static mut VALUE: State = State { value: 0 };
+}
+mod right {
+    pub static mut VALUE: [u8; 2] = [0; 2];
+}
+use left::VALUE as LEFT;
+fn read(a: &left::State, b: &[u8; 2]) -> u32 { a.value + b[0] as u32 }
+fn bump(a: &mut left::State) { a.value += 1; }
+pub unsafe fn update() -> u32 {
+    left::VALUE.value = 1;
+    right::VALUE[0] = 2;
+    bump(&mut LEFT);
+    read(&left::VALUE, &right::VALUE)
+}
+"#,
+            &["left::VALUE.with_borrow", "right::VALUE.with_borrow", "LEFT.with_borrow_mut"],
+            &["static mut"],
+        );
     }
 
     #[test]
