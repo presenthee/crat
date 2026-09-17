@@ -93,20 +93,32 @@ impl BytemuckDependency {
 }
 
 pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, BytemuckDependency) {
+    let started = std::time::Instant::now();
+    let progress = |step: &str| {
+        if config.verbose {
+            println!("Pointer replace: {step} ({:?})", started.elapsed());
+        }
+    };
+    progress("build expanded AST");
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let input = collect_input(tcx);
+    progress("build type shapes");
     let arena = typed_arena::Arena::new();
     let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
     let andersen_config = andersen::Config {
         use_optimized_mir: false,
         c_exposed_fns: config.c_exposed_fns.clone(),
     };
+    progress("pre-analyze points-to");
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
+    progress("solve points-to");
     let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+    progress("find parameter aliases");
     let aliases = find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
+    progress("post-analyze points-to");
     let points_to = andersen::post_analyze(
         &andersen_config,
         pre_points_to.clone(),
@@ -115,26 +127,35 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         tcx,
     );
 
+    progress("analyze mutability");
     let mutability_result =
         analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
+    progress("compute output parameters");
     let output_params =
         analyses::output_params::compute_output_params(&input, &mutability_result, &aliases);
+    progress("analyze ownership");
     let ownership_schemes = maybe_solidified_ownership(config, &input, &output_params);
+    progress("group source variables");
     let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
     let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
+    progress("analyze borrow promotion");
     let borrow_promotion_result =
         analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
     let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
+    progress("analyze struct copies");
     let struct_copy_result =
         analyses::struct_copy::analyze(&input, &borrow_promotion_result.mutable_fields);
     let promoted_mut_ref_result = source_var_groups
         .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
     let promoted_shared_ref_result = source_var_groups
         .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
+    progress("analyze pointer fatness");
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
+    progress("analyze offset signs");
     let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
     offset_sign_result.access_signs =
         source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
+    progress("analyze nullity");
     let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
     nullity_result.non_null_locals =
         source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
@@ -153,12 +174,14 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         struct_copy_result,
     };
 
+    progress("build function-pointer groups");
     let fn_ptr_groups = FnPtrGroups::build(
         &pre_points_to,
         &points_to_solutions,
         &input,
         &analysis_results,
     );
+    progress("decide function-pointer rewrites");
     let fn_ptr_rewrite = FnPtrRewriteDecision::build(
         &pre_points_to,
         &points_to_solutions,
@@ -168,6 +191,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         &fn_ptr_groups,
     );
 
+    progress("rewrite AST");
     let diagnostics = diagnostics::DecisionDiagnostics::from_env();
     let mut visitor = TransformVisitor::new(
         config,
@@ -181,6 +205,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     visitor.visit_crate(&mut krate);
 
     // add SliceCursor module to the crate if it was used
+    progress("print transformed AST");
     let slice_cursor_used = visitor.slice_cursor.get();
     let mut code = pprust::crate_to_string_for_macros(&krate);
     if slice_cursor_used {
@@ -189,6 +214,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     }
 
     visitor.emit_diagnostics();
+    progress("done");
 
     (code, visitor.bytemuck_dependency())
 }
@@ -420,8 +446,8 @@ fn slice_cursor_mod_str() -> &'static str {
             SliceCursorMut { base: &mut self.base[..], pos: self.pos }
         }
 
-        pub fn as_deref(self) -> SliceCursor<'a, T> {
-            SliceCursor { base: self.base, pos: self.pos }
+        pub fn as_deref(&self) -> SliceCursor<'_, T> {
+            SliceCursor { base: &self.base[..], pos: self.pos }
         }
 
         pub fn seek(&mut self, offset: isize) {
@@ -458,6 +484,10 @@ fn slice_cursor_mod_str() -> &'static str {
         }
 
         pub fn as_slice_mut(&mut self) -> &mut [T] {
+            &mut self.base[self.pos..]
+        }
+
+        pub fn into_slice_mut(self) -> &'a mut [T] {
             &mut self.base[self.pos..]
         }
     }

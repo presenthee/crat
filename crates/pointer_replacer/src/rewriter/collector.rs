@@ -678,5 +678,21 @@ pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
         collector.visit_body(body);
     }
 
+    // function items stored only in a static initializer do not occur in any
+    // function body. They still constrain the function's ABI and must be
+    // included in the same signature-rewrite grouping.
+    for maybe_owner in rust_program.tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Static(_, _, _, body_id) = item.kind else {
+            continue;
+        };
+        collector.visit_body(rust_program.tcx.hir_body(body_id));
+    }
+
     collector.fn_ptrs
 }
