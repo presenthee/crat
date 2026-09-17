@@ -303,19 +303,29 @@ pub fn rewrite_struct_param_fields(
 /// go to stderr under `CRAT_SNAPSHOT_TRACE`; `CRAT_SNAPSHOT_VALIDATE` adds a
 /// `debug_assert_eq!` after each exact-prefix copy.
 pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+    let started = std::time::Instant::now();
+    let progress = |step: &str| {
+        if config.verbose {
+            println!("Pointer aliasing: {step} ({:?})", started.elapsed());
+        }
+    };
+    progress("build expanded AST");
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let input = collect_input(tcx);
+    progress("build type shapes");
     let arena = typed_arena::Arena::new();
     let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
     let andersen_config = andersen::Config {
         use_optimized_mir: false,
         c_exposed_fns: config.c_exposed_fns.clone(),
     };
+    progress("pre-analyze points-to");
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
     let alloc_fns = pre_points_to.alloc_fns.clone();
+    progress("solve points-to");
     let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
 
     let trace = snapshot_rewriter::trace_enabled();
@@ -345,9 +355,13 @@ pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
         eprintln!("SNAPSHOT_EQUIV ok ({} callees)", expected.len());
     }
 
+    progress("analyze pointer flow");
     let flows = analyses::pointer_flow::pointer_flow_analysis(&input, &alloc_fns);
+    progress("classify array provenance");
     let provenances = analyses::array_local_provenance::array_local_provenance_from_flows(&flows);
+    progress("analyze access order");
     let access_order = analyses::access_order::AccessOrderAnalysis::analyze(&input, &flows);
+    progress("detect snapshot candidates");
     let candidates =
         analyses::aliasing::detect_snapshot_candidates(&input, &provenances, &access_order, trace);
     if trace {
@@ -362,6 +376,7 @@ pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
         }
     }
 
+    progress("plan snapshot rewrites");
     let changed = if candidates.is_empty() {
         false
     } else {
@@ -399,6 +414,7 @@ pub fn rewrite_aliasing(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
         snapshot_rewriter::apply_snapshot_isolation(&mut krate, &sites, &ast_to_hir, validate)
     };
 
+    progress("print transformed AST");
     (pprust::crate_to_string_for_macros(&krate), changed)
 }
 
