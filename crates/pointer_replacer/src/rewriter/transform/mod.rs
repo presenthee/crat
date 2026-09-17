@@ -1772,6 +1772,33 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             &forced_raw_bindings,
             DecisionReason::UnsupportedAllocatorRoot,
         );
+        let raw_pointer_slot_bindings = collect_raw_pointer_slot_bindings(rust_program);
+        record_binding_events(
+            &mut diagnostics,
+            rust_program.tcx,
+            &ptr_kinds,
+            &raw_pointer_slot_bindings,
+            DecisionReason::RawPointerSlot,
+        );
+        for &hir_id in &raw_pointer_slot_bindings {
+            if let Some((did, idx)) = param_index_for_binding(rust_program.tcx, hir_id)
+                && let Some(sig_dec) = sig_decs.data.get_mut(&did)
+                && !sig_dec.signature_locked
+            {
+                let ty = rust_program.tcx.typeck(hir_id.owner).node_type(hir_id);
+                let (_, mutability) = unwrap_ptr_from_mir_ty(ty).unwrap();
+                sig_dec.set_input_dec(idx, Some(PtrKind::Raw(mutability.is_mut())));
+                record_signature_input_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    did,
+                    idx,
+                    DecisionReason::RawPointerSlot,
+                );
+            }
+        }
+        forced_raw_bindings.extend(raw_pointer_slot_bindings);
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         normalize_owning_call_result_bindings(
             rust_program.tcx,
@@ -13929,6 +13956,54 @@ fn collect_raw_bridge_bindings(
         }
     }
     bindings
+}
+
+pub(crate) fn collect_raw_pointer_slot_bindings(
+    rust_program: &RustProgram<'_>,
+) -> FxHashSet<HirId> {
+    struct RawPointerSlotVisitor<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for RawPointerSlotVisitor<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Call(func, args) = expr.kind {
+                let typeck = self.tcx.typeck(expr.hir_id.owner);
+                let inputs = match typeck.expr_ty_adjusted(func).kind() {
+                    ty::TyKind::FnDef(did, _) => {
+                        Some(self.tcx.fn_sig(did).skip_binder().inputs().skip_binder())
+                    }
+                    ty::TyKind::FnPtr(sig, _) => Some(sig.inputs().skip_binder()),
+                    _ => None,
+                };
+                if let Some(inputs) = inputs {
+                    for (arg, input) in args.iter().zip(inputs) {
+                        if let Some((slot_ty, _)) = unwrap_ptr_from_mir_ty(*input)
+                            && slot_ty.is_raw_ptr()
+                            && let hir::ExprKind::AddrOf(_, _, inner) = hir_unwrap_cast(arg).kind
+                            && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) =
+                                utils::hir::unwrap_drop_temps(inner).kind
+                            && let Res::Local(hir_id) = path.res
+                            && typeck.node_type(hir_id).is_raw_ptr()
+                        {
+                            self.bindings.insert(hir_id);
+                        }
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = RawPointerSlotVisitor {
+        tcx: rust_program.tcx,
+        bindings: FxHashSet::default(),
+    };
+    for &did in &rust_program.functions {
+        visitor.visit_body(rust_program.tcx.hir_body_owned_by(did));
+    }
+    visitor.bindings
 }
 
 fn collect_raw_call_result_bindings(

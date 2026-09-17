@@ -41,6 +41,8 @@ mod lifetimes;
 mod struct_array_field_pre;
 mod transform;
 
+pub(crate) use transform::collect_raw_pointer_slot_bindings;
+
 pub struct Analysis {
     #[allow(dead_code)]
     pub(crate) borrow_promotion_result: BorrowPromotionResults,

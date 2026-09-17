@@ -197,6 +197,19 @@ impl FnPtrGroups {
             group_decisions.insert(*rep, joint_inputs);
         }
 
+        let raw_pointer_slots =
+            crate::rewriter::collect_raw_pointer_slot_bindings(rust_program);
+        for (&did, &rep) in &fn_to_group {
+            let body = rust_program.tcx.hir_body_owned_by(did);
+            for (idx, param) in body.params.iter().enumerate() {
+                if let rustc_hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind
+                    && raw_pointer_slots.contains(&hir_id)
+                {
+                    group_decisions.get_mut(&rep).unwrap()[idx] = None;
+                }
+            }
+        }
+
         FnPtrGroups {
             fn_to_group,
             group_decisions,

@@ -10511,3 +10511,65 @@ pub unsafe fn sum(user: *const i8, pass: *const i8) -> i8 {
         &[],
     );
 }
+
+
+#[test]
+fn test_rewriter_preserves_raw_pointer_slots_passed_by_address() {
+    run_test(
+        r#"
+#[repr(C)]
+pub union Value {
+    pub ptr: *mut i32,
+    pub integer: usize,
+}
+
+pub unsafe fn fill(out: *mut *mut i32) {
+    *out = core::ptr::null_mut();
+}
+
+pub unsafe fn run(value: *mut Value) {
+    let mut temp: *mut i32 = core::ptr::null_mut();
+    fill(&mut temp);
+    (*value).ptr = temp;
+}
+
+pub unsafe fn reset(mut temp: *mut i32, value: *mut Value) {
+    fill(&mut temp);
+    (*value).ptr = temp;
+}
+"#,
+        &[
+            "out: &mut *mut i32",
+            "let mut temp: *mut i32",
+            "(mut temp: *mut i32",
+        ],
+        &["(&mut temp).unwrap()"],
+    );
+}
+
+
+#[test]
+fn test_rewriter_preserves_raw_pointer_slots_in_callback_parameters() {
+    run_test(
+        r#"
+pub unsafe fn fill(out: *mut *mut i32) {
+    *out = core::ptr::null_mut();
+}
+
+pub unsafe fn reset(mut ptr: *mut i32) {
+    *ptr = 0;
+    fill(&mut ptr);
+}
+
+pub unsafe fn dispatch(cb: unsafe fn(*mut i32), ptr: *mut i32) {
+    cb(ptr);
+}
+
+pub unsafe fn run(ptr: *mut i32) {
+    dispatch(reset as unsafe fn(*mut i32), ptr);
+}
+"#,
+        &["cb: unsafe fn(*mut i32)", "reset as unsafe fn(*mut i32)"],
+        &["(&mut ptr).unwrap()"],
+    );
+}
