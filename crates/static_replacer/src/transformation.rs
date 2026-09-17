@@ -29,7 +29,7 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
             statics.insert(def_id);
         }
     }
-    let returned_statics = return_escape::statics_returned_by_non_raw_address(tcx);
+    let escaping_statics = return_escape::statics_with_escaping_non_raw_addresses(tcx);
 
     let mut visitor = HirVisitor {
         tcx,
@@ -46,7 +46,7 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
         if !statics.contains(&def_id) {
             continue;
         }
-        if returned_statics.contains(&def_id) || visitor.initializer_statics.contains(&def_id) {
+        if escaping_statics.contains(&def_id) || visitor.initializer_statics.contains(&def_id) {
             continue;
         }
         if exprs.iter().all(|(_, mutated)| !*mutated) {
@@ -1080,6 +1080,33 @@ unsafe fn f() -> *mut i32 { X = 1; return &raw mut X; }
             code,
             &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
             &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_stored_static_references_keep_original_storage() {
+        for function in [
+            "unsafe fn read(mut input: &mut [u8]) -> u8 { input = &mut SCRATCH; input[0] }",
+            "unsafe fn read() -> u8 { let input: &mut [u8] = &mut SCRATCH; input[0] }",
+            "unsafe fn read(other: &mut [u8]) -> u8 { let mut input = other; input = &mut SCRATCH; input[0] }",
+            "unsafe fn read(mut input: &mut [u8]) -> *mut u8 { input = &mut SCRATCH; input.as_mut_ptr() }",
+        ] {
+            let code = format!("static mut SCRATCH: [u8; 8] = [0; 8];\n{function}");
+            run_test(&code, &["static mut SCRATCH"], &["thread_local!", "with_borrow"]);
+        }
+    }
+
+    #[test]
+    fn test_temporary_static_borrows_remain_rewritable() {
+        run_test(
+            r#"
+static mut SCRATCH: [u8; 8] = [0; 8];
+fn consume(input: &mut [u8]) -> u8 { input[0] }
+unsafe fn read() -> u8 { consume(&mut SCRATCH) }
+unsafe fn raw_read() -> u8 { let ptr = SCRATCH.as_mut_ptr(); *ptr }
+"#,
+            &["std::cell::RefCell", "SCRATCH.with_borrow_mut"],
+            &["static mut SCRATCH"],
         );
     }
 
