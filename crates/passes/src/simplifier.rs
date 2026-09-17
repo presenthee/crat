@@ -204,6 +204,11 @@ impl<'tcx> AstVisitor<'tcx> {
 
     fn shorten_path(&self, path: &mut Path, hir_id: hir::HirId) {
         if let Some(&res) = self.ast_to_hir.path_span_to_res.get(&path.span)
+            && self.enum_def_id_for_variant_res(res).is_some()
+        {
+            return;
+        }
+        if let Some(&res) = self.ast_to_hir.path_span_to_res.get(&path.span)
             && let Res::Def(_, def_id) = res
             && let Some(local_def_id) = def_id.as_local()
             && let mod_id = self.tcx.parent_module(hir_id)
@@ -960,6 +965,42 @@ mod tests {
             &["g()"],
             &["crate::m::g()"],
         )
+    }
+
+    #[test]
+    fn test_preserve_enum_variant_expression_paths() {
+        run_test(
+            r#"
+enum Local { Start, Number(u32), Record { value: u32 } }
+fn local() -> (Local, Local, Local) {
+    (Local::Start, Local::Number(1), Local::Record { value: 2 })
+}
+mod model {
+    pub enum State<T> { Start, Number(T), Record { value: T } }
+}
+use model::State;
+fn imported() -> (State<u32>, State<u32>, State<u32>) {
+    (model::State::Start, model::State::<u32>::Number(1), model::State::Record { value: 2 })
+}
+mod aliased {
+    use crate::model::State as Renamed;
+    pub fn original_path() -> Renamed<u32> { crate::model::State::Number(4) }
+    pub fn alias_path() -> Renamed<u32> { Renamed::Number(5) }
+}
+mod consumer {
+    pub fn qualified() -> crate::model::State<u32> {
+        crate::model::State::Record { value: 3 }
+    }
+}
+"#,
+            &[
+                "Local::Start", "Local::Number(1)", "Local::Record { value: 2 }",
+                "State::<u32>::Number(1)", "State::Record { value: 2 }",
+                "crate::model::State::Record { value: 3 }",
+                "crate::model::State::Number(4)", "Renamed::Number(5)",
+            ],
+            &[],
+        );
     }
 
     #[test]
