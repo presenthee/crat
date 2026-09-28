@@ -54,6 +54,7 @@ pub(crate) fn apply_struct_param_field_spec(
     plan: &SpecPlan,
     tcx: TyCtxt<'_>,
     ast_to_hir: &AstToHir,
+    measurement: Option<&mut super::measurement::Measurement>,
 ) -> (bool, FieldSpecMap) {
     let field_tys = collect_field_tys(krate, plan, ast_to_hir);
     let fn_plans = resolve_and_validate(krate, plan, &field_tys, tcx, ast_to_hir);
@@ -65,6 +66,7 @@ pub(crate) fn apply_struct_param_field_spec(
         .filter_map(|(&(did, _), fp)| fp.exposed_rename.map(|n| (did, n)))
         .collect();
     let mut visitor = SpecTransformVisitor {
+        measurement,
         fn_plans: &fn_plans,
         exposed_renames: &exposed_renames,
         plan,
@@ -531,6 +533,7 @@ impl CallSiteAuditor<'_, '_> {
 }
 
 struct SpecTransformVisitor<'a, 'tcx> {
+    measurement: Option<&'a mut super::measurement::Measurement>,
     fn_plans: &'a FxHashMap<(LocalDefId, usize), FnPlan>,
     exposed_renames: &'a FxHashMap<LocalDefId, Symbol>,
     plan: &'a SpecPlan,
@@ -607,7 +610,11 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
                 // narrow the parameter type to a pointer to the field type
                 let input = &mut func.sig.decl.inputs[fn_plan.param_idx];
                 input.ty = P(Ty {
-                    id: DUMMY_NODE_ID,
+                    id: if self.measurement.is_some() {
+                        input.ty.id
+                    } else {
+                        DUMMY_NODE_ID
+                    },
                     kind: TyKind::Ptr(MutTy {
                         ty: fn_plan.field_ty.clone(),
                         mutbl: fn_plan.mutbl,
@@ -661,7 +668,22 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
                 self.pending_renames.insert(hoist.arg_node_id, hoist.name);
             }
             for hoist in hoists {
-                let [capture, guard] = hoist.stmts;
+                let [mut capture, mut guard] = hoist.stmts;
+                if let Some(observer) = self.measurement.as_deref_mut() {
+                    let mut outputs = Vec::new();
+                    for stmt in [&mut capture, &mut guard] {
+                        if let StmtKind::Let(local) = &mut stmt.kind {
+                            local.pat.id = observer.fresh_node();
+                            outputs.push(local.pat.id);
+                        }
+                    }
+                    observer.record(
+                        utils::pointer_lineage::Operation::Create,
+                        &[],
+                        &outputs,
+                        "capture and guard a specialized call argument",
+                    );
+                }
                 new_stmts.push(capture);
                 new_stmts.push(guard);
             }

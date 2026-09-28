@@ -95,6 +95,7 @@ fn group_for_field(groups: &[FieldGroup], field_name: Symbol) -> Option<(&FieldG
 }
 
 struct StructArrayTransformVisitor<'a, 'tcx> {
+    measurement: Option<&'a mut super::measurement::Measurement>,
     ctx: StructArrayCtx<'a, 'tcx>,
 }
 
@@ -103,8 +104,10 @@ impl<'a, 'tcx> StructArrayTransformVisitor<'a, 'tcx> {
         candidates: &'a StructRewriteCandidates,
         ast_to_hir: &'a AstToHir,
         tcx: TyCtxt<'tcx>,
+        measurement: Option<&'a mut super::measurement::Measurement>,
     ) -> Self {
         Self {
+            measurement,
             ctx: StructArrayCtx::new(candidates, ast_to_hir, tcx),
         }
     }
@@ -115,7 +118,7 @@ impl MutVisitor for StructArrayTransformVisitor<'_, '_> {
         if let ItemKind::Struct(_, _, VariantData::Struct { ref mut fields, .. }) = item.kind {
             let struct_did = self.ctx.ast_to_hir.global_map.get(&item.id).copied();
             if let Some(groups) = struct_did.and_then(|did| self.ctx.candidate_groups(did)) {
-                rewrite_struct_definition_fields(fields, groups);
+                rewrite_struct_definition_fields(fields, groups, self.measurement.as_deref_mut());
             }
         }
         mut_visit::walk_item(self, item);
@@ -196,11 +199,27 @@ impl StructArrayTransformVisitor<'_, '_> {
     }
 }
 
-fn rewrite_struct_definition_fields(fields: &mut ThinVec<FieldDef>, groups: &[FieldGroup]) {
+fn rewrite_struct_definition_fields(
+    fields: &mut ThinVec<FieldDef>,
+    groups: &[FieldGroup],
+    mut measurement: Option<&mut super::measurement::Measurement>,
+) {
     let mut sorted_groups: Vec<&FieldGroup> = groups.iter().collect();
     sorted_groups.sort_by(|a, b| b.start_idx.cmp(&a.start_idx));
 
     for group in sorted_groups {
+        if let Some(observer) = measurement.as_deref_mut() {
+            let parents: Vec<_> = fields[group.start_idx..group.start_idx + group.count]
+                .iter()
+                .map(|f| f.id)
+                .collect();
+            observer.record_nodes(
+                utils::pointer_lineage::Operation::Merge,
+                &parents,
+                &[fields[group.start_idx].id],
+                "combine consecutive struct fields into an array",
+            );
+        }
         let elem_ty = fields[group.start_idx].ty.clone();
         let span = fields[group.start_idx].span;
         fields[group.start_idx].ty = P(Ty {
@@ -387,12 +406,13 @@ pub fn apply_struct_array_transform<'tcx>(
     candidates: &StructRewriteCandidates,
     tcx: TyCtxt<'tcx>,
     ast_to_hir: &AstToHir,
+    measurement: Option<&mut super::measurement::Measurement>,
 ) -> bool {
     let candidates = filter_safe_candidates(krate, candidates, tcx, ast_to_hir);
     if candidates.is_empty() {
         return false;
     }
-    let mut visitor = StructArrayTransformVisitor::new(&candidates, ast_to_hir, tcx);
+    let mut visitor = StructArrayTransformVisitor::new(&candidates, ast_to_hir, tcx, measurement);
     visitor.visit_crate(krate);
     true
 }

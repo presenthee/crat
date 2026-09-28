@@ -31,6 +31,7 @@ pub struct Measurement {
     emissions: Vec<Emission>,
     error: Option<MeasurementError>,
     bound: bool,
+    next_node: u32,
 }
 impl Measurement {
     pub fn new(map: DeclarationMap) -> Self {
@@ -46,6 +47,7 @@ impl Measurement {
             emissions: vec![],
             error: None,
             bound: false,
+            next_node: 0,
         }
     }
 
@@ -123,8 +125,43 @@ impl Measurement {
             .map(|s| s.node)
             .filter(|n| !self.nodes.contains_key(n))
             .collect();
+        self.next_node = mapper
+            .global_map
+            .keys()
+            .map(|n| n.as_u32())
+            .max()
+            .unwrap_or(0)
+            .max(
+                mapper
+                    .local_map
+                    .keys()
+                    .map(|n| n.as_u32())
+                    .max()
+                    .unwrap_or(0),
+            )
+            + 1;
         self.bound = true;
         Ok(())
+    }
+
+    pub fn fresh_node(&mut self) -> NodeId {
+        let node = NodeId::from_u32(self.next_node);
+        self.next_node += 1;
+        node
+    }
+
+    pub fn record_nodes(
+        &mut self,
+        operation: Operation,
+        parents: &[NodeId],
+        outputs: &[NodeId],
+        reason: &str,
+    ) {
+        let ids: Result<Vec<_>, _> = parents.iter().map(|node| self.id(*node).cloned()).collect();
+        match ids {
+            Ok(ids) => self.record(operation, &ids, outputs, reason),
+            Err(e) => self.error = Some(e),
+        }
     }
 
     pub fn record(

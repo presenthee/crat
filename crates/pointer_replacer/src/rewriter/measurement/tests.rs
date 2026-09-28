@@ -170,3 +170,141 @@ fn emitted_map_reconciles_reparsed_split_source() {
         1
     );
 }
+
+fn measure_struct(
+    code: &str,
+    config: &super::super::Config,
+    arrays: bool,
+) -> (
+    ::utils::pointer_inventory::Inventory,
+    ::utils::pointer_inventory::Inventory,
+    Measurement,
+    Emission,
+) {
+    let baseline = run_compiler_on_str(code, |tcx| {
+        ::utils::pointer_inventory::collect_inventory(tcx, "fixture", StageId("input".into()))
+    })
+    .unwrap();
+    let ordinary = run_compiler_on_str(code, |tcx| {
+        if arrays {
+            super::super::rewrite_struct_arrays(config, tcx).0
+        } else {
+            super::super::rewrite_struct_param_fields(config, tcx).0
+        }
+    })
+    .unwrap();
+    let mut measurement = Measurement::new(seed_map(&baseline));
+    let observed = run_compiler_on_str(code, |tcx| {
+        if arrays {
+            super::super::rewrite_struct_arrays_observed(config, tcx, Some(&mut measurement)).0
+        } else {
+            super::super::rewrite_struct_param_fields_observed(config, tcx, Some(&mut measurement))
+                .0
+        }
+    })
+    .unwrap();
+    assert_eq!(ordinary, observed);
+    let emissions = measurement.take_emissions().unwrap();
+    assert_eq!(emissions.len(), 1);
+    let emission = emissions.into_iter().next().unwrap();
+    let final_inventory = run_compiler_on_str(&observed, |tcx| {
+        ::utils::pointer_identity::reconcile(tcx, &emission.delta.map, &Default::default())
+    })
+    .unwrap()
+    .unwrap();
+    (baseline, final_inventory, measurement, emission)
+}
+#[test]
+fn measurement_struct_array_fields() {
+    let code = r#"
+#[repr(C)] pub struct Group { pub a: *mut i32, pub b: *mut i32, pub c: *mut i32 }
+pub unsafe fn f() -> *mut i32 {
+    let mut s = Group { a: 0 as *mut i32, b: 0 as *mut i32, c: 0 as *mut i32 };
+    let p: *mut *mut i32 = &raw mut s.a;
+    *p.offset(1)
+}
+"#;
+    let (before, after, measurement, emission) = measure_struct(code, &Default::default(), true);
+    let merged = emission
+        .delta
+        .events
+        .iter()
+        .find(|e| e.operation == Operation::Merge)
+        .expect(&emission.source);
+    assert_eq!(merged.parents.len(), 3);
+    assert_eq!(merged.outputs.len(), 1);
+    let finals = after
+        .declarations
+        .iter()
+        .map(|d| d.declaration_id.clone())
+        .collect();
+    for field in before
+        .declarations
+        .iter()
+        .filter(|d| d.site == ::utils::pointer_inventory::Site::Field)
+    {
+        assert_eq!(
+            measurement
+                .ledger()
+                .descendants(&field.declaration_id, &finals)
+                .unwrap(),
+            merged.outputs.iter().cloned().collect()
+        );
+    }
+}
+#[test]
+fn measurement_struct_param_specialization() {
+    let mut config = super::super::Config::default();
+    config.c_exposed_fns.insert("build".into());
+    let code = r#"
+pub mod a {
+    pub type myint_t = u16;
+    #[repr(C)] pub struct st { pub lookup: [myint_t; 4], pub lit: [u32; 4] }
+    pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> i32 {
+        if !s.is_null() { (*s).lookup[0] = 1; }
+        *tree.offset(0) = 0; 0
+    }
+    pub unsafe extern "C" fn fixed(mut s: *mut st) -> i32 { build(s, ((*s).lit).as_mut_ptr()) }
+}
+pub mod b {
+    use crate::a::{build, st};
+    pub unsafe extern "C" fn stranger(mut s: *mut st, mut tree: *mut u32, flag: i32) -> i32 {
+        let mut p: *mut st = 0 as *mut st;
+        if flag != 0 { p = s; }
+        build(p, tree); 0
+    }
+}
+"#;
+    // Keep the fixture's import simple, as required by the existing rewrite.
+    let code = code.replace(
+        "use crate::a::{build, st};",
+        "use crate::a::build; use crate::a::st;",
+    );
+    let (before, after, _, emission) = measure_struct(&code, &config, false);
+    assert!(emission.source.contains("build_field"));
+    let generated: Vec<_> = after
+        .declarations
+        .iter()
+        .filter(|d| d.name.as_deref().is_some_and(|n| n.starts_with("__crat_g")))
+        .collect();
+    assert_eq!(generated.len(), 2, "{}", emission.source);
+    assert!(generated.iter().all(|d| d.scope == Scope::Application));
+    assert_eq!(
+        emission
+            .delta
+            .events
+            .iter()
+            .filter(|e| e.operation == Operation::Create)
+            .flat_map(|e| &e.outputs)
+            .count(),
+        2
+    );
+    for original in &before.declarations {
+        assert!(
+            after
+                .declarations
+                .iter()
+                .any(|d| d.declaration_id == original.declaration_id)
+        );
+    }
+}
