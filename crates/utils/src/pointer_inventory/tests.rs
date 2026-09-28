@@ -278,3 +278,10 @@ fn ignores_desugared_iterator_bindings_and_counts_variant_fields_once() {
     assert_eq!(locals.len(), 2, "{locals:?}");
     assert!(locals.iter().all(|d| d.pointer_state == PointerState::Raw));
 }
+
+#[test]
+fn opaque_c_void_pointee_is_not_an_unknown_wrapper() {
+    let inv = inventory("fn f(p: *mut core::ffi::c_void) {} ");
+    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
+    assert_eq!(inv.declarations[0].pointer_state, PointerState::Raw);
+}

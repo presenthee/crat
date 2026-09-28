@@ -10,7 +10,7 @@ pub struct DeclId(pub String);
 pub struct StageId(pub String);
 pub type SourceHashes = BTreeMap<String, String>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Site {
     Local,

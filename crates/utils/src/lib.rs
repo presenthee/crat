@@ -37,6 +37,7 @@ pub mod graph;
 pub mod hir;
 pub mod ir;
 pub mod pointer_inventory;
+pub mod pointer_identity;
 pub mod ty_shape;
 pub mod unsafety;
 
