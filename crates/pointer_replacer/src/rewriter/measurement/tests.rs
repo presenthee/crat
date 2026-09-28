@@ -868,3 +868,32 @@ pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) { *p.offset(a).offse
             .all(|d| d.scope == Scope::Support)
     );
 }
+
+#[test]
+fn measurement_config_defaults_and_stage_controls() {
+    use crate::rewriter::{Config, GatedPrepassPhase as P, run_gated_pointer_prepasses};
+    let default: Config = toml::from_str("").unwrap();
+    assert_eq!([default.enable_struct_arrays, default.enable_struct_param_fields,
+        default.enable_epoch_split, default.enable_aliasing,
+        default.enable_array_local_provenance, default.enable_slice_cursor], [true; 6]);
+    assert!(toml::from_str::<Config>("enable_epoch_splt = false").is_err());
+    assert!(toml::from_str::<Config>("c_exposed_fns = ['foo']\nverbose = true").is_ok());
+    for selected in 0..=3 {
+        let config = Config { enable_epoch_split: selected == 1,
+            enable_aliasing: selected == 2, enable_array_local_provenance: selected == 3,
+            ..Config::default() };
+        let result = run_gated_pointer_prepasses(&config, "fn f() {}");
+        for (enabled, phases) in [(config.enable_epoch_split, vec![P::EpochTrial,P::EpochReplay,P::EpochSelection]),
+            (config.enable_aliasing, vec![P::AliasingTrial,P::AliasingReplay]),
+            (config.enable_array_local_provenance, vec![P::ArrayTrial,P::ArrayReplay,P::ArraySelection])] {
+            for phase in phases { assert_eq!(result.phases.contains(&phase), enabled); }
+        }
+        assert!(result.decisions.is_empty());
+        if selected == 0 { assert!(result.phases.is_empty()); assert_eq!(result.source, "fn f() {}"); }
+    }
+    let config = Config { enable_aliasing: false, force_gated_prepass_trial_failure: true, ..Config::default() };
+    let result = run_gated_pointer_prepasses(&config, "fn f() {}");
+    assert!(result.combined_trial_failed);
+    assert!(!result.phases.contains(&P::AliasingFallback));
+    assert_eq!(result.source, "fn f() {}");
+}

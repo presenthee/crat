@@ -577,38 +577,41 @@ fn main() {
                 }
             }
             Pass::Pointer => {
-                if config.verbose {
-                    println!("Pointer: rewrite struct arrays");
-                }
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_struct_arrays(&config.pointer, tcx)
-                })
-                .unwrap();
-                if changed {
-                    std::fs::write(&file, s).unwrap();
-                }
-
-                if config.verbose {
-                    println!("Pointer: rewrite struct parameter fields");
-                }
-                let (s, changed, field_specs) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
-                })
-                .unwrap();
-                if !field_specs.is_empty() {
-                    // the sidecar persists across reruns on purpose: a rerun over
-                    // already-specialized output finds nothing to specialize (empty map)
-                    // but the existing records are still what the interface pass needs;
-                    // genuinely stale entries fail closed there (no {name}_field fn)
-                    let field_spec_path = dir.join("field_spec_map.json");
-                    std::fs::write(
-                        &field_spec_path,
-                        serde_json::to_string_pretty(&field_specs).unwrap(),
-                    )
+                if config.pointer.enable_struct_arrays {
+                    if config.verbose {
+                        println!("Pointer: rewrite struct arrays");
+                    }
+                    let (s, changed) = run_compiler_on_path(&file, |tcx| {
+                        pointer_replacer::rewrite_struct_arrays(&config.pointer, tcx)
+                    })
                     .unwrap();
+                    if changed {
+                        std::fs::write(&file, s).unwrap();
+                    }
                 }
-                if changed {
-                    std::fs::write(&file, s).unwrap();
+                if config.pointer.enable_struct_param_fields {
+                    if config.verbose {
+                        println!("Pointer: rewrite struct parameter fields");
+                    }
+                    let (s, changed, field_specs) = run_compiler_on_path(&file, |tcx| {
+                        pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
+                    })
+                    .unwrap();
+                    if !field_specs.is_empty() {
+                        // the sidecar persists across reruns on purpose: a rerun over
+                        // already-specialized output finds nothing to specialize (empty map)
+                        // but the existing records are still what the interface pass needs;
+                        // genuinely stale entries fail closed there (no {name}_field fn)
+                        let field_spec_path = dir.join("field_spec_map.json");
+                        std::fs::write(
+                            &field_spec_path,
+                            serde_json::to_string_pretty(&field_specs).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    if changed {
+                        std::fs::write(&file, s).unwrap();
+                    }
                 }
 
                 if config.verbose {

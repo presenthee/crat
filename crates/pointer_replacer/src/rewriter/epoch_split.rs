@@ -81,7 +81,7 @@ pub struct EpochSplitTrialPlan {
 }
 
 /// owned source and accounting data from either a combined trial or replay.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct EpochSplitRewriteResult {
     pub source: String,
     pub changed: bool,
