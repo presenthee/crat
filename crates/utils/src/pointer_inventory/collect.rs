@@ -209,8 +209,8 @@ pub fn collect_bound_inventory_with_roles(
         keys: Vec::new(),
         bindings: HashSet::new(),
         param_bindings: HashSet::new(),
-        owners: BTreeMap::new(),
-        ordinals: BTreeMap::new(),
+        owners: HashMap::new(),
+        ordinals: HashMap::new(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut collector);
     let mut declarations: HashMap<_, _> = collector
@@ -272,8 +272,8 @@ struct Collector<'tcx> {
     keys: Vec<DeclarationKey>,
     bindings: HashSet<hir::HirId>,
     param_bindings: HashSet<hir::HirId>,
-    owners: BTreeMap<String, u32>,
-    ordinals: BTreeMap<(String, Site), u32>,
+    owners: HashMap<LocalDefId, u32>,
+    ordinals: HashMap<(LocalDefId, Site), u32>,
 }
 
 impl<'tcx> Collector<'tcx> {
@@ -289,8 +289,8 @@ impl<'tcx> Collector<'tcx> {
         let owner_id = owner;
         let owner = self.tcx.def_path_str(owner.to_def_id());
         let next = self.owners.len() as u32;
-        let owner_index = *self.owners.entry(owner.clone()).or_insert(next);
-        let ordinal = self.ordinals.entry((owner.clone(), site)).or_default();
+        let owner_index = *self.owners.entry(owner_id).or_insert(next);
+        let ordinal = self.ordinals.entry((owner_id, site)).or_default();
         let locator = DeclarationLocator {
             owner_path: vec![owner_index],
             site,
@@ -396,7 +396,7 @@ impl<'tcx> Visitor<'tcx> for Collector<'tcx> {
                 self.tcx.type_of(id).instantiate_identity(),
                 item.span,
             ),
-            hir::ItemKind::Const(..) => self.add(
+            hir::ItemKind::Const(ident, ..) if ident.name.as_str() != "_" => self.add(
                 id,
                 Site::Const,
                 Scope::Application,

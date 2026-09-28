@@ -94,7 +94,9 @@ impl<'ast> Visitor<'ast> for BindingVisitor<'_, '_> {
     fn visit_item(&mut self, item: &'ast ast::Item) {
         match item.kind {
             ast::ItemKind::Static(_) => self.global(item.id, Site::Static),
-            ast::ItemKind::Const(_) => self.global(item.id, Site::Const),
+            ast::ItemKind::Const(ref c) if c.ident.name.as_str() != "_" => {
+                self.global(item.id, Site::Const)
+            }
             _ => (),
         }
         visit::walk_item(self, item);
@@ -227,7 +229,7 @@ impl<'ast> Visitor<'ast> for SourceVisitor {
             ast::ItemKind::Static(s) => {
                 self.add(item.id, Site::Static, Some(s.ident.name.to_string()))
             }
-            ast::ItemKind::Const(c) => {
+            ast::ItemKind::Const(c) if c.ident.name.as_str() != "_" => {
                 self.add(item.id, Site::Const, Some(c.ident.name.to_string()))
             }
             _ => (),

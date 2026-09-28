@@ -274,6 +274,11 @@ pub fn replace_local_borrows_observed(
                 Err(e) => observer.fail(e),
             }
         }
+        if bytemuck.needs_derive() {
+            if let Err(error) = measurement::register_derive_support(observer, &mut krate, &code) {
+                observer.fail(error);
+            }
+        }
         let _ = observer.finish(&krate, code.clone());
     }
     (code, bytemuck)

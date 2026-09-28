@@ -181,3 +181,13 @@ fn ast_bindings_cover_source_declarations_before_type_queries() {
     })
     .unwrap();
 }
+
+#[test]
+fn hashes_include_legitimate_measurement_and_reports_modules() {
+    let dir = TestDir::new();
+    for name in ["measurement", "reports"] {
+        fs::create_dir(dir.0.join(name)).unwrap();
+        fs::write(dir.0.join(name).join("mod.rs"), "pub fn f() {}").unwrap();
+    }
+    assert_eq!(crate_source_paths(&dir.0).unwrap(), vec![PathBuf::from("measurement/mod.rs"), PathBuf::from("reports/mod.rs")]);
+}
