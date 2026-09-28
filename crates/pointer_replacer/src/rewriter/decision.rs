@@ -86,7 +86,17 @@ impl PtrKind {
     }
 }
 
+/// Keep cursor-required pointers raw when the cursor experiment is disabled.
+/// Sign facts remain available; a plain slice cannot represent backward movement.
+pub fn apply_cursor_policy(kind: PtrKind, enabled: bool) -> PtrKind {
+    match kind {
+        PtrKind::SliceCursor(m) if !enabled => PtrKind::Raw(m),
+        other => other,
+    }
+}
+
 pub struct DecisionMaker<'tcx> {
+    enable_slice_cursor: bool,
     tcx: TyCtxt<'tcx>,
     mutable_pointers: IndexVec<Local, bool>,
     array_pointers: IndexVec<Local, bool>,
@@ -183,6 +193,7 @@ impl<'tcx> DecisionMaker<'tcx> {
             .cloned()
             .unwrap_or_else(|| DenseBitSet::new_empty(mutable_pointers.len()));
         DecisionMaker {
+            enable_slice_cursor: analysis.enable_slice_cursor,
             tcx,
             array_pointers,
             mutable_pointers,
@@ -340,6 +351,13 @@ impl<'tcx> DecisionMaker<'tcx> {
             }
         }
 
+        let controlled = decision.map(|kind| apply_cursor_policy(kind, self.enable_slice_cursor));
+        if controlled != decision {
+            events.push(DecisionInfoEvent {
+                before: decision, after: controlled, reason: DecisionReason::CursorDisabled, detail: None,
+            });
+            decision = controlled;
+        }
         let const_preserved = self.preserve_original_pointer_constness(decision, m.is_mut());
         if const_preserved != decision {
             events.push(DecisionInfoEvent {
@@ -1198,6 +1216,7 @@ mod tests {
         }
 
         DecisionMaker {
+            enable_slice_cursor: true,
             tcx,
             mutable_pointers,
             array_pointers,

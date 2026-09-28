@@ -70,6 +70,7 @@ pub struct InitialPointerDecisions {
 }
 
 pub struct Analysis {
+    pub(crate) enable_slice_cursor: bool,
     #[allow(dead_code)]
     pub(crate) borrow_promotion_result: BorrowPromotionResults,
     #[allow(dead_code)]
@@ -1648,6 +1649,7 @@ fn build_promotion_analysis<'tcx>(
     (
         input,
         Analysis {
+            enable_slice_cursor: config.enable_slice_cursor,
             borrow_promotion_result,
             borrow_lifetime_flows,
             promoted_mut_ref_result,

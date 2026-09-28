@@ -299,6 +299,7 @@ mod tests {
             nullity_result.non_null_locals =
                 source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
             let analysis = crate::rewriter::Analysis {
+                enable_slice_cursor: true,
                 borrow_promotion_result,
                 borrow_lifetime_flows,
                 promoted_mut_ref_result,

@@ -12,7 +12,7 @@ use rustc_span::def_id::LocalDefId;
 
 use super::{
     Analysis,
-    decision::{DecisionInfo, PtrKind, SigDecisions},
+    decision::{DecisionInfo, PtrKind, SigDecisions, apply_cursor_policy},
     diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
 use crate::{
@@ -238,6 +238,7 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                     );
                     ptr_kind = PtrKind::Raw(ptr_kind.is_mut());
                 }
+                ptr_kind = apply_cursor_policy(ptr_kind, analysis.enable_slice_cursor);
                 ptr_kinds.insert(*hir_id, ptr_kind);
             }
         }
