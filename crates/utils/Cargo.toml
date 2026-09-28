@@ -10,6 +10,7 @@ toml.workspace = true
 toml_edit.workspace = true
 lazy_static.workspace = true
 serde.workspace = true
+sha2.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true

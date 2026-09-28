@@ -108,7 +108,7 @@ fn walk_type<'tcx>(
         ty::Adt(def, args) => {
             // Local fields are inventoried at their definitions. Inspect type arguments,
             // never recursively multiply those fields at each declaration using the ADT.
-            if !def.did().is_local() {
+            if !def.did().is_local() && !ty.is_c_void(tcx) {
                 return Err(InventoryIssue {
                     locator: None,
                     reason: format!("unsupported external wrapper: {ty}"),
@@ -149,9 +149,26 @@ fn walk_type<'tcx>(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum DeclarationKey {
+    Global(LocalDefId, Site, u32),
+    Local(hir::HirId),
+}
+
 pub fn collect_inventory(tcx: TyCtxt<'_>, case_id: &str, stage: StageId) -> Inventory {
-    // Capture before HIR queries. Identity mapping consumes this AST in the next layer.
-    let _ast = crate::ast::expanded_ast(tcx);
+    let mut ast = crate::ast::expanded_ast(tcx);
+    let mapper = crate::ast::make_ast_to_hir(&mut ast, tcx);
+    collect_bound_inventory(tcx, &ast, &mapper, case_id, stage).0
+}
+
+/// Reuse the rewriter's AST and mapper; never request expanded_ast after HIR queries.
+pub fn collect_bound_inventory(
+    tcx: TyCtxt<'_>,
+    ast: &rustc_ast::Crate,
+    mapper: &crate::ir::AstToHir,
+    case_id: &str,
+    stage: StageId,
+) -> (Inventory, Vec<rustc_ast::NodeId>) {
     let mut collector = Collector {
         tcx,
         inventory: Inventory {
@@ -163,6 +180,7 @@ pub fn collect_inventory(tcx: TyCtxt<'_>, case_id: &str, stage: StageId) -> Inve
             declarations: Vec::new(),
             issues: Vec::new(),
         },
+        keys: Vec::new(),
         bindings: HashSet::new(),
         param_bindings: HashSet::new(),
         owners: BTreeMap::new(),
@@ -170,12 +188,44 @@ pub fn collect_inventory(tcx: TyCtxt<'_>, case_id: &str, stage: StageId) -> Inve
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut collector);
     crate::type_check(tcx);
-    collector.inventory
+    let mut declarations: HashMap<_, _> = collector
+        .keys
+        .into_iter()
+        .zip(collector.inventory.declarations)
+        .collect();
+    let sites = super::source::bound_sites(ast, mapper, tcx);
+    let mut nodes = Vec::new();
+    collector.inventory.declarations = Vec::new();
+    for (node, key) in sites {
+        if let Some(mut d) = declarations.remove(&key) {
+            let index = nodes.len();
+            d.locator = DeclarationLocator {
+                owner_path: vec![index as u32],
+                site: d.site,
+                ordinal: 0,
+                pattern_path: vec![],
+            };
+            d.declaration_id = DeclId(format!("{case_id}:decl:{index}"));
+            nodes.push(node);
+            collector.inventory.declarations.push(d);
+        }
+    }
+    for (_, d) in declarations {
+        collector.inventory.issues.push(InventoryIssue {
+            locator: Some(d.locator),
+            reason: format!(
+                "declaration has no source AST binding: {} {:?}",
+                d.owner, d.name
+            ),
+        });
+    }
+    (collector.inventory, nodes)
 }
 
 struct Collector<'tcx> {
     tcx: TyCtxt<'tcx>,
     inventory: Inventory,
+    keys: Vec<DeclarationKey>,
     bindings: HashSet<hir::HirId>,
     param_bindings: HashSet<hir::HirId>,
     owners: BTreeMap<String, u32>,
@@ -192,6 +242,7 @@ impl<'tcx> Collector<'tcx> {
         ty: Ty<'tcx>,
         span: Span,
     ) {
+        let owner_id = owner;
         let owner = self.tcx.def_path_str(owner.to_def_id());
         let next = self.owners.len() as u32;
         let owner_index = *self.owners.entry(owner.clone()).or_insert(next);
@@ -202,6 +253,8 @@ impl<'tcx> Collector<'tcx> {
             ordinal: *ordinal,
             pattern_path: vec![],
         };
+        self.keys
+            .push(DeclarationKey::Global(owner_id, site, *ordinal));
         *ordinal += 1;
         let (slots, pointer_state) = match classify_type(ty, self.tcx) {
             Ok(slots) => {
@@ -407,6 +460,7 @@ impl<'tcx> Visitor<'tcx> for Collector<'tcx> {
                 ty,
                 pat.span,
             );
+            *self.keys.last_mut().unwrap() = DeclarationKey::Local(id);
         }
         intravisit::walk_pat(self, pat);
     }
