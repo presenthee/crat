@@ -304,3 +304,18 @@ fn unsupported_issues_keep_distinct_structural_locators() {
         .collect();
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn distinct_anonymous_const_owners_have_distinct_signature_sites() {
+    let inv = inventory("const _: () = { fn check() {} }; const _: () = { fn check() {} };");
+    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
+    assert_eq!(inv.declarations.iter().filter(|d| d.site == Site::Return).count(), 2);
+}
+
+#[test]
+fn anonymous_constants_are_not_named_pointer_declarations() {
+    let inv = inventory("const _: *const u8 = 0 as *const u8; const KEEP: *const u8 = 0 as *const u8;");
+    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
+    assert_eq!(inv.declarations.iter().filter(|d| d.pointer_state == PointerState::Raw).count(), 1);
+    assert!(inv.declarations.iter().all(|d| d.name.as_deref() != Some("_")));
+}

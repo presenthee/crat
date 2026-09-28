@@ -616,3 +616,88 @@ impl rustc_ast::mut_visit::MutVisitor for Freshen<'_> {
 }
 #[cfg(test)]
 mod tests;
+
+/// Register only new items produced by the injected bytemuck derives. Compiler
+/// expansion provenance identifies them; original declarations keep their AST IDs.
+pub fn register_derive_support(
+    observer: &mut Measurement,
+    krate: &mut Crate,
+    code: &str,
+) -> Result<(), MeasurementError> {
+    use rustc_ast::{ItemKind, ModKind, ptr::P};
+    type Additions = BTreeMap<Vec<usize>, Vec<(usize, String)>>;
+    fn collect(
+        tcx: TyCtxt<'_>,
+        items: &[P<rustc_ast::Item>],
+        path: &mut Vec<usize>,
+        additions: &mut Additions,
+    ) {
+        let mut index = 0;
+        for item in items {
+            let expansion = item.span.ctxt().outer_expn_data();
+            let injected = expansion
+                .macro_def_id
+                .is_some_and(|did| tcx.crate_name(did.krate).as_str() == "bytemuck_derive");
+            if injected {
+                additions
+                    .entry(path.clone())
+                    .or_default()
+                    .push((index, rustc_ast_pretty::pprust::item_to_string(item)));
+                continue;
+            }
+            if let ItemKind::Mod(_, _, ModKind::Loaded(children, ..)) = &item.kind {
+                path.push(index);
+                collect(tcx, children, path, additions);
+                path.pop();
+            }
+            index += 1;
+        }
+    }
+    let code = code.to_owned();
+    let mut additions = std::thread::spawn(move || {
+        ::utils::compilation::run_compiler_on_str(&code, |tcx| {
+            let mut ast = ::utils::ast::expanded_ast(tcx);
+            ::utils::ast::remove_unnecessary_items_from_ast(&mut ast);
+            let mut additions = Additions::new();
+            collect(tcx, &ast.items, &mut vec![], &mut additions);
+            additions
+        })
+        .map_err(|_| MeasurementError::InvalidEvent("derive expansion failed".into()))
+    })
+    .join()
+    .map_err(|_| MeasurementError::InvalidEvent("derive expansion compiler panicked".into()))??;
+    fn insert(
+        observer: &mut Measurement,
+        items: &mut thin_vec::ThinVec<P<rustc_ast::Item>>,
+        path: &mut Vec<usize>,
+        additions: &mut Additions,
+    ) -> Result<(), MeasurementError> {
+        for (index, item) in items.iter_mut().enumerate() {
+            if let ItemKind::Mod(_, _, ModKind::Loaded(children, ..)) = &mut item.kind {
+                path.push(index);
+                insert(observer, children, path, additions)?;
+                path.pop();
+            }
+        }
+        if let Some(new_items) = additions.remove(path) {
+            for (index, source) in new_items.into_iter().rev() {
+                if index > items.len() {
+                    return Err(MeasurementError::InvalidEvent(
+                        "derive expansion structural position mismatch".into(),
+                    ));
+                }
+                let mut item = ::utils::item!("{source}");
+                observer.generated_support_item(&mut item);
+                items.insert(index, P(item));
+            }
+        }
+        Ok(())
+    }
+    insert(observer, &mut krate.items, &mut vec![], &mut additions)?;
+    if !additions.is_empty() {
+        return Err(MeasurementError::InvalidEvent(
+            "unmatched derive expansion container".into(),
+        ));
+    }
+    Ok(())
+}

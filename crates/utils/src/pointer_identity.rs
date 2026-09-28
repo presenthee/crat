@@ -240,8 +240,6 @@ pub fn crate_source_paths(root: &Path) -> Result<Vec<PathBuf>, MeasurementError>
                     | "target"
                     | ".git"
                     | ".superpowers"
-                    | "measurement"
-                    | "reports"
             ) {
                 continue;
             }

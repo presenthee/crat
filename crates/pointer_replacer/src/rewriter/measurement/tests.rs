@@ -941,3 +941,16 @@ fn measurement_cursor_off_fields_returns_callbacks_and_aliases() {
         }
     }
 }
+
+#[test]
+fn measurement_borrow_bytemuck_derive_support_is_mapped() {
+    let code = r#"
+#![feature(derive_clone_copy)]
+#[repr(C)] #[derive(Clone, Copy)] pub struct House { pub a: u32, pub b: u32 }
+pub unsafe fn first(p: *const u8) -> u8 { *p.offset(0) }
+pub unsafe fn bytes(h: House) -> u8 { first(&h as *const House as *const u8) }
+"#;
+    let (_, inventory, _, emission) = measure_borrow(code);
+    assert!(emission.source.contains("bytemuck::NoUninit"), "{}", emission.source);
+    assert!(inventory.declarations.iter().any(|d| d.scope == Scope::Support));
+}
