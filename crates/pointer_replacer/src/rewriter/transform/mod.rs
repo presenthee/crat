@@ -48,6 +48,7 @@ use crate::{
 };
 
 pub(crate) struct TransformVisitor<'a, 'tcx> {
+    measurement: Option<&'a mut super::measurement::Measurement>,
     tcx: TyCtxt<'tcx>,
     analysis: &'a Analysis,
     sig_decs: SigDecisions,
@@ -146,6 +147,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
     fn flat_map_item(&mut self, item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
         if self.should_remove_generated_copy_clone_impl(&item) {
+            if let Some(observer) = self.measurement.as_deref_mut() {
+                observer.delete_item(&item, "remove generated Copy/Clone implementation");
+            }
             return smallvec![];
         }
         mut_visit::walk_flat_map_item(self, item)
@@ -291,6 +295,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     );
                 }
 
+                let measured_param_ids = self.measurement.as_ref().map(|_| {
+                    fn_item
+                        .sig
+                        .decl
+                        .inputs
+                        .iter()
+                        .map(|p| p.ty.id)
+                        .collect::<Vec<_>>()
+                });
                 for (param_index, ((local_decl, input_dec), param)) in mir_body
                     .local_decls
                     .iter()
@@ -456,6 +469,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 }
 
+                if let Some(ids) = measured_param_ids {
+                    for (param, id) in fn_item.sig.decl.inputs.iter_mut().zip(ids) {
+                        param.ty.id = id;
+                    }
+                }
                 let output_dec_before = sig_dec.output_dec;
                 let output_lifetime = sig_dec.output_lifetime;
                 let adjusted_output_dec = output_dec_before.map(|output_dec| {
@@ -630,10 +648,30 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             .ty;
             let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl) else { return };
             self.transform_return_rhs(expr, hir_tail, output_kind, lhs_inner_ty);
+            if let Some(observer) = self.measurement.as_deref_mut() {
+                observer.generated_expr(
+                    expr,
+                    Some(node_id),
+                    "rewrite function return representation",
+                );
+            }
         }
     }
 
     fn flat_map_stmt(&mut self, s: Stmt) -> smallvec::SmallVec<[Stmt; 1]> {
+        let parent = self
+            .measurement
+            .as_deref()
+            .and_then(|observer| match &s.kind {
+                StmtKind::Expr(e) | StmtKind::Semi(e) => {
+                    if let ExprKind::Assign(lhs, _, _) = &e.kind {
+                        observer.storage_node(lhs, &self.ast_to_hir, self.tcx)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
         // C2Rust emits no-op path statements after updates (for example
         // `p = p.offset(1); p;`). Detect them before walking the statement:
         // pointer rewriting can turn the path into an offset expression, at
@@ -695,6 +733,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 _ => {
                     new_stmts.push(s);
                 }
+            }
+        }
+        if let Some(observer) = self.measurement.as_deref_mut() {
+            for stmt in &mut new_stmts {
+                observer.generated_stmt(stmt, parent, "introduce rewrite temporary");
             }
         }
         new_stmts
@@ -820,6 +863,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 if reborrow_mut_opt_ref {
                     *rhs = utils::expr!("({}).as_deref_mut()", pprust::expr_to_string(rhs));
                 }
+                if let Some(observer) = self.measurement.as_deref_mut() {
+                    observer.generated_expr(rhs, Some(local.pat.id), "rewrite pointer initializer");
+                }
             }
         }
 
@@ -837,7 +883,24 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         }
     }
 
+    fn visit_ty(&mut self, ty: &mut Ty) {
+        mut_visit::walk_ty(self, ty);
+        self.add_struct_lifetime_args_to_ty(ty);
+    }
+
     fn visit_expr(&mut self, expr: &mut Expr) {
+        let parent = self
+            .measurement
+            .as_deref()
+            .and_then(|observer| observer.storage_node(expr, &self.ast_to_hir, self.tcx));
+        self.rewrite_expr_inner(expr);
+        if let Some(observer) = self.measurement.as_deref_mut() {
+            observer.generated_expr(expr, parent, "rewrite pointer expression");
+        }
+    }
+}
+impl TransformVisitor<'_, '_> {
+    fn rewrite_expr_inner(&mut self, expr: &mut Expr) {
         mut_visit::walk_expr(self, expr);
         let expr_id = expr.id;
 
@@ -1427,11 +1490,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             _ => {}
         }
     }
-
-    fn visit_ty(&mut self, ty: &mut Ty) {
-        mut_visit::walk_ty(self, ty);
-        self.add_struct_lifetime_args_to_ty(ty);
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1712,6 +1770,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         fn_ptr_groups: FnPtrGroups,
         fn_ptr_rewrite: FnPtrRewriteDecision,
         diagnostics: DecisionDiagnostics,
+        measurement: Option<&'analysis mut super::measurement::Measurement>,
     ) -> TransformVisitor<'analysis, 'tcx> {
         let mut diagnostics = diagnostics;
         let lifetime_plans = super::lifetimes::LifetimePlans::new(rust_program, analysis);
@@ -2163,6 +2222,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             collect_borrowed_raw_params(rust_program.tcx, &initial_sig_decs, &sig_decs);
 
         let mut visitor = TransformVisitor {
+            measurement,
             tcx: rust_program.tcx,
             analysis,
             sig_decs,
@@ -2587,7 +2647,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         true
     }
 
-    fn insert_borrowed_raw_param_aliases(&self, def_id: LocalDefId, body: &mut Block) {
+    fn insert_borrowed_raw_param_aliases(&mut self, def_id: LocalDefId, body: &mut Block) {
         let hir_body = self.tcx.hir_body_owned_by(def_id);
         let mut insert_at = 0usize;
         for param in hir_body.params {
@@ -2598,10 +2658,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 continue;
             };
             let param_name = self.tcx.hir_name(hir_id).to_string();
-            body.stmts.insert(
-                insert_at,
-                utils::stmt!("let {} = {}.as_mut().unwrap();", info.alias, param_name),
-            );
+            let mut stmt = utils::stmt!("let {} = {}.as_mut().unwrap();", info.alias, param_name);
+            if let Some(observer) = self.measurement.as_deref_mut() {
+                let parent = observer.local_node(hir_id);
+                observer.generated_stmt(&mut stmt, parent, "introduce borrowed parameter alias");
+            }
+            body.stmts.insert(insert_at, stmt);
             insert_at += 1;
         }
     }
@@ -18973,6 +19035,7 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
                 crate::rewriter::diagnostics::DecisionDiagnostics::for_test(
                     crate::rewriter::diagnostics::DiagnosticsMode::Full,
                 ),
+                None,
             );
             visitor.diagnostics.events().to_vec()
         })

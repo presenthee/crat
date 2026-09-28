@@ -177,6 +177,13 @@ impl BytemuckDependency {
 }
 
 pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, BytemuckDependency) {
+    replace_local_borrows_observed(config, tcx, None)
+}
+pub fn replace_local_borrows_observed(
+    config: &Config,
+    tcx: TyCtxt<'_>,
+    mut measurement: Option<&mut measurement::Measurement>,
+) -> (String, BytemuckDependency) {
     let started = std::time::Instant::now();
     let progress = |step: &str| {
         if config.verbose {
@@ -186,6 +193,13 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     progress("build expanded AST");
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    if let Some(observer) = measurement.as_deref_mut() {
+        observer.start_stage(
+            utils::pointer_inventory::StageId("borrow".into()),
+            utils::pointer_lineage::Phase::Committed,
+        );
+        let _ = observer.bind(&krate, &ast_to_hir, tcx);
+    }
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let (input, analysis_results, fn_ptr_groups, fn_ptr_rewrite) =
@@ -201,6 +215,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         fn_ptr_groups,
         fn_ptr_rewrite,
         diagnostics,
+        measurement.as_deref_mut(),
     );
     visitor.visit_crate(&mut krate);
 
@@ -216,7 +231,22 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     visitor.emit_diagnostics();
     progress("done");
 
-    (code, visitor.bytemuck_dependency())
+    let bytemuck = visitor.bytemuck_dependency();
+    drop(visitor);
+    if let Some(observer) = measurement {
+        if slice_cursor_used {
+            match expanded_cursor_support() {
+                Ok(source) => {
+                    let mut item = utils::item!("{source}");
+                    observer.generated_support_item(&mut item);
+                    krate.items.push(rustc_ast::ptr::P(item));
+                }
+                Err(e) => observer.fail(e),
+            }
+        }
+        let _ = observer.finish(&krate, code.clone());
+    }
+    (code, bytemuck)
 }
 
 pub fn initial_pointer_decisions(
@@ -2165,6 +2195,36 @@ pub unsafe fn caller() -> *mut i32 {
         )
         .unwrap();
     }
+}
+
+// Expand only the known support source in an independent compiler session. Its
+// declarations must match the expansion seen when the emitted crate is compiled;
+// the ordinary, unexpanded support text remains the transformation output.
+fn expanded_cursor_support() -> Result<String, utils::pointer_identity::MeasurementError> {
+    static SOURCE: std::sync::OnceLock<Result<String, utils::pointer_identity::MeasurementError>> =
+        std::sync::OnceLock::new();
+    SOURCE
+        .get_or_init(|| {
+            std::thread::spawn(|| {
+                utils::compilation::run_compiler_on_str(slice_cursor_mod_str(), |tcx| {
+                    let mut ast = utils::ast::expanded_ast(tcx);
+                    utils::ast::remove_unnecessary_items_from_ast(&mut ast);
+                    pprust::crate_to_string_for_macros(&ast)
+                })
+                .map_err(|_| {
+                    utils::pointer_identity::MeasurementError::InvalidEvent(
+                        "cursor support expansion failed".into(),
+                    )
+                })
+            })
+            .join()
+            .map_err(|_| {
+                utils::pointer_identity::MeasurementError::InvalidEvent(
+                    "cursor support compiler panicked".into(),
+                )
+            })?
+        })
+        .clone()
 }
 
 fn slice_cursor_mod_str() -> &'static str {
