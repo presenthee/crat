@@ -129,8 +129,58 @@ pub fn reconcile(
             map.stage.0
         )));
     }
-    let inventory = pointer_inventory::collect_inventory(tcx, &map.case_id, map.stage.clone());
+    let mut ast = crate::ast::expanded_ast(tcx);
+    let mapper = crate::ast::make_ast_to_hir(&mut ast, tcx);
+    let roles = mapped_type_roles(&ast, &mapper, tcx, map);
+    let (inventory, _) = pointer_inventory::collect_bound_inventory_with_roles(
+        tcx,
+        &ast,
+        &mapper,
+        &map.case_id,
+        map.stage.clone(),
+        &roles,
+    );
+    crate::type_check(tcx);
     reconcile_inventory(inventory, map)
+}
+
+/// A cursor role requires both an explicit support declaration map and the
+/// compiler identity of its owning struct. User types with that name do not qualify.
+pub fn mapped_type_roles(
+    ast: &rustc_ast::Crate,
+    mapper: &crate::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+    map: &DeclarationMap,
+) -> TypeRoles {
+    let support: BTreeSet<_> = map
+        .entries
+        .iter()
+        .filter(|e| e.scope == Scope::Support)
+        .map(|e| &e.locator)
+        .collect();
+    let mut roles = TypeRoles::default();
+    for site in source_sites(ast) {
+        if site.locator.site != Site::Field || !support.contains(&site.locator) {
+            continue;
+        }
+        let Some(field) = mapper.global_map.get(&site.node) else {
+            continue;
+        };
+        let owner = tcx.parent(field.to_def_id());
+        if tcx.def_kind(owner) != rustc_hir::def::DefKind::Struct {
+            continue;
+        }
+        match tcx.item_name(owner).as_str() {
+            "SliceCursor" => {
+                roles.cursors.insert(owner, false);
+            }
+            "SliceCursorMut" => {
+                roles.cursors.insert(owner, true);
+            }
+            _ => (),
+        }
+    }
+    roles
 }
 
 pub fn reconcile_inventory(

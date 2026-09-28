@@ -713,3 +713,158 @@ pub unsafe fn foo(mut p: *mut i32, n: isize) -> i32 {
     .unwrap();
     assert_eq!(ordinary, result.source);
 }
+
+fn measure_borrow(
+    code: &str,
+) -> (
+    ::utils::pointer_inventory::Inventory,
+    ::utils::pointer_inventory::Inventory,
+    Measurement,
+    Emission,
+) {
+    let baseline = run_compiler_on_str(code, |tcx| {
+        ::utils::pointer_inventory::collect_inventory(tcx, "fixture", StageId("input".into()))
+    })
+    .unwrap();
+    let config = super::super::Config::default();
+    let ordinary = run_compiler_on_str(code, |tcx| {
+        super::super::replace_local_borrows(&config, tcx)
+    })
+    .unwrap();
+    let mut measurement = Measurement::new(seed_map(&baseline));
+    let observed = run_compiler_on_str(code, |tcx| {
+        super::super::replace_local_borrows_observed(&config, tcx, Some(&mut measurement))
+    })
+    .unwrap();
+    assert_eq!(ordinary, observed);
+    let emissions = measurement.take_emissions().unwrap();
+    assert_eq!(emissions.len(), 1);
+    let emission = emissions.into_iter().next().unwrap();
+    let final_inventory = run_compiler_on_str(&observed.0, |tcx| {
+        ::utils::pointer_identity::reconcile(tcx, &emission.delta.map, &Default::default())
+    })
+    .unwrap()
+    .unwrap();
+    (baseline, final_inventory, measurement, emission)
+}
+#[test]
+fn measurement_borrow_final_type_wins() {
+    let code = r#"
+#[repr(C)] pub struct Holder { pub p: *mut i32 }
+pub unsafe fn conflict() -> i32 {
+    let mut x = 0; let mut h = Holder { p: &raw mut x };
+    x = 1; *h.p = 2; x
+}
+pub unsafe fn identity(x: *mut i32) -> *mut i32 { x }
+"#;
+    let (before, after, _, _) = measure_borrow(code);
+    let field = before
+        .declarations
+        .iter()
+        .find(|d| d.site == ::utils::pointer_inventory::Site::Field)
+        .unwrap();
+    let final_field = after
+        .declarations
+        .iter()
+        .find(|d| d.declaration_id == field.declaration_id)
+        .unwrap();
+    assert_eq!(final_field.pointer_state, PointerState::Raw);
+    for original in before.declarations {
+        assert!(
+            after
+                .declarations
+                .iter()
+                .any(|d| d.declaration_id == original.declaration_id)
+        );
+    }
+    assert!(
+        after
+            .declarations
+            .iter()
+            .any(|d| d.owner.ends_with("identity") && d.pointer_state == PointerState::Promoted)
+    );
+}
+#[test]
+fn measurement_borrow_alias_retains_parent() {
+    let code = r#"
+#[repr(C)] pub struct State { pub buflen: i32, pub t: [u32; 2] }
+unsafe extern "C" { fn touch_state(state: *mut State); fn touch_words(words: *mut u32); }
+pub unsafe extern "C" fn update(mut S: *mut State) -> i32 {
+    let mut left = (*S).buflen;
+    (*S).t[0] = ((*S).t[0]).wrapping_add(1);
+    let words: *mut u32 = ((*S).t).as_mut_ptr();
+    touch_words(words); touch_state(S);
+    left + (*S).t[0] as i32
+}
+"#;
+    let (before, after, measurement, _) = measure_borrow(code);
+    let origin = before
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("S"))
+        .unwrap();
+    let alias = after
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("__crat_borrowed_S"))
+        .unwrap();
+    let finals = after
+        .declarations
+        .iter()
+        .map(|d| d.declaration_id.clone())
+        .collect();
+    assert!(
+        measurement
+            .ledger()
+            .descendants(&origin.declaration_id, &finals)
+            .unwrap()
+            .contains(&alias.declaration_id)
+    );
+}
+#[test]
+fn measurement_cursor_support_is_separate() {
+    let code = r#"
+pub mod user { pub struct SliceCursor<T>(pub T); }
+pub fn user_type(x: user::SliceCursor<u8>) {}
+pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) { *p.offset(a).offset(b) = 1; }
+"#;
+    let (_, after, _, emission) = measure_borrow(code);
+    assert!(emission.source.contains("pub mod slice_cursor"));
+    let p = after
+        .declarations
+        .iter()
+        .find(|d| d.scope == Scope::Application && d.name.as_deref() == Some("p"))
+        .unwrap();
+    assert_eq!(p.pointer_state, PointerState::Promoted);
+    assert_eq!(
+        p.slots[0].kind,
+        ::utils::pointer_inventory::PointerKind::SliceCursorMut
+    );
+    let user = after
+        .declarations
+        .iter()
+        .find(|d| d.owner.ends_with("user_type") && d.name.as_deref() == Some("x"))
+        .unwrap();
+    assert_eq!(user.pointer_state, PointerState::Nonpointer);
+    assert!(
+        after
+            .declarations
+            .iter()
+            .any(|d| d.scope == Scope::Support && d.pointer_state == PointerState::Raw)
+    );
+    assert_eq!(
+        after
+            .declarations
+            .iter()
+            .filter(|d| d.scope == Scope::Application && d.pointer_state == PointerState::Raw)
+            .count(),
+        0
+    );
+    assert!(
+        after
+            .declarations
+            .iter()
+            .filter(|d| d.owner.starts_with("slice_cursor::"))
+            .all(|d| d.scope == Scope::Support)
+    );
+}

@@ -24,7 +24,7 @@ pub fn classify_type<'tcx>(
 
 /// Compiler identities established by the injected-support declaration map.
 /// Names alone never confer a custom pointer representation.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TypeRoles {
     pub cursors: HashMap<DefId, bool>,
 }
@@ -108,7 +108,19 @@ fn walk_type<'tcx>(
         ty::Adt(def, args) => {
             // Local fields are inventoried at their definitions. Inspect type arguments,
             // never recursively multiply those fields at each declaration using the ADT.
-            if !def.did().is_local() && !ty.is_c_void(tcx) {
+            let lang = tcx.lang_items();
+            let is_range = [
+                lang.range_struct(),
+                lang.range_from_struct(),
+                lang.range_to_struct(),
+                lang.range_full_struct(),
+                lang.range_inclusive_struct(),
+                lang.range_to_inclusive_struct(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|did| did == def.did());
+            if !def.did().is_local() && !ty.is_c_void(tcx) && !is_range {
                 return Err(InventoryIssue {
                     locator: None,
                     reason: format!("unsupported external wrapper: {ty}"),
@@ -171,8 +183,20 @@ pub fn collect_bound_inventory(
     case_id: &str,
     stage: StageId,
 ) -> (Inventory, Vec<rustc_ast::NodeId>) {
+    collect_bound_inventory_with_roles(tcx, ast, mapper, case_id, stage, &TypeRoles::default())
+}
+
+pub fn collect_bound_inventory_with_roles(
+    tcx: TyCtxt<'_>,
+    ast: &rustc_ast::Crate,
+    mapper: &crate::ir::AstToHir,
+    case_id: &str,
+    stage: StageId,
+    roles: &TypeRoles,
+) -> (Inventory, Vec<rustc_ast::NodeId>) {
     let mut collector = Collector {
         tcx,
+        roles: roles.clone(),
         inventory: Inventory {
             schema_version: 1,
             case_id: case_id.into(),
@@ -201,6 +225,7 @@ pub fn collect_bound_inventory(
         .into_iter()
         .map(|s| (s.node, s))
         .collect();
+    let mut locator_changes = BTreeMap::new();
     for (node, key) in sites {
         if let Some(mut d) = declarations.remove(&key) {
             let index = nodes.len();
@@ -211,11 +236,21 @@ pub fn collect_bound_inventory(
                 });
                 continue;
             };
+            locator_changes.insert(d.locator.clone(), source_site.locator.clone());
             d.locator = source_site.locator.clone();
             d.name = source_site.name.clone();
             d.declaration_id = DeclId(format!("{case_id}:decl:{index}"));
             nodes.push(node);
             collector.inventory.declarations.push(d);
+        }
+    }
+    for issue in &mut collector.inventory.issues {
+        if let Some(locator) = issue
+            .locator
+            .as_ref()
+            .and_then(|old| locator_changes.get(old))
+        {
+            issue.locator = Some(locator.clone());
         }
     }
     for (_, d) in declarations {
@@ -231,6 +266,7 @@ pub fn collect_bound_inventory(
 }
 
 struct Collector<'tcx> {
+    roles: TypeRoles,
     tcx: TyCtxt<'tcx>,
     inventory: Inventory,
     keys: Vec<DeclarationKey>,
@@ -264,7 +300,11 @@ impl<'tcx> Collector<'tcx> {
         self.keys
             .push(DeclarationKey::Global(owner_id, site, *ordinal));
         *ordinal += 1;
-        let (slots, pointer_state) = match classify_type(ty, self.tcx) {
+        let ty = self
+            .tcx
+            .try_normalize_erasing_regions(ty::TypingEnv::post_analysis(self.tcx, owner_id), ty)
+            .unwrap_or(ty);
+        let (slots, pointer_state) = match classify_type_with_roles(ty, self.tcx, &self.roles) {
             Ok(slots) => {
                 let state = if slots.iter().any(|s| s.kind.is_raw()) {
                     PointerState::Raw

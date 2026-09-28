@@ -258,6 +258,34 @@ impl Measurement {
         entry.0.extend(outputs.iter().copied());
     }
 
+    pub fn fail(&mut self, error: MeasurementError) {
+        self.error = Some(error);
+    }
+
+    pub fn delete_item(&mut self, item: &rustc_ast::Item, reason: &str) {
+        let nodes: Vec<_> = ::utils::pointer_inventory::source_sites_in_item(item)
+            .iter()
+            .filter(|s| self.nodes.contains_key(&s.node))
+            .map(|s| s.node)
+            .collect();
+        if !nodes.is_empty() {
+            self.record_nodes(Operation::Delete, &nodes, &[], reason);
+        }
+    }
+
+    pub fn generated_support_item(&mut self, item: &mut rustc_ast::Item) {
+        use rustc_ast::mut_visit::MutVisitor;
+        Freshen { observer: self }.visit_item(item);
+        let sites = ::utils::pointer_inventory::source_sites_in_item(item);
+        let nodes: Vec<_> = sites.iter().map(|s| s.node).collect();
+        self.generated_sites(sites, None, "inject cursor runtime");
+        for node in nodes {
+            if let Err(e) = self.set_output_scope(node, Scope::Support) {
+                self.error = Some(e);
+            }
+        }
+    }
+
     pub fn generated_stmt(
         &mut self,
         stmt: &mut rustc_ast::Stmt,

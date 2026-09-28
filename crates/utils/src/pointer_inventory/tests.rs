@@ -285,3 +285,22 @@ fn opaque_c_void_pointee_is_not_an_unknown_wrapper() {
     assert!(inv.issues.is_empty(), "{:?}", inv.issues);
     assert_eq!(inv.declarations[0].pointer_state, PointerState::Raw);
 }
+
+#[test]
+fn unsupported_issues_keep_distinct_structural_locators() {
+    let inv = inventory(
+        "fn a(p: std::ptr::NonNull<u8>) {} fn b(q: std::ptr::NonNull<u8>) {} fn c(r: std::ptr::NonNull<u8>) {}",
+    );
+    let expected: std::collections::BTreeSet<_> = inv
+        .declarations
+        .iter()
+        .filter(|d| d.pointer_state == PointerState::Unsupported)
+        .map(|d| d.locator.clone())
+        .collect();
+    let actual: std::collections::BTreeSet<_> = inv
+        .issues
+        .iter()
+        .filter_map(|i| i.locator.clone())
+        .collect();
+    assert_eq!(actual, expected);
+}
