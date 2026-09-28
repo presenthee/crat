@@ -19,6 +19,7 @@ typed-arena.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+toml.workspace = true
 similar = "2.7.0"
 
 [package.metadata.rust-analyzer]
