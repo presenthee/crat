@@ -268,8 +268,23 @@ fn analyze<'tcx>(
 }
 
 pub fn rewrite_struct_arrays(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+    rewrite_struct_arrays_observed(config, tcx, None)
+}
+
+pub fn rewrite_struct_arrays_observed(
+    config: &Config,
+    tcx: TyCtxt<'_>,
+    mut measurement: Option<&mut measurement::Measurement>,
+) -> (String, bool) {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    if let Some(observer) = measurement.as_deref_mut() {
+        observer.start_stage(
+            utils::pointer_inventory::StageId("struct_arrays".into()),
+            utils::pointer_lineage::Phase::Committed,
+        );
+        let _ = observer.bind(&krate, &ast_to_hir, tcx);
+    }
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let input = collect_input(tcx);
@@ -289,17 +304,37 @@ pub fn rewrite_struct_arrays(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         &candidates,
         tcx,
         &ast_to_hir,
+        measurement.as_deref_mut(),
     );
 
-    (pprust::crate_to_string_for_macros(&krate), changed)
+    let source = pprust::crate_to_string_for_macros(&krate);
+    if let Some(observer) = measurement {
+        let _ = observer.finish(&krate, source.clone());
+    }
+    (source, changed)
 }
 
 pub fn rewrite_struct_param_fields(
     config: &Config,
     tcx: TyCtxt<'_>,
 ) -> (String, bool, utils::field_spec::FieldSpecMap) {
+    rewrite_struct_param_fields_observed(config, tcx, None)
+}
+
+pub fn rewrite_struct_param_fields_observed(
+    config: &Config,
+    tcx: TyCtxt<'_>,
+    mut measurement: Option<&mut measurement::Measurement>,
+) -> (String, bool, utils::field_spec::FieldSpecMap) {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    if let Some(observer) = measurement.as_deref_mut() {
+        observer.start_stage(
+            utils::pointer_inventory::StageId("struct_param_fields".into()),
+            utils::pointer_lineage::Phase::Committed,
+        );
+        let _ = observer.bind(&krate, &ast_to_hir, tcx);
+    }
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let input = collect_input(tcx);
@@ -328,13 +363,18 @@ pub fn rewrite_struct_param_fields(
         &config.c_exposed_fns,
     );
 
-    let (changed, field_specs) =
-        struct_param_field_spec::apply_struct_param_field_spec(&mut krate, &plan, tcx, &ast_to_hir);
-    (
-        pprust::crate_to_string_for_macros(&krate),
-        changed,
-        field_specs,
-    )
+    let (changed, field_specs) = struct_param_field_spec::apply_struct_param_field_spec(
+        &mut krate,
+        &plan,
+        tcx,
+        &ast_to_hir,
+        measurement.as_deref_mut(),
+    );
+    let source = pprust::crate_to_string_for_macros(&krate);
+    if let Some(observer) = measurement {
+        let _ = observer.finish(&krate, source.clone());
+    }
+    (source, changed, field_specs)
 }
 
 /// Snapshot-isolation sub-pass: inserts immutable copies of read-only
