@@ -16,3 +16,5 @@ pub mod mapper;
 pub mod mir;
 pub mod unsafe_finder;
 pub mod void_finder;
+
+pub mod pointer_finder;

@@ -9,6 +9,9 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 use passes::*;
+#[path = "crat/pointer_measurement.rs"]
+mod pointer_measurement;
+use pointer_measurement::required as measured;
 use serde::Deserialize;
 use utils::compilation::run_compiler_on_path;
 
@@ -115,6 +118,10 @@ struct Args {
     unexpand_use_print: bool,
 
     // Pointer
+    #[arg(long, requires = "pointer_measurement_dir")]
+    pointer_origin_map: Option<PathBuf>,
+    #[arg(long, requires = "pointer_origin_map")]
+    pointer_measurement_dir: Option<PathBuf>,
     #[arg(
         long,
         help = "Enable verbose ownership solver output for the pointer pass"
@@ -254,6 +261,11 @@ fn main() {
 
     if !config.passes.is_empty() && config.analysis.is_some() {
         eprintln!("Cannot run analysis and passes at the same time");
+        std::process::exit(1);
+    }
+
+    if args.pointer_origin_map.is_some() && !matches!(config.passes.as_slice(), [Pass::Pointer]) {
+        eprintln!("Pointer measurement requires exactly --pass pointer");
         std::process::exit(1);
     }
 
@@ -428,6 +440,15 @@ fn main() {
     });
     let file = dir.join(&lib_path);
 
+    let mut measurement = args.pointer_origin_map.as_ref().map(|origin| {
+        let mut session = measured(pointer_measurement::Session::new(
+            origin,
+            args.pointer_measurement_dir.as_ref().unwrap(),
+        ));
+        measured(session.bind_input(&dir, Path::new(&lib_path)));
+        session
+    });
+
     for pass in config.passes {
         if config.verbose {
             println!("{pass:?}");
@@ -582,19 +603,30 @@ fn main() {
                         println!("Pointer: rewrite struct arrays");
                     }
                     let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                        pointer_replacer::rewrite_struct_arrays(&config.pointer, tcx)
+                        pointer_replacer::rewrite_struct_arrays_observed(
+                            &config.pointer,
+                            tcx,
+                            measurement.as_mut().map(|s| &mut s.measurement),
+                        )
                     })
                     .unwrap();
                     if changed {
                         std::fs::write(&file, s).unwrap();
                     }
                 }
+                if let Some(session) = measurement.as_mut() {
+                    measured(session.record_pending());
+                }
                 if config.pointer.enable_struct_param_fields {
                     if config.verbose {
                         println!("Pointer: rewrite struct parameter fields");
                     }
                     let (s, changed, field_specs) = run_compiler_on_path(&file, |tcx| {
-                        pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
+                        pointer_replacer::rewrite_struct_param_fields_observed(
+                            &config.pointer,
+                            tcx,
+                            measurement.as_mut().map(|s| &mut s.measurement),
+                        )
                     })
                     .unwrap();
                     if !field_specs.is_empty() {
@@ -617,18 +649,30 @@ fn main() {
                 if config.verbose {
                     println!("Pointer: run gated pointer prepasses");
                 }
+                if let Some(session) = measurement.as_mut() {
+                    measured(session.record_pending());
+                }
                 let checkpoint_source = std::fs::read_to_string(&file).unwrap();
-                let gated = pointer_replacer::run_gated_pointer_prepasses(
+                let gated = pointer_replacer::run_gated_pointer_prepasses_observed(
                     &config.pointer,
                     &checkpoint_source,
+                    measurement.as_mut().map(|s| &mut s.measurement),
                 );
+                if let Some(session) = measurement.as_mut() {
+                    measured(session.record_gate(&gated));
+                    measured(session.record_pending());
+                }
                 std::fs::write(&file, gated.source).unwrap();
 
                 if config.verbose {
                     println!("Pointer: replace local borrows");
                 }
                 let (s, bytemuck) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::replace_local_borrows(&config.pointer, tcx)
+                    pointer_replacer::replace_local_borrows_observed(
+                            &config.pointer,
+                            tcx,
+                            measurement.as_mut().map(|s| &mut s.measurement),
+                        )
                 })
                 .unwrap();
                 std::fs::write(&file, s).unwrap();
@@ -636,6 +680,11 @@ fn main() {
                     utils::bytemuck::ensure_bytemuck_with_derive(&dir);
                 } else if bytemuck.needs_runtime() && !utils::has_dependency(&dir, "bytemuck") {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
+                }
+                if let Some(session) = measurement.as_mut() {
+                    measured(session.record_pending());
+                    let inventory = measured(session.collect_final());
+                    measured(session.finish(inventory));
                 }
             }
             Pass::Static => {

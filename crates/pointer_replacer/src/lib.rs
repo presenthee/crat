@@ -36,6 +36,8 @@ pub use rewriter::{
         CandidateId, CandidateMeasurement, ProfitabilityDecision, ProfitabilityMetric,
         ProfitabilityMetrics, RejectionReason,
     },
+    measurement, replace_local_borrows_observed, rewrite_struct_arrays_observed,
+    rewrite_struct_param_fields_observed, run_gated_pointer_prepasses_observed,
     replace_local_borrows, rewrite_aliasing, rewrite_array_local_provenance, rewrite_epoch_split,
     rewrite_struct_arrays, rewrite_struct_param_fields, run_gated_pointer_prepasses,
 };
