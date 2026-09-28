@@ -8,6 +8,17 @@ use utils::compilation::run_compiler_on_path;
 #[derive(Parser)]
 #[command(version)]
 struct Args {
+    #[arg(long, help = "Verified declaration map for this exact source version")]
+    pointer_declaration_map: Option<PathBuf>,
+    #[arg(long, help = "Write the seeded or reconciled declaration map")]
+    pointer_write_map: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with = "pointer_declaration_map",
+        help = "Stable suite/group/case identity for a new inventory"
+    )]
+    pointer_case_id: Option<String>,
+
     #[arg(long, help = "Show spans for unsafe operations")]
     unsafe_show_spans: bool,
 
@@ -27,6 +38,7 @@ enum Finder {
     Mir,
     Unsafe,
     Void,
+    Pointers,
 }
 
 fn main() {
@@ -37,6 +49,50 @@ fn main() {
     });
     let file = args.input.join(&lib_path);
     match args.finder {
+        Finder::Pointers => {
+            let result = (|| -> Result<_, Box<dyn std::error::Error>> {
+                use utils::{
+                    pointer_identity::{crate_hashes, relative_locations, seed_map},
+                    pointer_inventory::DeclarationMap,
+                };
+                let map: Option<DeclarationMap> = args
+                    .pointer_declaration_map
+                    .as_ref()
+                    .map(|path| -> Result<_, Box<dyn std::error::Error>> {
+                        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+                    })
+                    .transpose()?;
+                let hashes = crate_hashes(&args.input)?;
+                let mut inventory = run_compiler_on_path(&file, |tcx| {
+                    finders::pointer_finder::find_pointers(tcx, map.as_ref(), &hashes)
+                })
+                .map_err(|_| "pointer inventory compilation failed")??;
+                relative_locations(&mut inventory, &args.input)?;
+                if map.is_none() {
+                    inventory.case_id = args.pointer_case_id.unwrap_or_else(|| {
+                        args.input
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    for (index, d) in inventory.declarations.iter_mut().enumerate() {
+                        d.declaration_id.0 = format!("{}:input:decl:{index}", inventory.case_id);
+                    }
+                }
+                if let Some(path) = args.pointer_write_map {
+                    std::fs::write(path, serde_json::to_vec_pretty(&seed_map(&inventory))?)?;
+                }
+                Ok(inventory)
+            })();
+            match result {
+                Ok(inventory) => println!("{}", serde_json::to_string(&inventory).unwrap()),
+                Err(error) => {
+                    eprintln!("Pointer inventory: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Finder::Example => {
             run_compiler_on_path(&file, finders::example::run).unwrap();
         }

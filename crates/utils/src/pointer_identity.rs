@@ -224,3 +224,88 @@ pub fn reconcile_inventory(
 
 #[cfg(test)]
 mod tests;
+
+/// Exact compiler inputs for a crate snapshot, excluding configuration overlays,
+/// build caches and measurement output. Never follow an escaping symlink.
+pub fn crate_source_paths(root: &Path) -> Result<Vec<PathBuf>, MeasurementError> {
+    fn walk(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), MeasurementError> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                "aws-translate"
+                    | "bundles"
+                    | "target"
+                    | ".git"
+                    | ".superpowers"
+                    | "measurement"
+                    | "reports"
+            ) {
+                continue;
+            }
+            let path = entry.path();
+            let canonical = path.canonicalize()?;
+            if !canonical.starts_with(root)
+                || canonical
+                    .components()
+                    .any(|c| matches!(c.as_os_str().to_str(), Some("aws-translate" | "bundles")))
+            {
+                return Err(MeasurementError::Io(format!(
+                    "source escapes crate: {}",
+                    path.display()
+                )));
+            }
+            if path.is_dir() {
+                if entry.file_type()?.is_symlink() {
+                    return Err(MeasurementError::Io(
+                        "symlinked source directory is unsupported".into(),
+                    ));
+                }
+                walk(root, &path, files)?;
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                || matches!(
+                    name.as_ref(),
+                    "Cargo.toml" | "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml"
+                )
+                || path.strip_prefix(root).ok() == Some(Path::new(".cargo/config.toml"))
+            {
+                files.push(path.strip_prefix(root).unwrap().to_owned());
+            }
+        }
+        Ok(())
+    }
+    if root
+        .components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some("aws-translate" | "bundles")))
+    {
+        return Err(MeasurementError::Io("prohibited input tree".into()));
+    }
+    let root = root.canonicalize()?;
+    let mut files = Vec::new();
+    walk(&root, &root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+pub fn crate_hashes(root: &Path) -> Result<SourceHashes, MeasurementError> {
+    hash_sources(root, &crate_source_paths(root)?)
+}
+
+pub fn relative_locations(inventory: &mut Inventory, root: &Path) -> Result<(), MeasurementError> {
+    let root = root.canonicalize()?;
+    for declaration in &mut inventory.declarations {
+        let file = Path::new(&declaration.location.file);
+        if file.is_absolute() {
+            declaration.location.file = file
+                .strip_prefix(&root)
+                .map_err(|_| {
+                    MeasurementError::Io(format!("declaration outside crate: {}", file.display()))
+                })?
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    Ok(())
+}
