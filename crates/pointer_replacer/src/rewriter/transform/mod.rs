@@ -34,7 +34,7 @@ use super::{
         CursorDemotion, CursorDemotionValidationError, CursorOwner, FinalCursorDecisionView,
         resolve_late_cursors, validate_cursor_demotions,
     },
-    decision::{PtrKind, SigDecision, SigDecisions},
+    decision::{PtrKind, SigDecision, SigDecisions, apply_cursor_policy},
     diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
 use crate::{
@@ -2389,7 +2389,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         };
         if self.field_is_array_like(field) {
             if self.field_cursor_fields.contains(&field) {
-                Some(PtrKind::SliceCursor(mutability))
+                Some(apply_cursor_policy(PtrKind::SliceCursor(mutability), self.analysis.enable_slice_cursor))
             } else {
                 Some(PtrKind::Slice(mutability))
             }
@@ -2625,7 +2625,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         };
         if self.field_is_array_like(field) {
             if self.field_cursor_fields.contains(&field) {
-                Some(PtrKind::SliceCursor(mutability))
+                Some(apply_cursor_policy(PtrKind::SliceCursor(mutability), self.analysis.enable_slice_cursor))
             } else {
                 Some(PtrKind::Slice(mutability))
             }
@@ -15189,6 +15189,9 @@ fn collect_demoted_promoted_fields(
         sig_decs,
         ptr_kinds,
     );
+    if !analysis.enable_slice_cursor {
+        demoted_fields.extend(analysis.offset_sign_result.field_access_signs.iter().copied());
+    }
     let bitfield_structs = tcx
         .hir_free_items()
         .filter_map(|item_id| {
@@ -17174,7 +17177,7 @@ fn borrow_promoted_array_field_kind(
         return None;
     }
     if field_cursor_fields.contains(&field) {
-        Some(PtrKind::SliceCursor(mutability))
+        Some(apply_cursor_policy(PtrKind::SliceCursor(mutability), analysis.enable_slice_cursor))
     } else {
         Some(PtrKind::Slice(mutability))
     }
@@ -18966,6 +18969,7 @@ mod tests {
         nullity_result.non_null_locals =
             source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
         let analysis = super::super::Analysis {
+            enable_slice_cursor: true,
             borrow_promotion_result,
             borrow_lifetime_flows,
             promoted_mut_ref_result,

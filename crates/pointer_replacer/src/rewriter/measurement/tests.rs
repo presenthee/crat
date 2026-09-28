@@ -722,11 +722,22 @@ fn measure_borrow(
     Measurement,
     Emission,
 ) {
+    measure_borrow_config(code, &super::super::Config::default())
+}
+
+fn measure_borrow_config(
+    code: &str,
+    config: &super::super::Config,
+) -> (
+    ::utils::pointer_inventory::Inventory,
+    ::utils::pointer_inventory::Inventory,
+    Measurement,
+    Emission,
+) {
     let baseline = run_compiler_on_str(code, |tcx| {
         ::utils::pointer_inventory::collect_inventory(tcx, "fixture", StageId("input".into()))
     })
     .unwrap();
-    let config = super::super::Config::default();
     let ordinary = run_compiler_on_str(code, |tcx| {
         super::super::replace_local_borrows(&config, tcx)
     })
@@ -896,4 +907,37 @@ fn measurement_config_defaults_and_stage_controls() {
     assert!(result.combined_trial_failed);
     assert!(!result.phases.contains(&P::AliasingFallback));
     assert_eq!(result.source, "fn f() {}");
+}
+
+#[test]
+fn measurement_cursor_off_retains_backward_offset_raw() {
+    use ::utils::pointer_inventory::PointerKind;
+    let config = super::super::Config { enable_slice_cursor: false, ..Default::default() };
+    let code = "pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) { *p.offset(a).offset(b) = 1; }";
+    let (_, on, _, on_emission) = measure_borrow(code);
+    assert!(on_emission.source.contains("crate::slice_cursor::"));
+    assert!(on.declarations.iter().any(|d| d.slots.iter().any(|s| s.kind == PointerKind::SliceCursorMut)));
+    let (_, off, _, emission) = measure_borrow_config(code, &config);
+    assert!(!emission.source.contains("crate::slice_cursor::"));
+    assert_eq!(off.declarations.iter().find(|d| d.name.as_deref() == Some("p")).unwrap().pointer_state, PointerState::Raw);
+    let (_, forward, _, _) = measure_borrow_config("pub unsafe fn f(p: *const u8) -> u8 { *p.offset(1) }", &config);
+    assert!(forward.declarations.iter().find(|d| d.name.as_deref() == Some("p")).unwrap().slots.iter().any(|s| s.kind == PointerKind::Slice));
+}
+
+#[test]
+fn measurement_cursor_off_fields_returns_callbacks_and_aliases() {
+    let config = super::super::Config { enable_slice_cursor: false, ..Default::default() };
+    for code in [
+        "pub struct Holder { pub p: *const i32 } pub unsafe fn f(buf: [i32;4]) -> i32 { let h = Holder { p: buf.as_ptr().offset(3) }; *h.p.offset(-1) }",
+        "pub struct State { pub words: *mut u32, pub index: i32, pub count: i32 } pub unsafe fn f(s: *const State) -> *const i8 { (((*s).words.offset((*s).index as isize)) as *mut i8).offset(-(((*s).count / 8) as isize)) as *const i8 }",
+        "pub struct Bs { pub buf: *const u8, pub pos: i32 } pub unsafe fn f(bs: *const Bs) -> u8 { let mut p = (*bs).buf.offset((*bs).pos as isize); let first = *p; p = p.offset(1); first + *p }",
+        "pub unsafe fn back(p: *const u8) -> u8 { *p.offset(-1) } pub unsafe fn front(p: *const u8) -> u8 { *p.add(1) } pub unsafe fn call(p: *const u8, b: bool) -> u8 { let f: unsafe fn(*const u8)->u8 = if b { back } else { front }; f(p) }",
+    ] {
+        let (_, inventory, _, emission) = measure_borrow_config(code, &config);
+        assert!(!emission.source.contains("crate::slice_cursor::"), "{}", emission.source);
+        assert!(!emission.source.contains("pub mod slice_cursor"));
+        for d in inventory.declarations.iter().filter(|d| d.site == ::utils::pointer_inventory::Site::Field && matches!(d.name.as_deref(), Some("p" | "words" | "buf"))) {
+            assert_eq!(d.pointer_state, PointerState::Raw);
+        }
+    }
 }
