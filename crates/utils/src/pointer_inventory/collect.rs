@@ -196,15 +196,22 @@ pub fn collect_bound_inventory(
     let sites = super::source::bound_sites(ast, mapper, tcx);
     let mut nodes = Vec::new();
     collector.inventory.declarations = Vec::new();
+    let source_sites: HashMap<_, _> = super::source::source_sites(ast)
+        .into_iter()
+        .map(|s| (s.node, s))
+        .collect();
     for (node, key) in sites {
         if let Some(mut d) = declarations.remove(&key) {
             let index = nodes.len();
-            d.locator = DeclarationLocator {
-                owner_path: vec![index as u32],
-                site: d.site,
-                ordinal: 0,
-                pattern_path: vec![],
+            let Some(source_site) = source_sites.get(&node) else {
+                collector.inventory.issues.push(InventoryIssue {
+                    locator: Some(d.locator),
+                    reason: format!("missing structural source site: {node:?}"),
+                });
+                continue;
             };
+            d.locator = source_site.locator.clone();
+            d.name = source_site.name.clone();
             d.declaration_id = DeclId(format!("{case_id}:decl:{index}"));
             nodes.push(node);
             collector.inventory.declarations.push(d);

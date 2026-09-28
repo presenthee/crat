@@ -114,3 +114,114 @@ impl<'ast> Visitor<'ast> for BindingVisitor<'_, '_> {
         visit::walk_item(self, item);
     }
 }
+
+/// Structural source addresses, including unresolved identifier patterns. Typed
+/// collection filters non-bindings while retaining these addresses unchanged.
+#[derive(Clone, Debug)]
+pub struct SourceSite {
+    pub node: ast::NodeId,
+    pub locator: super::DeclarationLocator,
+    pub name: Option<String>,
+}
+pub fn source_sites(ast: &ast::Crate) -> Vec<SourceSite> {
+    let mut visitor = SourceVisitor {
+        sites: vec![],
+        in_param: false,
+    };
+    visitor.visit_crate(ast);
+    visitor.sites
+}
+struct SourceVisitor {
+    sites: Vec<SourceSite>,
+    in_param: bool,
+}
+impl SourceVisitor {
+    fn add(&mut self, node: ast::NodeId, site: Site, name: Option<String>) {
+        self.sites.push(SourceSite {
+            node,
+            locator: super::DeclarationLocator {
+                owner_path: vec![self.sites.len() as u32],
+                site,
+                ordinal: 0,
+                pattern_path: vec![],
+            },
+            name,
+        });
+    }
+}
+fn name(p: &ast::Pat) -> Option<String> {
+    if let ast::PatKind::Ident(_, ident, _) = p.kind {
+        Some(ident.name.to_string())
+    } else {
+        None
+    }
+}
+impl<'ast> Visitor<'ast> for SourceVisitor {
+    fn visit_fn(&mut self, kind: visit::FnKind<'ast>, _: rustc_span::Span, node: ast::NodeId) {
+        for param in &kind.decl().inputs {
+            if !matches!(param.pat.kind, ast::PatKind::Missing) {
+                self.add(param.ty.id, Site::Param, name(&param.pat));
+            }
+        }
+        self.add(node, Site::Return, None);
+        visit::walk_fn(self, kind);
+    }
+
+    fn visit_param(&mut self, param: &'ast ast::Param) {
+        let old = self.in_param;
+        self.in_param = true;
+        visit::walk_param(self, param);
+        self.in_param = old;
+    }
+
+    fn visit_pat(&mut self, pat: &'ast ast::Pat) {
+        if !self.in_param && matches!(pat.kind, ast::PatKind::Ident(..)) {
+            self.add(pat.id, Site::Local, name(pat));
+        }
+        // Alternative patterns repeat one definition. The compiler-bound visitor
+        // uses the canonical HirId; use the first alternative for the address.
+        if let ast::PatKind::Or(patterns) = &pat.kind {
+            if let Some(first) = patterns.first() {
+                self.visit_pat(first);
+            }
+        } else {
+            visit::walk_pat(self, pat);
+        }
+    }
+
+    fn visit_field_def(&mut self, field: &'ast ast::FieldDef) {
+        self.add(
+            field.id,
+            Site::Field,
+            field.ident.map(|i| i.name.to_string()),
+        );
+        visit::walk_field_def(self, field);
+    }
+
+    fn visit_item(&mut self, item: &'ast ast::Item) {
+        match &item.kind {
+            ast::ItemKind::Static(s) => {
+                self.add(item.id, Site::Static, Some(s.ident.name.to_string()))
+            }
+            ast::ItemKind::Const(c) => {
+                self.add(item.id, Site::Const, Some(c.ident.name.to_string()))
+            }
+            _ => (),
+        }
+        visit::walk_item(self, item);
+    }
+
+    fn visit_assoc_item(&mut self, item: &'ast ast::AssocItem, ctxt: visit::AssocCtxt) {
+        if let ast::AssocItemKind::Const(c) = &item.kind {
+            self.add(item.id, Site::Const, Some(c.ident.name.to_string()));
+        }
+        visit::walk_assoc_item(self, item, ctxt);
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast ast::ForeignItem) {
+        if let ast::ForeignItemKind::Static(s) = &item.kind {
+            self.add(item.id, Site::Static, Some(s.ident.name.to_string()));
+        }
+        visit::walk_item(self, item);
+    }
+}

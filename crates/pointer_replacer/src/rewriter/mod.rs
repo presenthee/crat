@@ -44,6 +44,7 @@ pub(crate) mod decision;
 pub(crate) mod diagnostics;
 mod epoch_split;
 mod lifetimes;
+pub mod measurement;
 pub mod profitability;
 mod snapshot_rewriter;
 mod struct_array_field_pre;

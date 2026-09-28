@@ -35,7 +35,10 @@ impl From<std::io::Error> for MeasurementError {
 /// Shape is checked only within an emitted source version. Renames/type changes
 /// require an explicitly updated output map; they are never guessed here.
 pub fn declaration_shape(d: &Declaration) -> String {
-    format!("{:?}|{:?}|{:?}", d.site, d.name, d.slots)
+    source_shape(d.site, &d.name)
+}
+pub fn source_shape(site: Site, name: &Option<String>) -> String {
+    format!("{site:?}|{name:?}")
 }
 pub fn seed_map(inventory: &Inventory) -> DeclarationMap {
     DeclarationMap {
