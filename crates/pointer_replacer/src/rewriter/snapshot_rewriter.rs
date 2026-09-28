@@ -427,6 +427,8 @@ pub(crate) fn apply_snapshot_isolation(
     sites: &[SiteRewrite],
     ast_to_hir: &AstToHir,
     validate: bool,
+    tcx: TyCtxt<'_>,
+    measurement: Option<&mut super::measurement::Measurement>,
 ) -> SnapshotIsolationResult {
     if sites.is_empty() {
         return SnapshotIsolationResult {
@@ -439,6 +441,8 @@ pub(crate) fn apply_snapshot_isolation(
         by_caller.entry(site.caller).or_default().push(site);
     }
     let mut visitor = EmitVisitor {
+        tcx,
+        measurement,
         ast_to_hir,
         by_caller,
         validate,
@@ -455,7 +459,9 @@ pub(crate) fn apply_snapshot_isolation(
     }
 }
 
-struct EmitVisitor<'a> {
+struct EmitVisitor<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    measurement: Option<&'a mut super::measurement::Measurement>,
     ast_to_hir: &'a AstToHir,
     by_caller: FxHashMap<LocalDefId, Vec<&'a SiteRewrite>>,
     validate: bool,
@@ -467,7 +473,7 @@ struct EmitVisitor<'a> {
     generated: Vec<GeneratedSnapshot>,
 }
 
-impl MutVisitor for EmitVisitor<'_> {
+impl MutVisitor for EmitVisitor<'_, '_> {
     fn visit_item(&mut self, item: &mut Item) {
         let (sites, is_unsafe) = if let ItemKind::Fn(box Fn { ref sig, .. }) = item.kind {
             (
@@ -508,7 +514,7 @@ impl MutVisitor for EmitVisitor<'_> {
     }
 }
 
-impl EmitVisitor<'_> {
+impl EmitVisitor<'_, '_> {
     /// Rewrites one statement's call arguments when it is a planned site and
     /// returns the snapshot statements to insert before it.
     fn rewrite_stmt(&mut self, stmt: &mut Stmt) -> Vec<Stmt> {
@@ -534,13 +540,26 @@ impl EmitVisitor<'_> {
             let runtime_capture = site.runtime_len.as_ref().map(|runtime| {
                 let name = self.fresh_len_name();
                 let source_name = &runtime.source_name;
-                inserts.push(utils::stmt!("let {name} = {source_name};"));
+                let mut stmt = utils::stmt!("let {name} = {source_name};");
+                if let Some(observer) = self.measurement.as_deref_mut() {
+                    observer.generated_stmt(&mut stmt, None, "capture snapshot length");
+                }
+                inserts.push(stmt);
                 *call_args[runtime.arg_index] = utils::expr!("{name}");
                 name
             });
             // Whole-array copies of one site share a single snapshot.
             let mut shared_whole: Option<String> = None;
             for copy in &site.copies {
+                let arg_index = match copy {
+                    PlannedCopy::Prefix { arg_index, .. }
+                    | PlannedCopy::Whole { arg_index, .. }
+                    | PlannedCopy::Runtime { arg_index, .. } => *arg_index,
+                };
+                let parent = self.measurement.as_deref().and_then(|observer| {
+                    observer.storage_node(&call_args[arg_index], self.ast_to_hir, self.tcx)
+                });
+                let first_insert = inserts.len();
                 match copy {
                     PlannedCopy::Prefix {
                         arg_index,
@@ -644,6 +663,15 @@ impl EmitVisitor<'_> {
                         }
                         *call_args[*arg_index] = utils::expr!("{name}.as_ptr()");
                         self.changed = true;
+                    }
+                }
+                if let Some(observer) = self.measurement.as_deref_mut() {
+                    for stmt in &mut inserts[first_insert..] {
+                        observer.generated_stmt(
+                            stmt,
+                            parent,
+                            "snapshot read-only argument storage",
+                        );
                     }
                 }
             }

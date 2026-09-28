@@ -546,6 +546,7 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
         c_exposed_fns,
         None,
         &LineageCatalog::default(),
+        None,
     )
     .changed
 }
@@ -562,6 +563,7 @@ pub(crate) fn apply_array_local_index_rewrite_with_allowlist<'tcx>(
     c_exposed_fns: &FxHashSet<String>,
     accepted: Option<&FxHashSet<CandidateId>>,
     lineage: &LineageCatalog,
+    measurement: Option<&mut super::measurement::Measurement>,
 ) -> ArrayLocalRewriteResult {
     let mut trace = RewriteTrace::from_env();
     let (changed, candidates) = apply_array_local_index_rewrite_inner(
@@ -576,6 +578,7 @@ pub(crate) fn apply_array_local_index_rewrite_with_allowlist<'tcx>(
         accepted,
         lineage,
         &mut trace,
+        measurement,
     );
     trace.emit(input.tcx);
     let artifacts = candidates
@@ -603,6 +606,7 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
     accepted: Option<&FxHashSet<CandidateId>>,
     lineage: &LineageCatalog,
     trace: &mut RewriteTrace,
+    mut measurement: Option<&mut super::measurement::Measurement>,
 ) -> (bool, Vec<ArrayLocalCandidateRecord>) {
     let mut origin_reporter = trace
         .is_enabled()
@@ -634,8 +638,21 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
         return (false, build_candidate_records(&plan));
     }
 
+    let checkpoint = measurement
+        .as_deref()
+        .map(super::measurement::Measurement::checkpoint);
+    if let Some(observer) = measurement.as_deref_mut() {
+        for (candidate, members) in &plan.groups {
+            for member in members {
+                if let Some(node) = observer.local_node(*member) {
+                    observer.annotate_candidate(node, format!("{candidate:?}"));
+                }
+            }
+        }
+    }
     let mut rewritten_krate = krate.clone();
     let mut visitor = ArrayLocalIndexRewriteVisitor {
+        measurement: measurement.as_deref_mut(),
         tcx: input.tcx,
         ast_to_hir,
         plan,
@@ -645,7 +662,11 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
     };
     visitor.visit_crate(&mut rewritten_krate);
     if !visitor.groups_applied_completely() {
-        return (false, visitor.failed_application_records());
+        let records = visitor.failed_application_records();
+        if let (Some(observer), Some(checkpoint)) = (visitor.measurement, checkpoint) {
+            observer.restore(checkpoint);
+        }
+        return (false, records);
     }
     let candidates = build_candidate_records(&visitor.plan);
     *krate = rewritten_krate;
@@ -681,6 +702,7 @@ pub(crate) fn apply_array_local_index_rewrite_traced<'tcx>(
         None,
         &LineageCatalog::default(),
         &mut trace,
+        None,
     );
     (trace.into_events(), candidates)
 }
@@ -3932,6 +3954,7 @@ fn introduced_index_rewritten_local_hir_id(
 }
 
 struct ArrayLocalIndexRewriteVisitor<'a, 'tcx> {
+    measurement: Option<&'a mut super::measurement::Measurement>,
     tcx: TyCtxt<'tcx>,
     ast_to_hir: &'a AstToHir,
     plan: RewritePlan,
@@ -4169,15 +4192,27 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
             return None;
         };
         let index_name = rewrite.index_name.clone();
-        let index_stmt = utils::stmt!(
+        let mut index_stmt = utils::stmt!(
             "let mut {}: isize = {};",
             index_name,
             pprust::expr_to_string(&new_index_init)
         );
-        let materialized_init = materialized_init_expr(&rewrite, &idx_read_expr(&rewrite));
+        let mut materialized_init = materialized_init_expr(&rewrite, &idx_read_expr(&rewrite));
 
         if !rewrite_binding_pat(&mut local.pat, &rewrite.source_name) {
             return None;
+        }
+        if let Some(observer) = self.measurement.as_deref_mut() {
+            observer.generated_stmt(
+                &mut index_stmt,
+                Some(local.pat.id),
+                "split materialized pointer and index",
+            );
+            observer.generated_expr(
+                &mut materialized_init,
+                Some(local.pat.id),
+                "materialize indexed pointer",
+            );
         }
         local.ty = Some(materialized_ty(&rewrite));
         *init = P(materialized_init);
@@ -4210,10 +4245,12 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             if !cursors.is_empty() {
                 let stmts = &mut fn_item.body.as_mut().unwrap().stmts;
                 for rewrite in cursors.into_iter().rev() {
-                    stmts.insert(
-                        0,
-                        utils::stmt!("let mut {}: isize = 0isize;", rewrite.index_name),
-                    );
+                    let mut stmt = utils::stmt!("let mut {}: isize = 0isize;", rewrite.index_name);
+                    if let Some(observer) = self.measurement.as_deref_mut() {
+                        let parent = observer.local_node(rewrite.base_hir_id);
+                        observer.generated_stmt(&mut stmt, parent, "introduce base offset counter");
+                    }
+                    stmts.insert(0, stmt);
                 }
                 self.changed = true;
             }
@@ -4355,7 +4392,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             Derivation::Conditional { .. } => IndexExpr::Unsupported,
             Derivation::Unsupported(_) => IndexExpr::Unsupported,
         };
-        let Some(new_init) = index_init_expr(index, rewrite.nullable) else {
+        let Some(mut new_init) = index_init_expr(index, rewrite.nullable) else {
             self.trace.record(
                 hir_id.owner.def_id,
                 TraceSubject::Member(rewrite.source_name.clone()),
@@ -4373,6 +4410,13 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             mut_visit::walk_local(self, local);
             return;
         }
+        if let Some(observer) = self.measurement.as_deref_mut() {
+            observer.generated_expr(
+                &mut new_init,
+                Some(local.pat.id),
+                "rewrite pointer initializer as an index",
+            );
+        }
         local.ty = Some(index_ty(rewrite.nullable));
         *init = P(new_init);
         self.introduced_hir_ids.insert(hir_id);
@@ -4387,6 +4431,18 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
+        let parent = self
+            .measurement
+            .as_deref()
+            .and_then(|observer| observer.storage_node(expr, self.ast_to_hir, self.tcx));
+        self.rewrite_expr_inner(expr);
+        if let Some(observer) = self.measurement.as_deref_mut() {
+            observer.generated_expr(expr, parent, "rewrite indexed pointer expression");
+        }
+    }
+}
+impl ArrayLocalIndexRewriteVisitor<'_, '_> {
+    fn rewrite_expr_inner(&mut self, expr: &mut Expr) {
         match &mut expr.kind {
             ExprKind::Assign(lhs, rhs, _) => {
                 if let Some(base_key) =

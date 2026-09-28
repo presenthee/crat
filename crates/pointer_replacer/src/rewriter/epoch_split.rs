@@ -42,10 +42,12 @@ pub(crate) struct PointerEpochSplitPlan {
     pub assignment_replacements: FxHashMap<HirId, EpochLetIntro>,
     // `let`-stmt HIR ids of dead scratch inits to delete.
     pub original_inits_to_remove: FxHashSet<HirId>,
+    pub candidate_ids: FxHashMap<HirId, CandidateId>,
 }
 
 #[derive(Debug)]
 pub(crate) struct EpochLetIntro {
+    pub original_init: HirId,
     pub new_name: Symbol,
     pub ty_string: String,
 }
@@ -95,6 +97,7 @@ impl PointerEpochSplitPlan {
             path_renames: FxHashMap::default(),
             assignment_replacements: FxHashMap::default(),
             original_inits_to_remove: FxHashSet::default(),
+            candidate_ids: FxHashMap::default(),
         }
     }
 }
@@ -728,6 +731,8 @@ fn finalize<'tcx>(
         let candidate = &state.candidates[&local];
         let candidate_id = candidate_ids[&local].clone();
         let mut plan = PointerEpochSplitPlan::empty();
+        plan.candidate_ids
+            .insert(candidate.init_let_stmt, candidate_id.clone());
         let mut generated_epochs = Vec::new();
         let mut artifacts = vec![ArtifactFootprint {
             id: ArtifactId {
@@ -752,6 +757,7 @@ fn finalize<'tcx>(
             plan.assignment_replacements.insert(
                 *assign_hir_id,
                 EpochLetIntro {
+                    original_init: candidate.init_let_stmt,
                     new_name: epoch_names[epoch],
                     ty_string: candidate.ty_string.clone(),
                 },
@@ -849,6 +855,9 @@ fn fresh_name(stem: &str, existing: &mut FxHashSet<String>) -> Symbol {
 // applies the plan to the AST: renames epoch-covered path uses, replaces
 // base-changing assignments with epoch `let`s, and drops dead scratch inits.
 struct EpochSplitApplier<'a, 'tcx> {
+    measurement: Option<&'a mut super::measurement::Measurement>,
+    output_nodes: FxHashMap<HirId, Vec<rustc_ast::NodeId>>,
+    parent_nodes: Vec<(HirId, rustc_ast::NodeId)>,
     tcx: TyCtxt<'tcx>,
     ast_to_hir: &'a AstToHir,
     plan: PointerEpochSplitPlan,
@@ -885,7 +894,20 @@ impl MutVisitor for EpochSplitApplier<'_, '_> {
             let rhs_str = pprust::expr_to_string(rhs);
             let new_name = intro.new_name;
             let ty_string = &intro.ty_string;
+            let original_rhs = self.measurement.as_ref().map(|_| rhs.clone());
             *stmt = utils::stmt!("let mut {new_name}: {ty_string} = {rhs_str};");
+            if let Some(observer) = self.measurement.as_deref_mut()
+                && let StmtKind::Let(local) = &mut stmt.kind
+            {
+                local.pat.id = observer.fresh_node();
+                if let Some(original_rhs) = original_rhs {
+                    local.kind = rustc_ast::LocalKind::Init(original_rhs);
+                }
+                self.output_nodes
+                    .entry(intro.original_init)
+                    .or_default()
+                    .push(local.pat.id);
+            }
         }
 
         // drop the dead scratch inits of split locals.
@@ -897,6 +919,9 @@ impl MutVisitor for EpochSplitApplier<'_, '_> {
                     .original_inits_to_remove
                     .contains(&hir_stmt.hir_id)
             {
+                if self.measurement.is_some() {
+                    self.parent_nodes.push((hir_stmt.hir_id, local.pat.id));
+                }
                 false
             } else {
                 true
@@ -940,6 +965,7 @@ impl EpochSplitTrialPlan {
                 .extend(candidate_plan.assignment_replacements);
             plan.original_inits_to_remove
                 .extend(candidate_plan.original_inits_to_remove);
+            plan.candidate_ids.extend(candidate_plan.candidate_ids);
         }
 
         let candidates: Vec<_> = self
@@ -966,12 +992,28 @@ impl EpochSplitTrialPlan {
 }
 
 pub fn rewrite_epoch_split_with_allowlist(
-    _config: &Config,
+    config: &Config,
     tcx: TyCtxt<'_>,
     accepted: Option<&FxHashSet<CandidateId>>,
 ) -> EpochSplitRewriteResult {
+    rewrite_epoch_split_with_allowlist_observed(config, tcx, accepted, None)
+}
+
+pub(crate) fn rewrite_epoch_split_with_allowlist_observed(
+    _config: &Config,
+    tcx: TyCtxt<'_>,
+    accepted: Option<&FxHashSet<CandidateId>>,
+    mut measurement: Option<&mut super::measurement::Measurement>,
+) -> EpochSplitRewriteResult {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    if let Some(observer) = measurement.as_deref_mut() {
+        observer.start_stage(
+            utils::pointer_inventory::StageId("epoch".into()),
+            observer.phase(),
+        );
+        let _ = observer.bind(&krate, &ast_to_hir, tcx);
+    }
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let trial = analyze_epoch_split_candidates(tcx);
@@ -981,18 +1023,44 @@ pub fn rewrite_epoch_split_with_allowlist(
         || !plan.original_inits_to_remove.is_empty();
     if changed {
         let mut applier = EpochSplitApplier {
+            measurement: measurement.as_deref_mut(),
+            output_nodes: Default::default(),
+            parent_nodes: Default::default(),
             tcx,
             ast_to_hir: &ast_to_hir,
             plan,
         };
         applier.visit_crate(&mut krate);
+        if let Some(observer) = applier.measurement {
+            for (parent, node) in applier.parent_nodes {
+                if let Some(candidate) = applier.plan.candidate_ids.get(&parent) {
+                    observer.annotate_candidate(node, format!("{candidate:?}"));
+                }
+                let outputs = applier.output_nodes.remove(&parent).unwrap_or_default();
+                let operation = match outputs.len() {
+                    0 => utils::pointer_lineage::Operation::Delete,
+                    1 => utils::pointer_lineage::Operation::Replace,
+                    _ => utils::pointer_lineage::Operation::Split,
+                };
+                observer.record_nodes(
+                    operation,
+                    &[node],
+                    &outputs,
+                    "split scratch declaration into base-specific epochs",
+                );
+            }
+        }
     }
     let artifacts = candidates
         .iter()
         .flat_map(|candidate| candidate.artifacts.iter().cloned())
         .collect();
+    let source = pprust::crate_to_string_for_macros(&krate);
+    if let Some(observer) = measurement {
+        let _ = observer.finish(&krate, source.clone());
+    }
     EpochSplitRewriteResult {
-        source: pprust::crate_to_string_for_macros(&krate),
+        source,
         changed,
         candidates,
         lineage,

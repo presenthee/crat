@@ -158,7 +158,9 @@ pub(super) enum DeclarationKey {
 pub fn collect_inventory(tcx: TyCtxt<'_>, case_id: &str, stage: StageId) -> Inventory {
     let mut ast = crate::ast::expanded_ast(tcx);
     let mapper = crate::ast::make_ast_to_hir(&mut ast, tcx);
-    collect_bound_inventory(tcx, &ast, &mapper, case_id, stage).0
+    let inventory = collect_bound_inventory(tcx, &ast, &mapper, case_id, stage).0;
+    crate::type_check(tcx);
+    inventory
 }
 
 /// Reuse the rewriter's AST and mapper; never request expanded_ast after HIR queries.
@@ -187,7 +189,6 @@ pub fn collect_bound_inventory(
         ordinals: BTreeMap::new(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut collector);
-    crate::type_check(tcx);
     let mut declarations: HashMap<_, _> = collector
         .keys
         .into_iter()

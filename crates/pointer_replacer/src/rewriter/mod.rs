@@ -113,6 +113,8 @@ pub struct Config {
     pub force_ownership_analysis_failure: bool,
     #[cfg(test)]
     pub force_gated_prepass_trial_failure: bool,
+    #[cfg(test)]
+    pub force_gated_prepass_replay_failure: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -400,6 +402,14 @@ pub(crate) fn rewrite_aliasing_with_lineage(
     tcx: TyCtxt<'_>,
     input_lineage: &profitability::LineageCatalog,
 ) -> AliasRewriteResult {
+    rewrite_aliasing_with_lineage_observed(config, tcx, input_lineage, None)
+}
+pub(crate) fn rewrite_aliasing_with_lineage_observed(
+    config: &Config,
+    tcx: TyCtxt<'_>,
+    input_lineage: &profitability::LineageCatalog,
+    mut measurement: Option<&mut measurement::Measurement>,
+) -> AliasRewriteResult {
     let started = std::time::Instant::now();
     let progress = |step: &str| {
         if config.verbose {
@@ -409,6 +419,13 @@ pub(crate) fn rewrite_aliasing_with_lineage(
     progress("build expanded AST");
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    if let Some(observer) = measurement.as_deref_mut() {
+        observer.start_stage(
+            utils::pointer_inventory::StageId("aliasing".into()),
+            observer.phase(),
+        );
+        let _ = observer.bind(&krate, &ast_to_hir, tcx);
+    }
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let input = collect_input(tcx);
@@ -511,7 +528,14 @@ pub(crate) fn rewrite_aliasing_with_lineage(
             eprintln!("SNAPSHOT_EMIT sites={}", sites.len());
         }
         let validate = std::env::var_os("CRAT_SNAPSHOT_VALIDATE").is_some();
-        snapshot_rewriter::apply_snapshot_isolation(&mut krate, &sites, &ast_to_hir, validate)
+        snapshot_rewriter::apply_snapshot_isolation(
+            &mut krate,
+            &sites,
+            &ast_to_hir,
+            validate,
+            tcx,
+            measurement.as_deref_mut(),
+        )
     };
 
     progress("print transformed AST");
@@ -533,8 +557,12 @@ pub(crate) fn rewrite_aliasing_with_lineage(
             );
         }
     }
+    let source = pprust::crate_to_string_for_macros(&krate);
+    if let Some(observer) = measurement {
+        let _ = observer.finish(&krate, source.clone());
+    }
     AliasRewriteResult {
-        source: pprust::crate_to_string_for_macros(&krate),
+        source,
         changed: rewrite.changed,
         lineage,
     }
@@ -593,8 +621,24 @@ pub(crate) fn rewrite_array_local_provenance_with_allowlist(
     accepted: Option<&FxHashSet<profitability::CandidateId>>,
     lineage: &profitability::LineageCatalog,
 ) -> array_local_index_rewriter::ArrayLocalRewriteResult {
+    rewrite_array_local_provenance_with_allowlist_observed(config, tcx, accepted, lineage, None)
+}
+pub(crate) fn rewrite_array_local_provenance_with_allowlist_observed(
+    config: &Config,
+    tcx: TyCtxt<'_>,
+    accepted: Option<&FxHashSet<profitability::CandidateId>>,
+    lineage: &profitability::LineageCatalog,
+    mut measurement: Option<&mut measurement::Measurement>,
+) -> array_local_index_rewriter::ArrayLocalRewriteResult {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    if let Some(observer) = measurement.as_deref_mut() {
+        observer.start_stage(
+            utils::pointer_inventory::StageId("array_local".into()),
+            observer.phase(),
+        );
+        let _ = observer.bind(&krate, &ast_to_hir, tcx);
+    }
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let input = collect_input(tcx);
@@ -623,7 +667,7 @@ pub(crate) fn rewrite_array_local_provenance_with_allowlist(
     let provenances =
         analyses::array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
 
-    array_local_index_rewriter::apply_array_local_index_rewrite_with_allowlist(
+    let result = array_local_index_rewriter::apply_array_local_index_rewrite_with_allowlist(
         &mut krate,
         &input,
         &provenances,
@@ -634,21 +678,53 @@ pub(crate) fn rewrite_array_local_provenance_with_allowlist(
         &config.c_exposed_fns,
         accepted,
         lineage,
-    )
+        measurement.as_deref_mut(),
+    );
+    if let Some(observer) = measurement {
+        let _ = observer.finish(&krate, result.source.clone());
+    }
+    result
 }
 
 /// runs the profitability-gated pointer prepasses entirely in memory, then
 /// restores the supplied checkpoint and replays only stable accepted IDs.
 pub fn run_gated_pointer_prepasses(config: &Config, checkpoint_source: &str) -> GatedPrepassResult {
+    run_gated_pointer_prepasses_observed(config, checkpoint_source, None)
+}
+pub fn run_gated_pointer_prepasses_observed(
+    config: &Config,
+    checkpoint_source: &str,
+    mut measurement: Option<&mut measurement::Measurement>,
+) -> GatedPrepassResult {
+    let observer_checkpoint = measurement
+        .as_deref()
+        .map(measurement::Measurement::checkpoint);
+    let mut trial_observer = measurement
+        .as_deref()
+        .map(measurement::Measurement::trial_checkpoint);
     let started = std::time::Instant::now();
     let mut phases = Vec::new();
 
     phases.push(GatedPrepassPhase::EpochTrial);
     let epoch_trial = match run_gated_compiler(checkpoint_source, |tcx| {
-        rewrite_epoch_split_with_allowlist(config, tcx, None)
+        epoch_split::rewrite_epoch_split_with_allowlist_observed(
+            config,
+            tcx,
+            None,
+            trial_observer.as_mut(),
+        )
     }) {
         Some(result) => result,
-        None => return gated_prepass_fallback(config, checkpoint_source, phases, started),
+        None => {
+            return gated_prepass_fallback(
+                config,
+                checkpoint_source,
+                phases,
+                started,
+                measurement.as_deref_mut(),
+                observer_checkpoint.as_ref(),
+            );
+        }
     };
     let epoch_trial_source = if epoch_trial.changed {
         epoch_trial.source.as_str()
@@ -658,10 +734,24 @@ pub fn run_gated_pointer_prepasses(config: &Config, checkpoint_source: &str) -> 
 
     phases.push(GatedPrepassPhase::AliasingTrial);
     let alias_trial = match run_gated_compiler(epoch_trial_source, |tcx| {
-        rewrite_aliasing_with_lineage(config, tcx, &epoch_trial.lineage)
+        rewrite_aliasing_with_lineage_observed(
+            config,
+            tcx,
+            &epoch_trial.lineage,
+            trial_observer.as_mut(),
+        )
     }) {
         Some(result) => result,
-        None => return gated_prepass_fallback(config, checkpoint_source, phases, started),
+        None => {
+            return gated_prepass_fallback(
+                config,
+                checkpoint_source,
+                phases,
+                started,
+                measurement.as_deref_mut(),
+                observer_checkpoint.as_ref(),
+            );
+        }
     };
     let alias_trial_source = if alias_trial.changed {
         alias_trial.source.as_str()
@@ -671,10 +761,25 @@ pub fn run_gated_pointer_prepasses(config: &Config, checkpoint_source: &str) -> 
 
     phases.push(GatedPrepassPhase::ArrayTrial);
     let array_trial = match run_gated_compiler(alias_trial_source, |tcx| {
-        rewrite_array_local_provenance_with_allowlist(config, tcx, None, &alias_trial.lineage)
+        rewrite_array_local_provenance_with_allowlist_observed(
+            config,
+            tcx,
+            None,
+            &alias_trial.lineage,
+            trial_observer.as_mut(),
+        )
     }) {
         Some(result) => result,
-        None => return gated_prepass_fallback(config, checkpoint_source, phases, started),
+        None => {
+            return gated_prepass_fallback(
+                config,
+                checkpoint_source,
+                phases,
+                started,
+                measurement.as_deref_mut(),
+                observer_checkpoint.as_ref(),
+            );
+        }
     };
     let array_trial_source = if array_trial.changed {
         array_trial.source.as_str()
@@ -724,13 +829,31 @@ pub fn run_gated_pointer_prepasses(config: &Config, checkpoint_source: &str) -> 
         )
     }) {
         Some(report) => report,
-        None => return gated_prepass_fallback(config, checkpoint_source, phases, started),
+        None => {
+            return gated_prepass_fallback(
+                config,
+                checkpoint_source,
+                phases,
+                started,
+                measurement.as_deref_mut(),
+                observer_checkpoint.as_ref(),
+            );
+        }
     };
     let epoch_pre_array_report = match run_gated_compiler(alias_trial_source, |tcx| {
         collect_promotion_report(config, tcx, &alias_trial.lineage, &epoch_trial_footprints)
     }) {
         Some(report) => report,
-        None => return gated_prepass_fallback(config, checkpoint_source, phases, started),
+        None => {
+            return gated_prepass_fallback(
+                config,
+                checkpoint_source,
+                phases,
+                started,
+                measurement.as_deref_mut(),
+                observer_checkpoint.as_ref(),
+            );
+        }
     };
     let array_baseline_report = match run_gated_compiler(alias_trial_source, |tcx| {
         collect_promotion_report(
@@ -741,13 +864,31 @@ pub fn run_gated_pointer_prepasses(config: &Config, checkpoint_source: &str) -> 
         )
     }) {
         Some(report) => report,
-        None => return gated_prepass_fallback(config, checkpoint_source, phases, started),
+        None => {
+            return gated_prepass_fallback(
+                config,
+                checkpoint_source,
+                phases,
+                started,
+                measurement.as_deref_mut(),
+                observer_checkpoint.as_ref(),
+            );
+        }
     };
     let array_trial_report = match run_gated_compiler(array_trial_source, |tcx| {
         collect_promotion_report(config, tcx, &alias_trial.lineage, &array_trial_footprints)
     }) {
         Some(report) => report,
-        None => return gated_prepass_fallback(config, checkpoint_source, phases, started),
+        None => {
+            return gated_prepass_fallback(
+                config,
+                checkpoint_source,
+                phases,
+                started,
+                measurement.as_deref_mut(),
+                observer_checkpoint.as_ref(),
+            );
+        }
     };
     let trial_time = started.elapsed();
 
@@ -886,12 +1027,32 @@ pub fn run_gated_pointer_prepasses(config: &Config, checkpoint_source: &str) -> 
     }
 
     phases.push(GatedPrepassPhase::RestoreCheckpoint);
+    if let (Some(observer), Some(checkpoint)) =
+        (measurement.as_deref_mut(), observer_checkpoint.as_ref())
+    {
+        observer.restore(checkpoint.clone());
+    }
+    drop(trial_observer);
     phases.push(GatedPrepassPhase::EpochReplay);
     let epoch_replay = match run_gated_compiler(checkpoint_source, |tcx| {
-        rewrite_epoch_split_with_allowlist(config, tcx, Some(&accepted_epochs))
+        epoch_split::rewrite_epoch_split_with_allowlist_observed(
+            config,
+            tcx,
+            Some(&accepted_epochs),
+            measurement.as_deref_mut(),
+        )
     }) {
         Some(result) => result,
-        None => return gated_prepass_fallback(config, checkpoint_source, phases, started),
+        None => {
+            return gated_prepass_fallback(
+                config,
+                checkpoint_source,
+                phases,
+                started,
+                measurement.as_deref_mut(),
+                observer_checkpoint.as_ref(),
+            );
+        }
     };
     let epoch_replay_source = if epoch_replay.changed {
         epoch_replay.source.as_str()
@@ -901,10 +1062,28 @@ pub fn run_gated_pointer_prepasses(config: &Config, checkpoint_source: &str) -> 
 
     phases.push(GatedPrepassPhase::AliasingReplay);
     let alias_replay = match run_gated_compiler(epoch_replay_source, |tcx| {
-        rewrite_aliasing_with_lineage(config, tcx, &epoch_replay.lineage)
+        #[cfg(test)]
+        if config.force_gated_prepass_replay_failure {
+            std::panic::resume_unwind(Box::new("forced failure after epoch replay"));
+        }
+        rewrite_aliasing_with_lineage_observed(
+            config,
+            tcx,
+            &epoch_replay.lineage,
+            measurement.as_deref_mut(),
+        )
     }) {
         Some(result) => result,
-        None => return gated_prepass_fallback(config, checkpoint_source, phases, started),
+        None => {
+            return gated_prepass_fallback(
+                config,
+                checkpoint_source,
+                phases,
+                started,
+                measurement.as_deref_mut(),
+                observer_checkpoint.as_ref(),
+            );
+        }
     };
     let alias_replay_source = if alias_replay.changed {
         alias_replay.source.as_str()
@@ -919,15 +1098,25 @@ pub fn run_gated_pointer_prepasses(config: &Config, checkpoint_source: &str) -> 
         .cloned()
         .collect();
     let array_replay = match run_gated_compiler(alias_replay_source, |tcx| {
-        rewrite_array_local_provenance_with_allowlist(
+        rewrite_array_local_provenance_with_allowlist_observed(
             config,
             tcx,
             Some(&replay_allowlist),
             &alias_replay.lineage,
+            measurement.as_deref_mut(),
         )
     }) {
         Some(result) => result,
-        None => return gated_prepass_fallback(config, checkpoint_source, phases, started),
+        None => {
+            return gated_prepass_fallback(
+                config,
+                checkpoint_source,
+                phases,
+                started,
+                measurement.as_deref_mut(),
+                observer_checkpoint.as_ref(),
+            );
+        }
     };
     let source = if array_replay.changed {
         array_replay.source
@@ -1100,11 +1289,30 @@ fn gated_prepass_fallback(
     checkpoint_source: &str,
     mut phases: Vec<GatedPrepassPhase>,
     started: std::time::Instant,
+    mut measurement: Option<&mut measurement::Measurement>,
+    checkpoint: Option<&measurement::Measurement>,
 ) -> GatedPrepassResult {
+    if let (Some(observer), Some(checkpoint)) = (measurement.as_deref_mut(), checkpoint) {
+        observer.restore(checkpoint.clone());
+    }
     phases.push(GatedPrepassPhase::AliasingFallback);
-    let source = match run_gated_compiler(checkpoint_source, |tcx| rewrite_aliasing(config, tcx)) {
-        Some((source, true)) => source,
-        Some((_, false)) | None => checkpoint_source.to_string(),
+    let result = run_gated_compiler(checkpoint_source, |tcx| {
+        rewrite_aliasing_with_lineage_observed(
+            config,
+            tcx,
+            &profitability::LineageCatalog::default(),
+            measurement.as_deref_mut(),
+        )
+    });
+    let source = match result {
+        Some(result) if result.changed => result.source,
+        Some(_) => checkpoint_source.to_string(),
+        None => {
+            if let (Some(observer), Some(checkpoint)) = (measurement, checkpoint) {
+                observer.restore(checkpoint.clone());
+            }
+            checkpoint_source.to_string()
+        }
     };
     let trial_time = started.elapsed();
     if config.verbose {
