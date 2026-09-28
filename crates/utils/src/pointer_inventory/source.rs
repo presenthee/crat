@@ -131,6 +131,22 @@ pub fn source_sites(ast: &ast::Crate) -> Vec<SourceSite> {
     visitor.visit_crate(ast);
     visitor.sites
 }
+pub fn source_sites_in_stmt(stmt: &ast::Stmt) -> Vec<SourceSite> {
+    let mut visitor = SourceVisitor {
+        sites: vec![],
+        in_param: false,
+    };
+    visitor.visit_stmt(stmt);
+    visitor.sites
+}
+pub fn source_sites_in_expr(expr: &ast::Expr) -> Vec<SourceSite> {
+    let mut visitor = SourceVisitor {
+        sites: vec![],
+        in_param: false,
+    };
+    visitor.visit_expr(expr);
+    visitor.sites
+}
 struct SourceVisitor {
     sites: Vec<SourceSite>,
     in_param: bool,

@@ -308,3 +308,408 @@ pub mod b {
         );
     }
 }
+
+const EPOCH_SOURCE: &str = r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let c: i8 = *x;
+    x = b;
+    x
+}
+"#;
+#[test]
+fn measurement_epoch_split_records_one_structural_split() {
+    let baseline = run_compiler_on_str(EPOCH_SOURCE, |tcx| {
+        ::utils::pointer_inventory::collect_inventory(tcx, "fixture", StageId("input".into()))
+    })
+    .unwrap();
+    let origin = baseline
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("x"))
+        .unwrap()
+        .declaration_id
+        .clone();
+    let mut measurement = Measurement::new(seed_map(&baseline));
+    let config = super::super::Config::default();
+    let result = run_compiler_on_str(EPOCH_SOURCE, |tcx| {
+        super::super::epoch_split::rewrite_epoch_split_with_allowlist_observed(
+            &config,
+            tcx,
+            None,
+            Some(&mut measurement),
+        )
+    })
+    .unwrap();
+    let emissions = measurement.take_emissions().unwrap();
+    assert_eq!(emissions.len(), 1);
+    assert_eq!(
+        emissions[0]
+            .delta
+            .events
+            .iter()
+            .filter(|e| e.operation == Operation::Split)
+            .count(),
+        1
+    );
+    assert!(
+        emissions[0]
+            .delta
+            .events
+            .iter()
+            .filter(|e| e.operation == Operation::Split)
+            .all(|e| e.candidate_id.is_some())
+    );
+    let inv = run_compiler_on_str(&result.source, |tcx| {
+        ::utils::pointer_identity::reconcile(tcx, &emissions[0].delta.map, &Default::default())
+    })
+    .unwrap()
+    .unwrap();
+    let finals = inv
+        .declarations
+        .iter()
+        .map(|d| d.declaration_id.clone())
+        .collect();
+    assert_eq!(
+        measurement
+            .ledger()
+            .descendants(&origin, &finals)
+            .unwrap()
+            .len(),
+        2
+    );
+    let ordinary = run_compiler_on_str(EPOCH_SOURCE, |tcx| {
+        super::super::rewrite_epoch_split(&config, tcx).0
+    })
+    .unwrap();
+    assert_eq!(ordinary, result.source);
+}
+
+#[test]
+fn generated_reconstruction_keeps_original_ancestry() {
+    let emission = fixture(|krate, measurement, q| {
+        let parent = measurement.id(q).unwrap().clone();
+        let mut stmt =
+            ::utils::stmt!("let n = Some(0isize).map_or(0 as *mut u8, |idx| idx as *mut u8);");
+        measurement.generated_stmt(&mut stmt, Some(q), "reconstruct pointer from index");
+        let ast::ItemKind::Fn(f) = &mut krate
+            .items
+            .iter_mut()
+            .find(|i| matches!(i.kind, ast::ItemKind::Fn(_)))
+            .unwrap()
+            .kind
+        else {
+            unreachable!()
+        };
+        f.body.as_mut().unwrap().stmts.push(stmt);
+        let emission = measurement.finish(krate, source(krate)).unwrap();
+        let finals = emission
+            .delta
+            .map
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(
+            measurement
+                .ledger()
+                .descendants(&parent, &finals)
+                .unwrap()
+                .len(),
+            4
+        );
+        emission
+    });
+    let inv = run_compiler_on_str(&emission.source, |tcx| {
+        ::utils::pointer_identity::reconcile(tcx, &emission.delta.map, &Default::default())
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        inv.declarations
+            .iter()
+            .filter(|d| d.pointer_state == PointerState::Raw)
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn measurement_snapshot_alias_has_explicit_structural_parent() {
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) { *out = *src; }
+pub unsafe fn driver(q: *mut i32) { callee(q, q); }
+"#;
+    let baseline = run_compiler_on_str(code, |tcx| {
+        ::utils::pointer_inventory::collect_inventory(tcx, "fixture", StageId("input".into()))
+    })
+    .unwrap();
+    let q = baseline
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("q"))
+        .unwrap()
+        .declaration_id
+        .clone();
+    let mut measurement = Measurement::new(seed_map(&baseline));
+    let config = super::super::Config::default();
+    let result = run_compiler_on_str(code, |tcx| {
+        super::super::rewrite_aliasing_with_lineage_observed(
+            &config,
+            tcx,
+            &Default::default(),
+            Some(&mut measurement),
+        )
+    })
+    .unwrap();
+    assert!(result.changed, "{}", result.source);
+    let emissions = measurement.take_emissions().unwrap();
+    let inv = run_compiler_on_str(&result.source, |tcx| {
+        ::utils::pointer_identity::reconcile(tcx, &emissions[0].delta.map, &Default::default())
+    })
+    .unwrap()
+    .unwrap();
+    let finals = inv
+        .declarations
+        .iter()
+        .map(|d| d.declaration_id.clone())
+        .collect();
+    let descendants = measurement.ledger().descendants(&q, &finals).unwrap();
+    let snapshot = inv
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("__crat_snap_0"))
+        .unwrap();
+    assert!(descendants.contains(&snapshot.declaration_id));
+    assert_eq!(descendants.len(), 2);
+    let ordinary =
+        run_compiler_on_str(code, |tcx| super::super::rewrite_aliasing(&config, tcx).0).unwrap();
+    assert_eq!(ordinary, result.source);
+}
+
+#[test]
+fn measurement_array_index_reconstruction_preserves_ancestry() {
+    let code = r#"
+pub unsafe fn f(p: *mut i32, take: bool) -> *mut i32 {
+    let mut q: *mut i32 = std::ptr::null_mut();
+    if take { q = p.add(2); }
+    q
+}
+"#;
+    let baseline = run_compiler_on_str(code, |tcx| {
+        ::utils::pointer_inventory::collect_inventory(tcx, "fixture", StageId("input".into()))
+    })
+    .unwrap();
+    let q = baseline
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("q"))
+        .unwrap()
+        .declaration_id
+        .clone();
+    let mut measurement = Measurement::new(seed_map(&baseline));
+    let config = super::super::Config::default();
+    let result = run_compiler_on_str(code, |tcx| {
+        super::super::rewrite_array_local_provenance_with_allowlist_observed(
+            &config,
+            tcx,
+            None,
+            &Default::default(),
+            Some(&mut measurement),
+        )
+    })
+    .unwrap();
+    assert!(result.changed, "{}", result.source);
+    let emissions = measurement.take_emissions().unwrap();
+    let inv = run_compiler_on_str(&result.source, |tcx| {
+        ::utils::pointer_identity::reconcile(tcx, &emissions[0].delta.map, &Default::default())
+    })
+    .unwrap()
+    .unwrap();
+    let finals = inv
+        .declarations
+        .iter()
+        .map(|d| d.declaration_id.clone())
+        .collect();
+    let descendants = measurement.ledger().descendants(&q, &finals).unwrap();
+    assert!(
+        inv.declarations
+            .iter()
+            .any(|d| descendants.contains(&d.declaration_id)
+                && d.pointer_state == PointerState::Nonpointer
+                && d.name.as_deref() == Some("q_idx"))
+    );
+    assert!(
+        inv.declarations
+            .iter()
+            .any(|d| descendants.contains(&d.declaration_id)
+                && d.pointer_state == PointerState::Raw
+                && d.site == ::utils::pointer_inventory::Site::Return)
+    );
+    let ordinary = run_compiler_on_str(code, |tcx| {
+        super::super::rewrite_array_local_provenance(&config, tcx).0
+    })
+    .unwrap();
+    assert_eq!(ordinary, result.source);
+}
+
+const GATE_SOURCE: &str = r#"
+pub unsafe fn foo(mut p: *mut i32, mut r: *mut i32) -> i32 {
+    let mut q: *mut i32 = 0 as *mut i32;
+    q = p.offset(3); *p = 1; *q = 3;
+    let a: i32 = *q;
+    q = r.offset(1); *r = 2; *q = 5;
+    a
+}
+"#;
+fn measured_gate(
+    code: &str,
+    config: &super::super::Config,
+) -> (super::super::GatedPrepassResult, Measurement, Vec<Emission>) {
+    let baseline = run_compiler_on_str(code, |tcx| {
+        ::utils::pointer_inventory::collect_inventory(tcx, "fixture", StageId("input".into()))
+    })
+    .unwrap();
+    let ordinary = super::super::run_gated_pointer_prepasses(config, code);
+    let mut observer = Measurement::new(seed_map(&baseline));
+    let observed =
+        super::super::run_gated_pointer_prepasses_observed(config, code, Some(&mut observer));
+    assert_eq!(observed.source, ordinary.source);
+    assert_eq!(observed.phases, ordinary.phases);
+    assert_eq!(
+        (observed.accepted_epochs, observed.accepted_arrays),
+        (ordinary.accepted_epochs, ordinary.accepted_arrays)
+    );
+    let emissions = observer.take_emissions().unwrap();
+    run_compiler_on_str(&observed.source, |tcx| {
+        ::utils::pointer_identity::reconcile(
+            tcx,
+            observer.ledger().current_map(),
+            &Default::default(),
+        )
+    })
+    .unwrap()
+    .unwrap();
+    (observed, observer, emissions)
+}
+#[test]
+fn measurement_gate_trial_replay_isolation() {
+    let (result, _, emissions) = measured_gate(GATE_SOURCE, &Default::default());
+    assert_eq!((result.accepted_epochs, result.accepted_arrays), (1, 2));
+    assert_eq!(emissions.len(), 3);
+    assert!(
+        emissions
+            .iter()
+            .flat_map(|e| &e.delta.events)
+            .all(|e| e.phase == Phase::Committed)
+    );
+    assert_eq!(
+        emissions
+            .iter()
+            .flat_map(|e| &e.delta.events)
+            .filter(|e| e.stage.0 == "epoch" && e.operation == Operation::Split)
+            .count(),
+        1
+    );
+    let rejected = r#"
+pub unsafe fn f(a: *mut core::ffi::c_void, b: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let mut x: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;
+    x = a; let is_null = x.is_null(); x = b; x
+}
+"#;
+    let (result, _, emissions) = measured_gate(rejected, &Default::default());
+    assert_eq!(result.accepted_epochs, 0);
+    assert_eq!(result.rejected_epochs, 1);
+    assert!(
+        emissions
+            .iter()
+            .flat_map(|e| &e.delta.events)
+            .all(|e| e.operation == Operation::Preserve)
+    );
+}
+#[test]
+fn measurement_gate_replay_failure_restores_lineage() {
+    let mut config = super::super::Config::default();
+    config.force_gated_prepass_replay_failure = true;
+    let (result, _, emissions) = measured_gate(GATE_SOURCE, &config);
+    assert!(result.combined_trial_failed);
+    assert!(
+        result
+            .phases
+            .contains(&super::super::GatedPrepassPhase::EpochReplay)
+    );
+    assert_eq!(emissions.len(), 1);
+    assert_eq!(emissions[0].delta.map.stage.0, "aliasing");
+    assert!(
+        emissions[0]
+            .delta
+            .events
+            .iter()
+            .all(|e| e.operation == Operation::Preserve)
+    );
+}
+
+#[test]
+fn measurement_array_materialized_binding_and_base_counter() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, n: isize) -> i32 {
+    let mut prev: *mut i32 = p;
+    p = p.offset(n);
+    *prev + *p
+}
+"#;
+    let baseline = run_compiler_on_str(code, |tcx| {
+        ::utils::pointer_inventory::collect_inventory(tcx, "fixture", StageId("input".into()))
+    })
+    .unwrap();
+    assert_eq!(baseline.declarations.len(), 4);
+    let mut measurement = Measurement::new(seed_map(&baseline));
+    let config = super::super::Config::default();
+    let result = run_compiler_on_str(code, |tcx| {
+        super::super::rewrite_array_local_provenance_with_allowlist_observed(
+            &config,
+            tcx,
+            None,
+            &Default::default(),
+            Some(&mut measurement),
+        )
+    })
+    .unwrap();
+    let emissions = measurement.take_emissions().unwrap();
+    let inv = run_compiler_on_str(&result.source, |tcx| {
+        ::utils::pointer_identity::reconcile(tcx, &emissions[0].delta.map, &Default::default())
+    })
+    .unwrap()
+    .unwrap();
+    let finals = inv
+        .declarations
+        .iter()
+        .map(|d| d.declaration_id.clone())
+        .collect();
+    for name in ["p", "prev"] {
+        let origin = baseline
+            .declarations
+            .iter()
+            .find(|d| d.name.as_deref() == Some(name))
+            .unwrap();
+        let descendants = measurement
+            .ledger()
+            .descendants(&origin.declaration_id, &finals)
+            .unwrap();
+        assert_eq!(descendants.len(), 2);
+        assert_eq!(
+            inv.declarations
+                .iter()
+                .filter(|d| descendants.contains(&d.declaration_id)
+                    && d.pointer_state == PointerState::Raw)
+                .count(),
+            1
+        );
+    }
+    let ordinary = run_compiler_on_str(code, |tcx| {
+        super::super::rewrite_array_local_provenance(&config, tcx).0
+    })
+    .unwrap();
+    assert_eq!(ordinary, result.source);
+}
