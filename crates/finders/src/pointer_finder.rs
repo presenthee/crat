@@ -14,12 +14,7 @@ pub fn find_pointers(
         return reconcile(tcx, map, hashes);
     }
     let mut inventory = collect_inventory(tcx, "crate", StageId("input".into()));
-    if !inventory.issues.is_empty() {
-        return Err(MeasurementError::UnsupportedInventory(format!(
-            "{:?}",
-            inventory.issues
-        )));
-    }
+    utils::pointer_inventory::validate_inventory(&inventory)?;
     inventory.source_hashes = hashes.clone();
     Ok(inventory)
 }

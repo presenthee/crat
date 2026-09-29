@@ -236,3 +236,20 @@ fn failed_type_check_never_publishes_completion() {
     assert!(!result.status.success());
     assert!(!measurement.join("complete.json").exists());
 }
+
+#[test]
+fn finder_seeds_case_and_observation_keys_together() {
+    let f = Fixture::new();
+    fs::write(f.input().join("lib.rs"), "pub fn f(p: std::ptr::NonNull<u8>) {}\n").unwrap();
+    let map = f.0.join("partial-map.json");
+    let out = f.finder(&["--pointer-case-id", "Public-Tests/fixture/partial", "--pointer-write-map", map.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let inventory: Inventory = serde_json::from_slice(&out.stdout).unwrap();
+    let map: DeclarationMap = serde_json::from_slice(&fs::read(map).unwrap()).unwrap();
+    let ids: std::collections::BTreeSet<_> = inventory.declarations.iter().map(|d| d.declaration_id.clone()).collect();
+    assert_eq!(ids, inventory.observations.keys().cloned().collect());
+    assert_eq!(ids, map.entries.iter().map(|e| e.id.clone()).collect());
+    assert!(ids.iter().all(|id| id.0.starts_with("Public-Tests/fixture/partial:")));
+    assert!(inventory.structural_errors.is_empty());
+    assert!(inventory.observations.values().any(|o| !o.diagnostics.is_empty()));
+}

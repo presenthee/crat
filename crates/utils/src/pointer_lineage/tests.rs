@@ -5,7 +5,7 @@ fn id(s: &str) -> DeclId {
 }
 fn map(stage: &str, names: &[&str]) -> DeclarationMap {
     DeclarationMap {
-        schema_version: 1,
+        schema_version: 2,
         case_id: "fixture".into(),
         profile: Some("base".into()),
         stage: StageId(stage.into()),
@@ -35,7 +35,7 @@ fn event(
     outputs: &[&str],
 ) -> LineageEvent {
     LineageEvent {
-        schema_version: 1,
+        schema_version: 2,
         event_id: format!("{stage}:{n}"),
         stage: StageId(stage.into()),
         phase: Phase::Committed,

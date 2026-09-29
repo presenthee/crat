@@ -117,7 +117,7 @@ impl Ledger {
         let mut consumed = BTreeSet::new();
         let mut ancestors = BTreeMap::new();
         for e in &delta.events {
-            if e.schema_version != 1
+            if e.schema_version != 2
                 || e.stage != delta.map.stage
                 || e.phase != Phase::Committed
                 || !event_ids.insert(e.event_id.clone())

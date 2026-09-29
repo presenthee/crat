@@ -29,14 +29,6 @@ pub enum Scope {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PointerState {
-    Raw,
-    Promoted,
-    Nonpointer,
-    Unsupported,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum PointerKind {
     RawConst,
     RawMut,
@@ -95,8 +87,6 @@ pub struct Declaration {
     pub location: SourceLocation,
     pub resolved_type: String,
     pub locator: DeclarationLocator,
-    pub slots: Vec<PointerSlot>,
-    pub pointer_state: PointerState,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryIssue {
@@ -111,7 +101,9 @@ pub struct Inventory {
     pub stage: StageId,
     pub source_hashes: SourceHashes,
     pub declarations: Vec<Declaration>,
-    pub issues: Vec<InventoryIssue>,
+    pub counting_contract: String,
+    pub observations: BTreeMap<DeclId, TypeObservation>,
+    pub structural_errors: Vec<InventoryIssue>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MappedDeclaration {

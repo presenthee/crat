@@ -76,9 +76,9 @@ fn main() {
                             .to_string_lossy()
                             .into_owned()
                     });
-                    for (index, d) in inventory.declarations.iter_mut().enumerate() {
-                        d.declaration_id.0 = format!("{}:input:decl:{index}", inventory.case_id);
-                    }
+                    let replacements = inventory.declarations.iter().enumerate().map(|(index, d)|
+                        (d.declaration_id.clone(), utils::pointer_inventory::DeclId(format!("{}:input:decl:{index}", inventory.case_id)))).collect();
+                    utils::pointer_inventory::rekey_declarations(&mut inventory, &replacements)?;
                 }
                 if let Some(path) = args.pointer_write_map {
                     std::fs::write(path, serde_json::to_vec_pretty(&seed_map(&inventory))?)?;

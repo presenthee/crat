@@ -18,16 +18,16 @@ fn counts_declarations_and_nested_slots() {
         }
     "#,
     );
-    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
+    assert!(inv.structural_errors.is_empty(), "{:?}", inv.structural_errors);
     let raw: Vec<_> = inv
         .declarations
         .iter()
-        .filter(|d| d.pointer_state == PointerState::Raw)
+        .filter(|d| endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw)
         .collect();
     assert_eq!(raw.len(), 4);
     assert_eq!(
         raw.iter()
-            .flat_map(|d| &d.slots)
+            .flat_map(|d| &inv.observations[&d.declaration_id].slots)
             .filter(|s| s.kind.is_raw())
             .count(),
         5
@@ -48,13 +48,13 @@ fn normalizes_aliases_optional_wrappers_and_nested_rawness() {
              n: Option<&[u8]>, o: [*const u8; 100]) {}
     "#,
     );
-    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
+    assert!(inv.structural_errors.is_empty(), "{:?}", inv.structural_errors);
     let params: Vec<_> = inv
         .declarations
         .iter()
         .filter(|d| d.site == Site::Param)
         .collect();
-    let kinds: Vec<_> = params.iter().map(|d| d.slots[0].kind).collect();
+    let kinds: Vec<_> = params.iter().map(|d| inv.observations[&d.declaration_id].slots[0].kind).collect();
     assert_eq!(
         kinds,
         [
@@ -75,11 +75,11 @@ fn normalizes_aliases_optional_wrappers_and_nested_rawness() {
             PointerKind::RawConst
         ]
     );
-    assert_eq!(params[11].pointer_state, PointerState::Raw);
-    assert_eq!(params[11].slots.len(), 2);
-    assert!(params[12].slots[0].optional);
-    assert!(params[13].slots[0].optional);
-    assert_eq!(params[14].slots.len(), 1);
+    assert_eq!(endpoint_state(&inv.observations[&params[11].declaration_id]), EndpointState::Raw);
+    assert_eq!(inv.observations[&params[11].declaration_id].slots.len(), 2);
+    assert!(inv.observations[&params[12].declaration_id].slots[0].optional);
+    assert!(inv.observations[&params[13].declaration_id].slots[0].optional);
+    assert_eq!(inv.observations[&params[14].declaration_id].slots.len(), 1);
 }
 
 #[test]
@@ -93,14 +93,14 @@ fn patterns_and_signatures_are_counted_once() {
         }
     "#,
     );
-    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
+    assert!(inv.structural_errors.is_empty(), "{:?}", inv.structural_errors);
     let params: Vec<_> = inv
         .declarations
         .iter()
         .filter(|d| d.site == Site::Param)
         .collect();
     assert_eq!(params.len(), 2);
-    assert_eq!(params[0].slots.len(), 2);
+    assert_eq!(inv.observations[&params[0].declaration_id].slots.len(), 2);
     let locals: Vec<_> = inv
         .declarations
         .iter()
@@ -138,18 +138,18 @@ fn includes_methods_closures_constants_and_foreign_signatures() {
         fn f() { let f = |p: *mut u8| -> *mut u8 { p }; }
     "#,
     );
-    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
+    assert!(inv.structural_errors.is_empty(), "{:?}", inv.structural_errors);
     assert_eq!(
         inv.declarations
             .iter()
-            .filter(|d| d.scope == Scope::Foreign && d.pointer_state == PointerState::Raw)
+            .filter(|d| d.scope == Scope::Foreign && endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw)
             .count(),
         3
     );
     assert_eq!(
         inv.declarations
             .iter()
-            .filter(|d| d.site == Site::Const && d.pointer_state == PointerState::Raw)
+            .filter(|d| d.site == Site::Const && endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw)
             .count(),
         1
     );
@@ -157,7 +157,7 @@ fn includes_methods_closures_constants_and_foreign_signatures() {
         inv.declarations
             .iter()
             .filter(|d| d.site == Site::Param
-                && d.pointer_state == PointerState::Raw
+                && endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw
                 && d.scope == Scope::Application)
             .count(),
         2
@@ -166,7 +166,7 @@ fn includes_methods_closures_constants_and_foreign_signatures() {
         inv.declarations
             .iter()
             .filter(|d| d.site == Site::Return
-                && d.pointer_state == PointerState::Raw
+                && endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw
                 && d.scope == Scope::Application)
             .count(),
         2
@@ -181,20 +181,20 @@ fn excludes_phantom_storage_and_function_signature_payloads() {
              c: Option<unsafe fn(*mut u8)>, d: *const u8) {}
     "#,
     );
-    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
+    assert!(inv.structural_errors.is_empty(), "{:?}", inv.structural_errors);
     let params: Vec<_> = inv
         .declarations
         .iter()
         .filter(|d| d.site == Site::Param)
         .collect();
-    assert!(params[0].slots.is_empty());
-    assert_eq!(params[1].slots.len(), 1);
-    assert_eq!(params[1].slots[0].kind, PointerKind::FnPtr);
-    assert_eq!(params[2].slots[0].kind, PointerKind::OptFnPtr);
+    assert!(inv.observations[&params[0].declaration_id].slots.is_empty());
+    assert_eq!(inv.observations[&params[1].declaration_id].slots.len(), 1);
+    assert_eq!(inv.observations[&params[1].declaration_id].slots[0].kind, PointerKind::FnPtr);
+    assert_eq!(inv.observations[&params[2].declaration_id].slots[0].kind, PointerKind::OptFnPtr);
     assert_eq!(
         params
             .iter()
-            .filter(|d| d.pointer_state == PointerState::Raw)
+            .filter(|d| endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw)
             .count(),
         1
     );
@@ -203,15 +203,10 @@ fn excludes_phantom_storage_and_function_signature_payloads() {
 #[test]
 fn opaque_wrappers_are_not_silently_removed() {
     let inv = inventory(r#"fn f(p: std::ptr::NonNull<u8>) {}"#);
-    assert_eq!(inv.issues.len(), 1);
-    assert_eq!(
-        inv.declarations
-            .iter()
-            .find(|d| d.site == Site::Param)
-            .unwrap()
-            .pointer_state,
-        PointerState::Unsupported
-    );
+    assert!(inv.structural_errors.is_empty());
+    let d = inv.declarations.iter().find(|d| d.site == Site::Param).unwrap();
+    assert_eq!(endpoint_state(&inv.observations[&d.declaration_id]), EndpointState::Unknown);
+    assert_eq!(inv.observations[&d.declaration_id].diagnostics.len(),1);
 }
 
 #[test]
@@ -238,16 +233,15 @@ fn cursor_kinds_use_registered_type_identity() {
                 roles.cursors.insert(def.did(), mutable);
             }
             assert_eq!(
-                classify_type_with_roles(sig.inputs()[0], tcx, &roles).unwrap()[0].kind,
+                observe_type(sig.inputs()[0], tcx, &roles).slots[0].kind,
                 PointerKind::SliceCursor
             );
             assert_eq!(
-                classify_type_with_roles(sig.inputs()[1], tcx, &roles).unwrap()[0].kind,
+                observe_type(sig.inputs()[1], tcx, &roles).slots[0].kind,
                 PointerKind::SliceCursorMut
             );
             assert!(
-                classify_type_with_roles(sig.inputs()[2], tcx, &roles)
-                    .unwrap()
+                observe_type(sig.inputs()[2], tcx, &roles).slots
                     .is_empty()
             );
         },
@@ -263,7 +257,7 @@ fn ignores_desugared_iterator_bindings_and_counts_variant_fields_once() {
         fn f() { for p in [0usize as *mut u8] { let q = p; } }
     "#,
     );
-    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
+    assert!(inv.structural_errors.is_empty(), "{:?}", inv.structural_errors);
     let fields: Vec<_> = inv
         .declarations
         .iter()
@@ -276,14 +270,14 @@ fn ignores_desugared_iterator_bindings_and_counts_variant_fields_once() {
         .filter(|d| d.site == Site::Local)
         .collect();
     assert_eq!(locals.len(), 2, "{locals:?}");
-    assert!(locals.iter().all(|d| d.pointer_state == PointerState::Raw));
+    assert!(locals.iter().all(|d| endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw));
 }
 
 #[test]
 fn opaque_c_void_pointee_is_not_an_unknown_wrapper() {
     let inv = inventory("fn f(p: *mut core::ffi::c_void) {} ");
-    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
-    assert_eq!(inv.declarations[0].pointer_state, PointerState::Raw);
+    assert!(inv.structural_errors.is_empty(), "{:?}", inv.structural_errors);
+    assert_eq!(endpoint_state(&inv.observations[&inv.declarations[0].declaration_id]), EndpointState::Raw);
 }
 
 #[test]
@@ -294,28 +288,44 @@ fn unsupported_issues_keep_distinct_structural_locators() {
     let expected: std::collections::BTreeSet<_> = inv
         .declarations
         .iter()
-        .filter(|d| d.pointer_state == PointerState::Unsupported)
+        .filter(|d| endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Unknown)
         .map(|d| d.locator.clone())
         .collect();
-    let actual: std::collections::BTreeSet<_> = inv
-        .issues
-        .iter()
-        .filter_map(|i| i.locator.clone())
-        .collect();
+    let actual: std::collections::BTreeSet<_> = inv.declarations.iter()
+        .filter(|d| !inv.observations[&d.declaration_id].diagnostics.is_empty())
+        .map(|d| d.locator.clone()).collect();
+    assert_eq!(actual.len(),3);
     assert_eq!(actual, expected);
 }
 
 #[test]
 fn distinct_anonymous_const_owners_have_distinct_signature_sites() {
     let inv = inventory("const _: () = { fn check() {} }; const _: () = { fn check() {} };");
-    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
-    assert_eq!(inv.declarations.iter().filter(|d| d.site == Site::Return).count(), 2);
+    assert!(inv.structural_errors.is_empty(), "{:?}", inv.structural_errors);
+    assert_eq!(
+        inv.declarations
+            .iter()
+            .filter(|d| d.site == Site::Return)
+            .count(),
+        2
+    );
 }
 
 #[test]
 fn anonymous_constants_are_not_named_pointer_declarations() {
-    let inv = inventory("const _: *const u8 = 0 as *const u8; const KEEP: *const u8 = 0 as *const u8;");
-    assert!(inv.issues.is_empty(), "{:?}", inv.issues);
-    assert_eq!(inv.declarations.iter().filter(|d| d.pointer_state == PointerState::Raw).count(), 1);
-    assert!(inv.declarations.iter().all(|d| d.name.as_deref() != Some("_")));
+    let inv =
+        inventory("const _: *const u8 = 0 as *const u8; const KEEP: *const u8 = 0 as *const u8;");
+    assert!(inv.structural_errors.is_empty(), "{:?}", inv.structural_errors);
+    assert_eq!(
+        inv.declarations
+            .iter()
+            .filter(|d| endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw)
+            .count(),
+        1
+    );
+    assert!(
+        inv.declarations
+            .iter()
+            .all(|d| d.name.as_deref() != Some("_"))
+    );
 }
