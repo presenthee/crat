@@ -420,7 +420,7 @@ impl Measurement {
             outputs.push(id);
         }
         self.events.push(LineageEvent {
-            schema_version: 1,
+            schema_version: 2,
             event_id,
             stage: self.stage.clone(),
             phase: self.phase,
@@ -502,7 +502,7 @@ impl Measurement {
                     )));
                 }
                 events.push(LineageEvent {
-                    schema_version: 1,
+                    schema_version: 2,
                     event_id: format!(
                         "{}:{}:preserve:{}",
                         self.ledger.current_map().case_id,
@@ -545,7 +545,7 @@ impl Measurement {
             .map(|e| e.id.clone())
             .collect();
         let map = DeclarationMap {
-            schema_version: 1,
+            schema_version: 2,
             case_id: old.case_id.clone(),
             profile: old.profile.clone(),
             stage: self.stage.clone(),

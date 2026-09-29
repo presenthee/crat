@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::*;
-use crate::pointer_inventory::{PointerState, Site, StageId, collect_inventory};
+use crate::pointer_inventory::{EndpointState, Site, StageId, collect_inventory};
 
 fn inventory(code: &str) -> Inventory {
     crate::compilation::run_compiler_on_str(code, |tcx| {
@@ -107,7 +107,7 @@ fn explicit_output_map_preserves_renamed_identity_and_support_scope() {
     assert_eq!(
         out.declarations
             .iter()
-            .filter(|d| d.scope == Scope::Application && d.pointer_state == PointerState::Raw)
+            .filter(|d| d.scope == Scope::Application && endpoint_state(&out.observations[&d.declaration_id]) == EndpointState::Raw)
             .count(),
         1
     );
@@ -171,7 +171,7 @@ fn ast_bindings_cover_source_declarations_before_type_queries() {
             "fixture",
             StageId("input".into()),
         );
-        assert!(inv.issues.is_empty(), "{:?}", inv.issues);
+        assert!(inv.structural_errors.is_empty(), "{:?}", inv.structural_errors);
         assert_eq!(nodes.len(), inv.declarations.len());
         assert_eq!(
             nodes.iter().collect::<std::collections::HashSet<_>>().len(),
@@ -190,4 +190,33 @@ fn hashes_include_legitimate_measurement_and_reports_modules() {
         fs::write(dir.0.join(name).join("mod.rs"), "pub fn f() {}").unwrap();
     }
     assert_eq!(crate_source_paths(&dir.0).unwrap(), vec![PathBuf::from("measurement/mod.rs"), PathBuf::from("reports/mod.rs")]);
+}
+
+#[test]
+fn identity_survives_unknown_kind_detail() {
+    let code = "fn f(a: *mut u8, b: std::ptr::NonNull<u8>) {}";
+    let before = inventory(code);
+    validate_inventory(&before).unwrap();
+    let map = seed_map(&before);
+    let after = mapped(code, &map, &SourceHashes::new()).unwrap();
+    assert_eq!(seed_map(&after), map);
+    assert_eq!(after.observations.keys().cloned().collect::<BTreeSet<_>>(), after.declarations.iter().map(|d| d.declaration_id.clone()).collect());
+    assert!(after.structural_errors.is_empty());
+    assert_eq!(after.observations[&after.declarations[1].declaration_id].raw_presence, Presence::Unknown);
+}
+
+#[test]
+fn reconcile_rekeys_observations_with_declarations() {
+    let mut inv = inventory("fn f(p: *mut u8) {}");
+    let before = inv.clone();
+    let renames: BTreeMap<_,_> = inv.declarations.iter().enumerate().map(|(i,d)| (d.declaration_id.clone(), DeclId(format!("new:{i}")))).collect();
+    rekey_declarations(&mut inv, &renames).unwrap();
+    assert_eq!(inv.observations.keys().cloned().collect::<BTreeSet<_>>(), renames.values().cloned().collect());
+    for (old,new) in &renames { assert_eq!(before.observations[old],inv.observations[new]); }
+    let mut broken = before.clone();
+    let duplicates = renames.keys().map(|id| (id.clone(), DeclId("same".into()))).collect();
+    assert!(rekey_declarations(&mut broken,&duplicates).is_err());
+    assert_eq!(broken,before);
+    assert!(rekey_declarations(&mut broken,&BTreeMap::new()).is_err());
+    assert_eq!(broken,before);
 }

@@ -42,7 +42,7 @@ pub fn source_shape(site: Site, name: &Option<String>) -> String {
 }
 pub fn seed_map(inventory: &Inventory) -> DeclarationMap {
     DeclarationMap {
-        schema_version: 1,
+        schema_version: MEASUREMENT_SCHEMA_VERSION,
         case_id: inventory.case_id.clone(),
         profile: inventory.profile.clone(),
         stage: inventory.stage.clone(),
@@ -61,7 +61,7 @@ pub fn seed_map(inventory: &Inventory) -> DeclarationMap {
 }
 
 pub fn validate_map(map: &DeclarationMap) -> Result<(), MeasurementError> {
-    if map.schema_version != 1 {
+    if map.schema_version != MEASUREMENT_SCHEMA_VERSION {
         return Err(MeasurementError::InvalidEvent(format!(
             "unsupported map schema {}",
             map.schema_version
@@ -188,12 +188,8 @@ pub fn reconcile_inventory(
     map: &DeclarationMap,
 ) -> Result<Inventory, MeasurementError> {
     validate_map(map)?;
-    if !inventory.issues.is_empty() {
-        return Err(MeasurementError::UnsupportedInventory(format!(
-            "{}: {:?}",
-            map.stage.0, inventory.issues
-        )));
-    }
+    validate_inventory(&inventory)?;
+    let mut replacements = BTreeMap::new();
     let mut entries: BTreeMap<_, _> = map.entries.iter().map(|e| (&e.locator, e)).collect();
     for d in &mut inventory.declarations {
         let entry = entries.remove(&d.locator).ok_or_else(|| {
@@ -208,7 +204,7 @@ pub fn reconcile_inventory(
                 declaration_shape(d)
             )));
         }
-        d.declaration_id = entry.id.clone();
+        replacements.insert(d.declaration_id.clone(), entry.id.clone());
         d.scope = entry.scope;
     }
     if let Some(entry) = entries.values().next() {
@@ -217,6 +213,7 @@ pub fn reconcile_inventory(
             map.stage.0, entry.id.0
         )));
     }
+    rekey_declarations(&mut inventory, &replacements)?;
     inventory.source_hashes = map.source_hashes.clone();
     inventory.profile = map.profile.clone();
     Ok(inventory)

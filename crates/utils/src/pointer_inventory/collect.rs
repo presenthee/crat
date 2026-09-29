@@ -15,34 +15,11 @@ use rustc_span::{
 
 use super::*;
 
-pub fn classify_type<'tcx>(
-    ty: Ty<'tcx>,
-    tcx: TyCtxt<'tcx>,
-) -> Result<Vec<PointerSlot>, InventoryIssue> {
-    classify_type_with_roles(ty, tcx, &TypeRoles::default())
-}
-
 /// Compiler identities established by the injected-support declaration map.
 /// Names alone never confer a custom pointer representation.
 #[derive(Default, Clone)]
 pub struct TypeRoles {
     pub cursors: HashMap<DefId, bool>,
-}
-
-pub fn classify_type_with_roles<'tcx>(
-    ty: Ty<'tcx>,
-    tcx: TyCtxt<'tcx>,
-    roles: &TypeRoles,
-) -> Result<Vec<PointerSlot>, InventoryIssue> {
-    let observed = observe_type(ty, tcx, roles);
-    if observed.slots_complete {
-        Ok(observed.slots)
-    } else {
-        Err(InventoryIssue {
-            locator: None,
-            reason: format!("unsupported type: {ty}"),
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -82,13 +59,15 @@ pub fn collect_bound_inventory_with_roles(
         tcx,
         roles: roles.clone(),
         inventory: Inventory {
-            schema_version: 1,
+            schema_version: MEASUREMENT_SCHEMA_VERSION,
             case_id: case_id.into(),
             profile: None,
             stage,
             source_hashes: BTreeMap::new(),
             declarations: Vec::new(),
-            issues: Vec::new(),
+            counting_contract: COUNTING_CONTRACT.into(),
+            observations: BTreeMap::new(),
+            structural_errors: Vec::new(),
         },
         keys: Vec::new(),
         bindings: HashSet::new(),
@@ -110,11 +89,12 @@ pub fn collect_bound_inventory_with_roles(
         .map(|s| (s.node, s))
         .collect();
     let mut locator_changes = BTreeMap::new();
+    let mut replacements = BTreeMap::new();
     for (node, key) in sites {
         if let Some(mut d) = declarations.remove(&key) {
             let index = nodes.len();
             let Some(source_site) = source_sites.get(&node) else {
-                collector.inventory.issues.push(InventoryIssue {
+                collector.inventory.structural_errors.push(InventoryIssue {
                     locator: Some(d.locator),
                     reason: format!("missing structural source site: {node:?}"),
                 });
@@ -123,12 +103,12 @@ pub fn collect_bound_inventory_with_roles(
             locator_changes.insert(d.locator.clone(), source_site.locator.clone());
             d.locator = source_site.locator.clone();
             d.name = source_site.name.clone();
-            d.declaration_id = DeclId(format!("{case_id}:decl:{index}"));
+            replacements.insert(d.declaration_id.clone(), DeclId(format!("{case_id}:decl:{index}")));
             nodes.push(node);
             collector.inventory.declarations.push(d);
         }
     }
-    for issue in &mut collector.inventory.issues {
+    for issue in &mut collector.inventory.structural_errors {
         if let Some(locator) = issue
             .locator
             .as_ref()
@@ -138,13 +118,17 @@ pub fn collect_bound_inventory_with_roles(
         }
     }
     for (_, d) in declarations {
-        collector.inventory.issues.push(InventoryIssue {
+        collector.inventory.structural_errors.push(InventoryIssue {
             locator: Some(d.locator),
             reason: format!(
                 "declaration has no source AST binding: {} {:?}",
                 d.owner, d.name
             ),
         });
+    }
+    collector.inventory.observations.retain(|id, _| replacements.contains_key(id));
+    if let Err(error) = rekey_declarations(&mut collector.inventory, &replacements) {
+        collector.inventory.structural_errors.push(InventoryIssue { locator: None, reason: error.to_string() });
     }
     (collector.inventory, nodes)
 }
@@ -188,30 +172,12 @@ impl<'tcx> Collector<'tcx> {
             .tcx
             .try_normalize_erasing_regions(ty::TypingEnv::post_analysis(self.tcx, owner_id), ty)
             .unwrap_or(ty);
-        let (slots, pointer_state) = match classify_type_with_roles(ty, self.tcx, &self.roles) {
-            Ok(slots) => {
-                let state = if slots.iter().any(|s| s.kind.is_raw()) {
-                    PointerState::Raw
-                } else if slots.iter().any(|s| s.kind.is_data_pointer()) {
-                    PointerState::Promoted
-                } else {
-                    PointerState::Nonpointer
-                };
-                (slots, state)
-            }
-            Err(mut issue) => {
-                issue.locator = Some(locator.clone());
-                self.inventory.issues.push(issue);
-                (vec![], PointerState::Unsupported)
-            }
-        };
+        let observed = observe_type(ty, self.tcx, &self.roles);
+        let declaration_id = DeclId(format!("{}:decl:{}", self.inventory.case_id, self.inventory.declarations.len()));
+        self.inventory.observations.insert(declaration_id.clone(), observed);
         let loc = self.tcx.sess.source_map().lookup_char_pos(span.lo());
         self.inventory.declarations.push(Declaration {
-            declaration_id: DeclId(format!(
-                "{}:decl:{}",
-                self.inventory.case_id,
-                self.inventory.declarations.len()
-            )),
+            declaration_id,
             site,
             scope,
             owner,
@@ -223,8 +189,6 @@ impl<'tcx> Collector<'tcx> {
             },
             resolved_type: ty.to_string(),
             locator,
-            slots,
-            pointer_state,
         });
     }
 

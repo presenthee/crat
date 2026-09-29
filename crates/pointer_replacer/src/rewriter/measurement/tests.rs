@@ -1,7 +1,7 @@
 use ::utils::{
     compilation::run_compiler_on_str,
     pointer_identity::seed_map,
-    pointer_inventory::{PointerState, collect_bound_inventory},
+    pointer_inventory::{EndpointState, endpoint_state, collect_bound_inventory},
 };
 use rustc_ast::{self as ast, mut_visit::MutVisitor};
 
@@ -23,7 +23,7 @@ fn fixture<R: Send>(
             inventory
                 .declarations
                 .iter()
-                .filter(|d| d.pointer_state == PointerState::Raw)
+                .filter(|d| endpoint_state(&inventory.observations[&d.declaration_id]) == EndpointState::Raw)
                 .count(),
             2
         );
@@ -429,7 +429,7 @@ fn generated_reconstruction_keeps_original_ancestry() {
     assert_eq!(
         inv.declarations
             .iter()
-            .filter(|d| d.pointer_state == PointerState::Raw)
+            .filter(|d| endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw)
             .count(),
         4
     );
@@ -537,14 +537,14 @@ pub unsafe fn f(p: *mut i32, take: bool) -> *mut i32 {
         inv.declarations
             .iter()
             .any(|d| descendants.contains(&d.declaration_id)
-                && d.pointer_state == PointerState::Nonpointer
+                && endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Nonpointer
                 && d.name.as_deref() == Some("q_idx"))
     );
     assert!(
         inv.declarations
             .iter()
             .any(|d| descendants.contains(&d.declaration_id)
-                && d.pointer_state == PointerState::Raw
+                && endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw
                 && d.site == ::utils::pointer_inventory::Site::Return)
     );
     let ordinary = run_compiler_on_str(code, |tcx| {
@@ -702,7 +702,7 @@ pub unsafe fn foo(mut p: *mut i32, n: isize) -> i32 {
             inv.declarations
                 .iter()
                 .filter(|d| descendants.contains(&d.declaration_id)
-                    && d.pointer_state == PointerState::Raw)
+                    && endpoint_state(&inv.observations[&d.declaration_id]) == EndpointState::Raw)
                 .count(),
             1
         );
@@ -779,7 +779,7 @@ pub unsafe fn identity(x: *mut i32) -> *mut i32 { x }
         .iter()
         .find(|d| d.declaration_id == field.declaration_id)
         .unwrap();
-    assert_eq!(final_field.pointer_state, PointerState::Raw);
+    assert_eq!(endpoint_state(&after.observations[&final_field.declaration_id]), EndpointState::Raw);
     for original in before.declarations {
         assert!(
             after
@@ -792,7 +792,7 @@ pub unsafe fn identity(x: *mut i32) -> *mut i32 { x }
         after
             .declarations
             .iter()
-            .any(|d| d.owner.ends_with("identity") && d.pointer_state == PointerState::Promoted)
+            .any(|d| d.owner.ends_with("identity") && endpoint_state(&after.observations[&d.declaration_id]) == EndpointState::Promoted)
     );
 }
 #[test]
@@ -846,9 +846,9 @@ pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) { *p.offset(a).offse
         .iter()
         .find(|d| d.scope == Scope::Application && d.name.as_deref() == Some("p"))
         .unwrap();
-    assert_eq!(p.pointer_state, PointerState::Promoted);
+    assert_eq!(endpoint_state(&after.observations[&p.declaration_id]), EndpointState::Promoted);
     assert_eq!(
-        p.slots[0].kind,
+        after.observations[&p.declaration_id].slots[0].kind,
         ::utils::pointer_inventory::PointerKind::SliceCursorMut
     );
     let user = after
@@ -856,18 +856,18 @@ pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) { *p.offset(a).offse
         .iter()
         .find(|d| d.owner.ends_with("user_type") && d.name.as_deref() == Some("x"))
         .unwrap();
-    assert_eq!(user.pointer_state, PointerState::Nonpointer);
+    assert_eq!(endpoint_state(&after.observations[&user.declaration_id]), EndpointState::Nonpointer);
     assert!(
         after
             .declarations
             .iter()
-            .any(|d| d.scope == Scope::Support && d.pointer_state == PointerState::Raw)
+            .any(|d| d.scope == Scope::Support && endpoint_state(&after.observations[&d.declaration_id]) == EndpointState::Raw)
     );
     assert_eq!(
         after
             .declarations
             .iter()
-            .filter(|d| d.scope == Scope::Application && d.pointer_state == PointerState::Raw)
+            .filter(|d| d.scope == Scope::Application && endpoint_state(&after.observations[&d.declaration_id]) == EndpointState::Raw)
             .count(),
         0
     );
@@ -916,12 +916,12 @@ fn measurement_cursor_off_retains_backward_offset_raw() {
     let code = "pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) { *p.offset(a).offset(b) = 1; }";
     let (_, on, _, on_emission) = measure_borrow(code);
     assert!(on_emission.source.contains("crate::slice_cursor::"));
-    assert!(on.declarations.iter().any(|d| d.slots.iter().any(|s| s.kind == PointerKind::SliceCursorMut)));
+    assert!(on.declarations.iter().any(|d| on.observations[&d.declaration_id].slots.iter().any(|s| s.kind == PointerKind::SliceCursorMut)));
     let (_, off, _, emission) = measure_borrow_config(code, &config);
     assert!(!emission.source.contains("crate::slice_cursor::"));
-    assert_eq!(off.declarations.iter().find(|d| d.name.as_deref() == Some("p")).unwrap().pointer_state, PointerState::Raw);
+    assert_eq!(endpoint_state(&off.observations[&off.declarations.iter().find(|d| d.name.as_deref() == Some("p")).unwrap().declaration_id]), EndpointState::Raw);
     let (_, forward, _, _) = measure_borrow_config("pub unsafe fn f(p: *const u8) -> u8 { *p.offset(1) }", &config);
-    assert!(forward.declarations.iter().find(|d| d.name.as_deref() == Some("p")).unwrap().slots.iter().any(|s| s.kind == PointerKind::Slice));
+    assert!(forward.observations[&forward.declarations.iter().find(|d| d.name.as_deref() == Some("p")).unwrap().declaration_id].slots.iter().any(|s| s.kind == PointerKind::Slice));
 }
 
 #[test]
@@ -937,7 +937,7 @@ fn measurement_cursor_off_fields_returns_callbacks_and_aliases() {
         assert!(!emission.source.contains("crate::slice_cursor::"), "{}", emission.source);
         assert!(!emission.source.contains("pub mod slice_cursor"));
         for d in inventory.declarations.iter().filter(|d| d.site == ::utils::pointer_inventory::Site::Field && matches!(d.name.as_deref(), Some("p" | "words" | "buf"))) {
-            assert_eq!(d.pointer_state, PointerState::Raw);
+            assert_eq!(endpoint_state(&inventory.observations[&d.declaration_id]), EndpointState::Raw);
         }
     }
 }
