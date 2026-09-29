@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::json;
 use utils::{
     compilation::run_compiler_on_path,
+    pointer_effectiveness::assess_availability,
     pointer_identity::{
         MeasurementError, crate_hashes, crate_source_paths, hash_sources, reconcile_inventory,
         relative_locations, validate_map,
@@ -30,6 +31,8 @@ pub struct Session {
     lib: PathBuf,
     ledger: Ledger,
     artifacts: Vec<PathBuf>,
+    baseline: Option<Inventory>,
+    stages: Vec<Inventory>,
 }
 impl Session {
     pub fn new(origin_map_path: &Path, measurement_dir: &Path) -> Result<Self, MeasurementError> {
@@ -48,6 +51,8 @@ impl Session {
             lib: PathBuf::new(),
             ledger: Ledger::new(map),
             artifacts: Vec::new(),
+            baseline: None,
+            stages: Vec::new(),
         })
     }
 
@@ -77,6 +82,7 @@ impl Session {
         })
         .map_err(|_| invalid("input type-check failed"))??;
         relative_locations(&mut inventory, &self.root)?;
+        self.baseline = Some(inventory.clone());
         self.write("input-inventory.json", &inventory)?;
         self.write("input-declaration-map.json", &map)
     }
@@ -114,6 +120,7 @@ impl Session {
         .map_err(|_| invalid(format!("{stage} type-check failed")))??;
         relative_locations(&mut inventory, &snapshot)?;
         self.ledger.commit(emission.delta.clone())?;
+        self.stages.push(inventory.clone());
         for path in crate_source_paths(&snapshot)? {
             self.artifacts
                 .push(PathBuf::from(&prefix).join("crate").join(path));
@@ -133,7 +140,7 @@ impl Session {
         decisions.sort_by_key(|d| d["candidate"].as_str().unwrap().to_owned());
         self.write(
             "gate.json",
-            &json!({"schema_version":1,
+            &json!({"schema_version":2,
                 "accepted_epochs":gate.accepted_epochs, "rejected_epochs":gate.rejected_epochs,
                 "accepted_arrays":gate.accepted_arrays, "rejected_arrays":gate.rejected_arrays,
                 "combined_trial_failed":gate.combined_trial_failed,
@@ -164,6 +171,14 @@ impl Session {
         if final_inventory.source_hashes != map.source_hashes {
             return Err(MeasurementError::HashMismatch("final output".into()));
         }
+        let availability = assess_availability(
+            self.baseline
+                .as_ref()
+                .ok_or_else(|| invalid("missing input inventory"))?,
+            &self.stages,
+            &final_inventory,
+            &self.ledger,
+        )?;
         self.write("final-inventory.json", &final_inventory)?;
         self.write("final-declaration-map.json", &map)?;
         let mut lines = String::new();
@@ -178,7 +193,8 @@ impl Session {
         self.artifacts.sort();
         self.artifacts.dedup();
         let hashes = hash_sources(&self.dir, &self.artifacts)?;
-        let completion = json!({"schema_version":1,"status":"success", "case_id":map.case_id,
+        let completion = json!({"schema_version":2,"counting_contract":"raw-origins-v2","status":"artifacts_complete", "case_id":map.case_id,
+            "availability":availability,
             "profile":map.profile,"stages":self.ledger.stages().iter().map(|s| &s.map.stage).collect::<Vec<_>>(),
             "artifact_hashes":hashes});
         fs::write(
