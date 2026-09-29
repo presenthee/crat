@@ -34,131 +34,15 @@ pub fn classify_type_with_roles<'tcx>(
     tcx: TyCtxt<'tcx>,
     roles: &TypeRoles,
 ) -> Result<Vec<PointerSlot>, InventoryIssue> {
-    let mut slots = Vec::new();
-    walk_type(ty, tcx, roles, "root", false, &mut slots)?;
-    Ok(slots)
-}
-
-fn walk_type<'tcx>(
-    ty: Ty<'tcx>,
-    tcx: TyCtxt<'tcx>,
-    roles: &TypeRoles,
-    path: &str,
-    optional: bool,
-    slots: &mut Vec<PointerSlot>,
-) -> Result<(), InventoryIssue> {
-    use PointerKind as K;
-    let pointer = match *ty.kind() {
-        ty::RawPtr(inner, m) => Some((if m.is_mut() { K::RawMut } else { K::RawConst }, inner)),
-        ty::Ref(_, inner, m) => {
-            let k = match (inner.is_slice(), optional, m.is_mut()) {
-                (true, _, true) => K::SliceMut,
-                (true, _, false) => K::Slice,
-                (false, true, true) => K::OptRefMut,
-                (false, true, false) => K::OptRef,
-                (false, false, true) => K::RefMut,
-                (false, false, false) => K::Ref,
-            };
-            Some((k, inner))
-        }
-        ty::Adt(def, args) if def.is_box() => {
-            let inner = args.type_at(0);
-            let k = match (inner.is_slice(), optional) {
-                (true, true) => K::OptBoxedSlice,
-                (true, false) => K::BoxedSlice,
-                (false, true) => K::OptBox,
-                (false, false) => K::Box,
-            };
-            Some((k, inner))
-        }
-        _ => None,
-    };
-    if let Some((kind, inner)) = pointer {
-        slots.push(PointerSlot {
-            path: path.into(),
-            kind,
-            optional,
-        });
-        return walk_type(inner, tcx, roles, &format!("{path}.pointee"), false, slots);
+    let observed = observe_type(ty, tcx, roles);
+    if observed.slots_complete {
+        Ok(observed.slots)
+    } else {
+        Err(InventoryIssue {
+            locator: None,
+            reason: format!("unsupported type: {ty}"),
+        })
     }
-    match *ty.kind() {
-        ty::Adt(def, args) if tcx.lang_items().option_type() == Some(def.did()) => {
-            walk_type(args.type_at(0), tcx, roles, path, true, slots)?
-        }
-        ty::Adt(def, _) if def.is_phantom_data() => (),
-        ty::Adt(def, args) if roles.cursors.contains_key(&def.did()) => {
-            slots.push(PointerSlot {
-                path: path.into(),
-                kind: if roles.cursors[&def.did()] {
-                    K::SliceCursorMut
-                } else {
-                    K::SliceCursor
-                },
-                optional,
-            });
-            walk_type(
-                args.types().next().expect("cursor element type"),
-                tcx,
-                roles,
-                &format!("{path}.element"),
-                false,
-                slots,
-            )?;
-        }
-        ty::Adt(def, args) => {
-            // Local fields are inventoried at their definitions. Inspect type arguments,
-            // never recursively multiply those fields at each declaration using the ADT.
-            let lang = tcx.lang_items();
-            let is_range = [
-                lang.range_struct(),
-                lang.range_from_struct(),
-                lang.range_to_struct(),
-                lang.range_full_struct(),
-                lang.range_inclusive_struct(),
-                lang.range_to_inclusive_struct(),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|did| did == def.did());
-            if !def.did().is_local() && !ty.is_c_void(tcx) && !is_range {
-                return Err(InventoryIssue {
-                    locator: None,
-                    reason: format!("unsupported external wrapper: {ty}"),
-                });
-            }
-            for (i, arg) in args.types().enumerate() {
-                walk_type(arg, tcx, roles, &format!("{path}.arg[{i}]"), false, slots)?;
-            }
-        }
-        ty::Tuple(types) => {
-            for (i, inner) in types.iter().enumerate() {
-                walk_type(
-                    inner,
-                    tcx,
-                    roles,
-                    &format!("{path}.tuple[{i}]"),
-                    false,
-                    slots,
-                )?;
-            }
-        }
-        ty::Array(inner, _) | ty::Slice(inner) => {
-            walk_type(inner, tcx, roles, &format!("{path}.element"), false, slots)?
-        }
-        ty::FnPtr(..) => slots.push(PointerSlot {
-            path: path.into(),
-            kind: if optional { K::OptFnPtr } else { K::FnPtr },
-            optional,
-        }),
-        ty::Alias(..) | ty::Error(_) | ty::Infer(_) => {
-            return Err(InventoryIssue {
-                locator: None,
-                reason: format!("unresolved type: {ty}"),
-            });
-        }
-        _ => (),
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
