@@ -52,6 +52,8 @@ pub enum PointerKind {
     SliceMut,
     SliceCursor,
     SliceCursorMut,
+    Vec,
+    String,
     FnPtr,
     OptFnPtr,
 }
@@ -126,4 +128,47 @@ pub struct DeclarationMap {
     pub stage: StageId,
     pub source_hashes: SourceHashes,
     pub entries: Vec<MappedDeclaration>,
+}
+
+pub const MEASUREMENT_SCHEMA_VERSION: u32 = 2;
+pub const COUNTING_CONTRACT: &str = "raw-origins-v2";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Presence {
+    Present,
+    Absent,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationFact {
+    RawPresence,
+    DataRepresentation,
+    Slots,
+    RawSlots,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeDiagnostic {
+    pub code: String,
+    pub path: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub affects: Vec<ObservationFact>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeObservation {
+    pub raw_presence: Presence,
+    pub data_representation: Presence,
+    pub slots: Vec<PointerSlot>,
+    pub slots_complete: bool,
+    pub raw_slots_complete: bool,
+    pub diagnostics: Vec<TypeDiagnostic>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointState {
+    Raw,
+    Promoted,
+    Nonpointer,
+    Unknown,
 }
