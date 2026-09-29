@@ -190,7 +190,12 @@ fn all_profiles_publish_complete_artifacts_without_changing_output() {
         );
         let done: Value =
             serde_json::from_slice(&fs::read(measurement.join("complete.json")).unwrap()).unwrap();
-        assert_eq!(done["status"], "success");
+        assert_eq!(done["status"], "artifacts_complete");
+        assert_eq!(done["schema_version"], 2);
+        assert_eq!(done["counting_contract"], "raw-origins-v2");
+        assert_eq!(done["availability"]["baseline_origins"]["status"], "complete");
+        assert_eq!(done["availability"]["origin_categories"]["status"], "complete");
+        assert_eq!(done["availability"]["final_raw_definitions"]["status"], "complete");
         assert_eq!(
             done["stages"].as_array().unwrap().len(),
             1 + (bits & 31u32).count_ones() as usize
@@ -252,4 +257,23 @@ fn finder_seeds_case_and_observation_keys_together() {
     assert!(ids.iter().all(|id| id.0.starts_with("Public-Tests/fixture/partial:")));
     assert!(inventory.structural_errors.is_empty());
     assert!(inventory.observations.values().any(|o| !o.diagnostics.is_empty()));
+}
+
+#[test]
+fn partial_inventory_can_publish_valid_artifacts() {
+    let f=Fixture::new();
+    fs::write(f.input().join("lib.rs"),"pub fn f(p: std::ptr::NonNull<u8>) {}\n").unwrap();
+    let map=f.seed();
+    let config=f.0.join("config.toml");
+    fs::write(&config,"[pointer]\nenable_struct_arrays=false\nenable_struct_param_fields=false\nenable_epoch_split=false\nenable_aliasing=false\nenable_array_local_provenance=false\nenable_slice_cursor=false\n").unwrap();
+    let measurement=f.0.join("measurement");let output=f.0.join("out");fs::create_dir(&output).unwrap();
+    let out=command(env!("CARGO_BIN_EXE_crat")).args(["--pass","pointer","--config"]).arg(config)
+        .arg("-o").arg(output).arg("--pointer-origin-map").arg(map)
+        .arg("--pointer-measurement-dir").arg(&measurement).arg(f.input()).output().unwrap();
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let done: Value=serde_json::from_slice(&fs::read(measurement.join("complete.json")).unwrap()).unwrap();
+    assert_eq!(done["status"],"artifacts_complete");
+    assert_eq!(done["availability"]["baseline_origins"]["status"],"unavailable");
+    assert_eq!(done["availability"]["final_raw_definitions"]["status"],"unavailable");
+    assert_eq!(done["availability"]["baseline_origins"]["reasons"][0]["code"],"baseline_raw_presence_unknown");
 }

@@ -155,3 +155,5 @@ pub fn escape(c: u8) -> Option<&'static str> {
         _ => None,
     }
 }
+
+pub mod pointer_effectiveness;
