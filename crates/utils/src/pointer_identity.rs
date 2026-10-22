@@ -292,14 +292,10 @@ pub fn relative_locations(inventory: &mut Inventory, root: &Path) -> Result<(), 
     let root = root.canonicalize()?;
     for declaration in &mut inventory.declarations {
         let file = Path::new(&declaration.location.file);
-        if file.is_absolute() {
-            declaration.location.file = file
-                .strip_prefix(&root)
-                .map_err(|_| {
-                    MeasurementError::Io(format!("declaration outside crate: {}", file.display()))
-                })?
-                .to_string_lossy()
-                .into_owned();
+        // Declarations spanning outside the crate (macro-expanded std code) keep
+        // their absolute path so the counting scripts can filter them.
+        if let Ok(rel) = file.strip_prefix(&root) {
+            declaration.location.file = rel.to_string_lossy().into_owned();
         }
     }
     Ok(())

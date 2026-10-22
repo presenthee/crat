@@ -31,9 +31,33 @@ pub(super) enum DeclarationKey {
 pub fn collect_inventory(tcx: TyCtxt<'_>, case_id: &str, stage: StageId) -> Inventory {
     let mut ast = crate::ast::expanded_ast(tcx);
     let mapper = crate::ast::make_ast_to_hir(&mut ast, tcx);
-    let inventory = collect_bound_inventory(tcx, &ast, &mapper, case_id, stage).0;
+    let roles = injected_cursor_roles(tcx);
+    let inventory =
+        collect_bound_inventory_with_roles(tcx, &ast, &mapper, case_id, stage, &roles).0;
     crate::type_check(tcx);
     inventory
+}
+
+/// Standalone counting without a declaration map: recognise the injected
+/// `slice_cursor` support module by its def path.
+pub(super) fn injected_cursor_roles(tcx: TyCtxt<'_>) -> TypeRoles {
+    let mut roles = TypeRoles::default();
+    for id in tcx.hir_crate_items(()).free_items() {
+        let def_id = id.owner_id.to_def_id();
+        if !matches!(tcx.hir_item(id).kind, hir::ItemKind::Struct(..)) {
+            continue;
+        }
+        match tcx.def_path_str(def_id).as_str() {
+            "slice_cursor::SliceCursor" => roles.cursors.insert(def_id, false),
+            "slice_cursor::SliceCursorMut" => roles.cursors.insert(def_id, true),
+            _ => None,
+        };
+    }
+    roles
+}
+
+pub(super) fn is_injected_support_owner(owner: &str) -> bool {
+    owner.starts_with("slice_cursor::") || owner.starts_with("<slice_cursor::")
 }
 
 /// Reuse the rewriter's AST and mapper; never request expanded_ast after HIR queries.
@@ -156,6 +180,7 @@ impl<'tcx> Collector<'tcx> {
     ) {
         let owner_id = owner;
         let owner = self.tcx.def_path_str(owner.to_def_id());
+        let scope = if is_injected_support_owner(&owner) { Scope::Support } else { scope };
         let next = self.owners.len() as u32;
         let owner_index = *self.owners.entry(owner_id).or_insert(next);
         let ordinal = self.ordinals.entry((owner_id, site)).or_default();

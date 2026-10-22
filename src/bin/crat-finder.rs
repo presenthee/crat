@@ -39,6 +39,7 @@ enum Finder {
     Unsafe,
     Void,
     Pointers,
+    PointerUses,
 }
 
 fn main() {
@@ -92,6 +93,10 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Finder::PointerUses => {
+            let counts = run_compiler_on_path(&file, utils::pointer_inventory::count_uses).unwrap();
+            println!("{}", serde_json::to_string(&counts).unwrap());
         }
         Finder::Example => {
             run_compiler_on_path(&file, finders::example::run).unwrap();
