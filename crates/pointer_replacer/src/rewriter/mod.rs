@@ -154,10 +154,10 @@ pub fn initial_pointer_decisions(
     let (input, analysis, fn_ptr_groups, _) = analyze(config, options, tcx);
     let lifetime_plans = lifetimes::LifetimePlans::new(&input, &analysis);
     let signatures = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
-    let bindings = collector::collect_diffs(&input, &analysis, &signatures, &fn_ptr_groups);
+    let diffs = collector::collect_diffs(&input, &analysis, &signatures, &fn_ptr_groups);
     InitialPointerDecisions {
         signatures,
-        bindings,
+        bindings: diffs.ptr_kinds,
     }
 }
 
