@@ -964,7 +964,17 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         span: LoHi,
         allow_checks: bool,
     ) -> Option<Assign<'a, 'tcx>> {
-        let locs = self.stmt_span_to_locs.get(&span)?;
+        let mut locs = &self.stmt_span_to_locs.get(&span)?[..];
+        // A tail-expression assignment is followed by a same-span write of the
+        // block's unit value (`_n = const ()`); skip it.
+        if let [rest @ .., last] = locs
+            && !rest.is_empty()
+            && let StatementKind::Assign(box (_, Rvalue::Use(Operand::Constant(c)))) =
+                &self.get_statement(*last).kind
+            && c.ty().is_unit()
+        {
+            locs = rest;
+        }
         for (i, loc) in locs.iter().enumerate() {
             let stmt = self.get_statement(*loc);
             let StatementKind::Assign(box (lhs, rhs)) = &stmt.kind else { panic!() };
