@@ -355,8 +355,11 @@ pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> Stri
                     derefs
                         .iter()
                         .filter_map(|deref| {
-                            if let Some(Assign { loc, span, rhs, .. }) =
-                                hir_visitor.assigns.get(&deref.hir_id)
+                            // Without per-return writes, returns are flag-guarded, so the
+                            // assignment must stay to set the flag.
+                            if wfrs.is_some()
+                                && let Some(Assign { loc, span, rhs, .. }) =
+                                    hir_visitor.assigns.get(&deref.hir_id)
                                 && let Some(returns) = hir_visitor.returns.get_mut(&local_def_id)
                             {
                                 let source_map = tcx.sess.source_map();
@@ -1302,5 +1305,55 @@ fn generate_default_init<'tcx>(ty: rustc_middle::ty::Ty<'tcx>, tcx: TyCtxt<'tcx>
             let ty_str = mir_ty_to_string(ty, tcx);
             format!("std::mem::transmute([0u8; std::mem::size_of::<{ty_str}>()])")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn run_test(code: &str, max_loop_head_states: usize, includes: &[&str]) {
+        let config = crate::Config {
+            max_loop_head_states,
+            simplify: true,
+            ..Default::default()
+        };
+        let s = utils::compilation::run_compiler_on_str(code, |tcx| {
+            super::transform(tcx, &config, false)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&s, utils::type_check).expect(&s);
+        for include in includes {
+            assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+        }
+    }
+
+    const READ32: &str = r#"
+#[no_mangle]
+pub unsafe extern "C" fn read16(mut br: *mut u32, mut n: u32, mut val: *mut u32) -> i32 {
+    if *br < n {
+        return 0 as i32;
+    }
+    *val = *br;
+    return 1 as i32;
+}
+#[no_mangle]
+pub unsafe extern "C" fn read32(mut br: *mut u32, mut n: u32, mut val: *mut u32) -> i32 {
+    let mut low: u32 = 0;
+    let mut high: u32 = 0;
+    if read16(br, 16 as u32, &mut low) == 0 || read16(br, n.wrapping_sub(16 as u32), &mut high) == 0 {
+        return 0 as i32;
+    }
+    *val = low | high << 16 as i32;
+    return 1 as i32;
+}
+"#;
+
+    #[test]
+    fn test_direct_return() {
+        run_test(READ32, usize::MAX, &["return Ok(low | high << 16 as i32)"]);
+    }
+
+    #[test]
+    fn test_direct_return_path_insensitive() {
+        run_test(READ32, 1, &["val___s = true"]);
     }
 }
