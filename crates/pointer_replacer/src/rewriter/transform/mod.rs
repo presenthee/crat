@@ -1095,6 +1095,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     };
 
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                let is_ctor = matches!(
+                    func.kind,
+                    hir::ExprKind::Path(hir::QPath::Resolved(_, path))
+                        if matches!(path.res, Res::Def(DefKind::Ctor(..), _))
+                );
 
                 if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
                     *expr = free_rewrite;
@@ -1118,6 +1123,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         })
                         .or_else(|| {
                             unwrap_ptr_from_mir_ty(ty).map(|(_, m)| {
+                                // a constructor's field type is fixed by the constructed type
+                                if is_ctor {
+                                    return PtrKind::Raw(m.is_mut());
+                                }
                                 PtrKind::Raw(
                                     self.get_mutability_decision(harg).unwrap_or(m.is_mut()),
                                 )
