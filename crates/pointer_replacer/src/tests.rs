@@ -14450,3 +14450,31 @@ pub unsafe fn eval(mut nodes: *mut N, pos: usize) {
         &["usize..]))[0]"],
     );
 }
+
+#[test]
+fn test_cursor_field_index_through_raw_struct_ptr_borrows_explicitly() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub words: *mut u32,
+}
+
+extern "C" {
+    fn observe(s: *mut State);
+}
+
+pub unsafe fn shift(s: *mut State, c: i32) {
+    *(*s).words.offset(c as isize) = *(*s).words.offset((c - 1) as isize);
+    observe(s);
+    observe(s.offset(1));
+}
+"#,
+        &[
+            "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
+            "(&mut ((*s).words))[",
+            "(&((*s).words))[",
+        ],
+        &[],
+    );
+}
