@@ -14356,3 +14356,44 @@ fn snapshot_runtime_prefix_validation_uses_captured_length() {
     assert!(!rewritten.contains("len as usize"), "{rewritten}");
     ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
 }
+
+#[test]
+fn test_call_result_pattern_binding_raw() {
+    run_test(
+        r#"
+unsafe fn init(mut buf: *mut u8, mut n: usize) -> Result<*mut u8, u32> {
+    let mut chunk___v: *mut u8 = 0 as *mut u8;
+    if n < 4 as usize { return Err(1 as u32); }
+    chunk___v = buf.offset(1 as isize);
+    *chunk___v.offset(2 as isize) = 0 as u8;
+    return Ok(chunk___v);
+}
+pub unsafe fn create(mut buf: *mut u8, mut n: usize) -> u32 {
+    let mut chunk: *mut u8 = 0 as *mut u8;
+    let mut error: u32 = match { let rv___ = init(buf, n); rv___ } {
+        Ok(v___) => { *(&mut chunk) = v___; 0 }
+        Err(v___) => v___,
+    };
+    if error != 0 { return error; }
+    *chunk.offset(1 as isize) = 1 as u8;
+    return 0 as u32;
+}
+unsafe fn encode(mut storage: *mut u8, mut n: usize) -> (Result<u64, i32>, Option<*mut u8>) {
+    let mut output___s: bool = false;
+    let mut output___v: *mut u8 = 0 as *mut u8;
+    if n == 0 as usize { return (Err(0 as i32), None); }
+    output___s = true;
+    output___v = storage.offset(0 as isize);
+    *output___v.offset(1 as isize) = 0 as u8;
+    return (Ok(0 as u64), if output___s { Some(output___v) } else { None });
+}
+pub unsafe fn process(mut storage: *mut u8, mut n: usize, mut out: *mut *mut u8) -> u64 {
+    let rv___t = encode(storage, n);
+    if let Some(v___) = rv___t.1 { *out = v___ };
+    return match rv___t.0 { Ok(v) => v, Err(_) => 0 as u64 };
+}
+"#,
+        &["*Some(&mut chunk).unwrap() = v___;", "((out))[0] = v___"],
+        &["(v___).as_mut_ptr()"],
+    );
+}
