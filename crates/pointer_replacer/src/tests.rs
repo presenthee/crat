@@ -10613,7 +10613,7 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("q_idx"), "{s}");
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
-    assert!(s.contains("(&mut ((p)[(q_idx) as usize..]))[0] = 3"), "{s}");
+    assert!(s.contains("(p)[((q_idx)) as usize] = 3"), "{s}");
 }
 
 #[test]
@@ -14414,5 +14414,39 @@ pub unsafe fn encode(mut storage: *mut u8, mut n: usize) -> (Result<u64, i32>, O
 "#,
         &["Some((output___v).as_ptr().cast_mut())"],
         &[],
+    );
+}
+
+#[test]
+fn test_slice_local_deref_offset_uses_direct_index() {
+    run_test(
+        r#"
+pub struct U {
+    pub v: u32,
+}
+impl U {
+    pub fn set_v(&mut self, x: u32) {
+        self.v = x;
+    }
+}
+pub struct N {
+    pub u: U,
+}
+unsafe fn count(mut nodes: *const N, n: usize) -> u32 {
+    let mut s: u32 = 0;
+    let mut i: usize = 0;
+    while i < n {
+        s = s.wrapping_add((*nodes.offset(i as isize)).u.v);
+        i = i + 1;
+    }
+    s
+}
+pub unsafe fn eval(mut nodes: *mut N, pos: usize) {
+    (*nodes.offset(pos as isize)).u.set_v(count(nodes, pos));
+    (*nodes.offset(1 as isize)).u.v = 0;
+}
+"#,
+        &["(nodes)[((pos as isize)) as usize]"],
+        &["usize..]))[0]"],
     );
 }

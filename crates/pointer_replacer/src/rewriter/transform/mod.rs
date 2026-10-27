@@ -1360,8 +1360,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let inner = unwrap_addr_of_deref(unwrap_cast_and_paren(e));
                     let hir_inner = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_e));
                     let pe = self.ptr_expr(inner, hir_inner);
-                    if let Some(pe) = pe
-                        && self.ptr_expr_base_is_cursor(&pe)
+                    if let Some(pe) = &pe
+                        && self.ptr_expr_base_is_cursor(pe)
                         && let Some(offset) = combined_cursor_offset(&pe.projs)
                         && !pe.addr_of
                         && !pe.as_ptr
@@ -1370,6 +1370,18 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         let base_str = pprust::expr_to_string(pe.base);
                         let offset_str = pprust::expr_to_string(&offset);
                         *expr = utils::expr!("({})[{}]", base_str, offset_str)
+                    } else if let Some(pe) = pe
+                        && self.ptr_expr_base_is_slice_local(&pe)
+                        && let Some(offset) = combined_slice_offset(&pe.projs)
+                        && !pe.addr_of
+                        && !pe.as_ptr
+                        && !pe.cast_int
+                    {
+                        // index directly instead of `(&mut (base)[off..])[0]`, whose explicit
+                        // borrow is not two-phase and conflicts with uses of `base` in method args
+                        let base_str = pprust::expr_to_string(pe.base);
+                        let offset_str = pprust::expr_to_string(&offset);
+                        *expr = utils::expr!("({})[({}) as usize]", base_str, offset_str)
                     } else {
                         match self.transform_ptr(e, hir_e, PtrCtx::Deref(m)) {
                             PtrKind::Raw(_) => {}
@@ -5774,6 +5786,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
     }
 
+    fn ptr_expr_base_is_slice_local(&self, pe: &PtrExpr<'_, 'tcx>) -> bool {
+        matches!(
+            pe.base_kind,
+            PtrExprBaseKind::Path(Res::Local(hir_id))
+                if matches!(self.effective_ptr_kind(hir_id), Some(PtrKind::Slice(_)))
+        )
+    }
+
     fn allocator_root<'a>(&self, expr: &'a Expr) -> Option<AllocatorRoot<'a>> {
         let ExprKind::Call(callee, args) = &unwrap_cast_and_paren(expr).kind else {
             return None;
@@ -8495,6 +8515,17 @@ fn combined_cursor_offset(projs: &[PtrExprProj<'_, '_>]) -> Option<Expr> {
         })
         .collect::<Option<Vec<_>>>()?;
     combined_offsets(&offsets, true)
+}
+
+fn combined_slice_offset(projs: &[PtrExprProj<'_, '_>]) -> Option<Expr> {
+    let offsets = projs
+        .iter()
+        .map(|proj| match proj {
+            PtrExprProj::Offset(offset) => Some(*offset),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    combined_offsets(&offsets, false)
 }
 
 #[derive(Default)]
