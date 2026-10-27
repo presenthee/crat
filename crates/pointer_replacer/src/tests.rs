@@ -14397,3 +14397,22 @@ pub unsafe fn process(mut storage: *mut u8, mut n: usize, mut out: *mut *mut u8)
         &["(v___).as_mut_ptr()"],
     );
 }
+
+#[test]
+fn test_ctor_arg_payload_mutability() {
+    run_test(
+        r#"
+pub unsafe fn encode(mut storage: *mut u8, mut n: usize) -> (Result<u64, i32>, Option<*mut u8>) {
+    let mut output___s: bool = false;
+    let mut output___v: *mut u8 = 0 as *mut u8;
+    if n == 0 as usize { return (Err(0 as i32), None); }
+    output___s = true;
+    output___v = storage.offset(0 as isize);
+    let mut x: u8 = *output___v.offset(1 as isize);
+    return (Ok(x as u64), if output___s { Some(output___v) } else { None });
+}
+"#,
+        &["Some((output___v).as_ptr().cast_mut())"],
+        &[],
+    );
+}
