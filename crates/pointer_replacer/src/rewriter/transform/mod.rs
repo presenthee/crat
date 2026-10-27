@@ -1367,7 +1367,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         && !pe.as_ptr
                         && !pe.cast_int
                     {
-                        let base_str = pprust::expr_to_string(pe.base);
+                        let mut base_str = pprust::expr_to_string(pe.base);
+                        // the cursor's overloaded index must not implicitly borrow through a raw
+                        // pointer (`dangerous_implicit_autorefs`)
+                        if self.place_derefs_raw_local(pe.hir_base) {
+                            base_str = format!("&{}({base_str})", if m { "mut " } else { "" });
+                        }
                         let offset_str = pprust::expr_to_string(&offset);
                         *expr = utils::expr!("({})[{}]", base_str, offset_str)
                     } else if let Some(pe) = pe
@@ -7934,6 +7939,21 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             _ => PathOrDeref::Other,
         }
+    }
+
+    /// Whether the place `expr` is reached through a dereference of a raw-pointer local that
+    /// stays raw after rewriting.
+    fn place_derefs_raw_local(&self, expr: &hir::Expr<'tcx>) -> bool {
+        let PathOrDeref::Deref(hir_id) = self.behind_subscripts(expr) else {
+            return false;
+        };
+        let hir::ExprKind::Unary(UnOp::Deref, ptr) = hir_unwrap_subscript(expr).kind else {
+            return false;
+        };
+        self.tcx.typeck(ptr.hir_id.owner).expr_ty(ptr).is_raw_ptr()
+            && self
+                .effective_ptr_kind(hir_id)
+                .is_none_or(|kind| matches!(kind, PtrKind::Raw(_)))
     }
 
     fn projected_base_mutability(&self, pe: &PtrExpr<'_, 'tcx>, fallback: bool) -> bool {
