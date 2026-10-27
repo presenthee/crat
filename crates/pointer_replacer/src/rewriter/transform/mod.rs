@@ -14072,7 +14072,36 @@ fn collect_raw_call_result_bindings(
             {
                 self.bindings.insert(hir_id);
             }
+            match expr.kind {
+                hir::ExprKind::Match(scrutinee, arms, _)
+                    if hir_is_call_result(self.tcx, scrutinee) =>
+                {
+                    for arm in arms {
+                        self.insert_pattern_bindings(arm.pat);
+                    }
+                }
+                hir::ExprKind::Let(let_expr) if hir_is_call_result(self.tcx, let_expr.init) => {
+                    self.insert_pattern_bindings(let_expr.pat);
+                }
+                _ => {}
+            }
             intravisit::walk_expr(self, expr);
+        }
+    }
+
+    impl RawCallResultVisitor<'_, '_> {
+        // A binding nested in a pattern over a call result (`Ok(v)`, `Some(v)`) takes the
+        // callee's payload type, which is never rewritten.
+        fn insert_pattern_bindings(&mut self, pat: &hir::Pat<'_>) {
+            if matches!(pat.kind, hir::PatKind::Binding(..)) {
+                return;
+            }
+            let typeck = self.tcx.typeck(pat.hir_id.owner);
+            pat.each_binding(|_, hir_id, _, _| {
+                if typeck.node_type(hir_id).is_raw_ptr() {
+                    self.bindings.insert(hir_id);
+                }
+            });
         }
     }
 
@@ -14099,6 +14128,41 @@ fn collect_raw_call_result_bindings(
         bindings.extend(visitor.bindings);
     }
     bindings
+}
+
+/// Whether `expr` is a call, possibly through block tails, tuple fields, and a local
+/// initialized by the call (e.g., `{ let rv = f(); rv }` or `rv.1` after `let rv = f()`).
+fn hir_is_call_result(tcx: TyCtxt<'_>, mut expr: &hir::Expr<'_>) -> bool {
+    loop {
+        match expr.kind {
+            hir::ExprKind::Block(
+                hir::Block {
+                    expr: Some(tail), ..
+                },
+                _,
+            ) => expr = tail,
+            hir::ExprKind::Field(base, _)
+                if matches!(
+                    tcx.typeck(base.hir_id.owner).expr_ty(base).kind(),
+                    ty::TyKind::Tuple(_)
+                ) =>
+            {
+                expr = base
+            }
+            hir::ExprKind::Call(..) => return true,
+            hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+                let Res::Local(hir_id) = path.res else {
+                    return false;
+                };
+                return matches!(
+                    tcx.parent_hir_node(hir_id),
+                    hir::Node::LetStmt(hir::LetStmt { init: Some(init), .. })
+                        if matches!(init.kind, hir::ExprKind::Call(..))
+                );
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn collect_raw_local_assignment_bindings(
