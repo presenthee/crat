@@ -5129,7 +5129,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
         }
 
-        if let Some(rhs_kind) = self.ptr_source_kind(&pe) {
+        // an untracked reference-typed source (e.g., a punning accessor's `&mut T`) is not a
+        // raw pointer
+        let source_kind = self.ptr_source_kind(&pe).or_else(|| {
+            if let ty::TyKind::Ref(_, _, m1) = pe.base_ty.kind()
+                && pe.base_kind == PtrExprBaseKind::Other
+                && pe.projs.is_empty()
+                && matches!(
+                    ctx,
+                    PtrCtx::Rhs(PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_))
+                )
+            {
+                Some(PtrKind::Ref(m1.is_mut()))
+            } else {
+                None
+            }
+        });
+        if let Some(rhs_kind) = source_kind {
             match (ctx, rhs_kind) {
                 (PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m), PtrKind::Raw(m1)) => {
                     if m && !m1 {
