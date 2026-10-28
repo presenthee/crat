@@ -14530,3 +14530,34 @@ pub unsafe extern "C" fn load(mut buf: *mut libc::c_uchar, mut n: libc::c_int) -
         &[],
     );
 }
+
+#[test]
+fn test_ref_returning_accessor_to_slice_arg() {
+    run_test(
+        r#"
+use ::libc;
+pub struct U {
+    pub v: i16,
+}
+impl U {
+    pub fn get_v_mut(&mut self) -> &mut i16 {
+        &mut self.v
+    }
+}
+pub struct V {
+    pub u: U,
+}
+pub unsafe extern "C" fn copy_be16(mut pdest: *mut u16, mut psource: *mut u16) {
+    let mut source: *mut libc::c_uchar = psource as *mut libc::c_uchar;
+    let mut dest: *mut libc::c_uchar = pdest as *mut libc::c_uchar;
+    *dest.offset(0 as libc::c_int as isize) = *source.offset(1 as libc::c_int as isize);
+    *dest.offset(1 as libc::c_int as isize) = *source.offset(0 as libc::c_int as isize);
+}
+pub unsafe extern "C" fn store(mut value: *mut V, mut p: *mut u16) {
+    copy_be16((*value).u.get_v_mut() as *mut i16 as *mut u16, p);
+}
+"#,
+        &["std::slice::from_mut(bytemuck::cast_mut("],
+        &["is_null"],
+    );
+}
