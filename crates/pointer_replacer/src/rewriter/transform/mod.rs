@@ -4218,6 +4218,17 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn transform_ptr(&self, ptr: &mut Expr, hir_ptr: &hir::Expr<'tcx>, ctx: PtrCtx) -> PtrKind {
+        self.transform_ptr_with_cast_ty(ptr, hir_ptr, ctx, None)
+    }
+
+    /// `cast_ty` is the type of a stripped cast around an enclosing block whose tail is `ptr`.
+    fn transform_ptr_with_cast_ty(
+        &self,
+        ptr: &mut Expr,
+        hir_ptr: &hir::Expr<'tcx>,
+        ctx: PtrCtx,
+        cast_ty: Option<ty::Ty<'tcx>>,
+    ) -> PtrKind {
         let allocator_root_expr = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr)).clone();
         // Raw-pointer casts describe the old representation. Once the target
         // is a reference-like representation, retaining an outer cast can
@@ -4268,7 +4279,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             } else {
                 hir_e
             };
-            return self.transform_ptr(inner, hir_inner, ctx);
+            // the tail's own type misses the cast stripped around the block
+            let cast_ty = if hir_expr_starts_with_cast(hir_ptr) {
+                Some(self.tcx.typeck(hir_ptr.hir_id.owner).expr_ty_adjusted(hir_ptr))
+            } else {
+                cast_ty
+            };
+            return self.transform_ptr_with_cast_ty(inner, hir_inner, ctx, cast_ty);
         }
 
         if is_null_ptr_constructor(&allocator_root_expr) {
@@ -4321,6 +4338,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             && let Some(pe) = self.ptr_expr(e, hir_e)
             && pe.projs.is_empty()
             && !hir_expr_starts_with_cast(hir_ptr)
+            && cast_ty.is_none()
             && self.ptr_source_kind(&pe) == Some(kind)
         {
             return kind;
@@ -4328,7 +4346,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
         if let PtrCtx::Rhs(kind @ (PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice)) = ctx {
             debug_assert!(!kind.is_optional());
-            self.transform_ptr(ptr, hir_ptr, PtrCtx::Rhs(kind.optional_variant()));
+            self.transform_ptr_with_cast_ty(
+                ptr,
+                hir_ptr,
+                PtrCtx::Rhs(kind.optional_variant()),
+                cast_ty,
+            );
             *ptr = match kind {
                 PtrKind::Ref(m) if opt_ref_receiver_should_borrow(ptr) => {
                     utils::expr!(
@@ -4343,10 +4366,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
 
         if let PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) = ctx {
-            let lhs_ty = self
-                .tcx
-                .typeck(hir_ptr.hir_id.owner)
-                .expr_ty_adjusted(hir_ptr);
+            let lhs_ty = cast_ty.unwrap_or_else(|| {
+                self.tcx
+                    .typeck(hir_ptr.hir_id.owner)
+                    .expr_ty_adjusted(hir_ptr)
+            });
             let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx)
                 .unwrap_or_else(|| panic!("{} {}", lhs_ty, pprust::expr_to_string(ptr)));
             if let Some(kind) = self.try_materialize_box_allocator_root(
@@ -4362,7 +4386,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
         let e = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr));
         let typeck = self.tcx.typeck(hir_ptr.hir_id.owner);
-        let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
+        let lhs_ty = cast_ty.unwrap_or_else(|| typeck.expr_ty_adjusted(hir_ptr));
         let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
         if let PtrCtx::Rhs(
             kind @ (PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)),

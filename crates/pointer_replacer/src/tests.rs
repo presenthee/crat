@@ -14478,3 +14478,30 @@ pub unsafe fn shift(s: *mut State, c: i32) {
         &[],
     );
 }
+
+#[test]
+fn test_block_tail_keeps_outer_cast_pointee() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn read() -> (*mut libc::c_void, Option<i32>) {
+    (0 as *mut libc::c_void, None)
+}
+pub unsafe extern "C" fn get() -> libc::c_int {
+    let mut size: libc::c_int = 0;
+    let mut q: *mut libc::c_int = 0 as *mut libc::c_int;
+    q = {
+        let rv___t = read();
+        if let Some(v___) = rv___t.1 { *(&mut size) = v___ };
+        rv___t.0
+    } as *mut libc::c_int;
+    if q.is_null() {
+        return 0;
+    }
+    return *q + size;
+}
+"#,
+        &["Option<&i32>", "as *const i32).as_ref()"],
+        &[],
+    );
+}
