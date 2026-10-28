@@ -5413,7 +5413,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
                 (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::SliceCursor(_)) => {
                     let base = self.projected_expr(&pe, m, false);
-                    *ptr = self.cursor_or_slice_to_slice_expr(&base, m);
+                    let slice = self.cursor_or_slice_to_slice_expr(&base, m);
+                    *ptr = self.plain_slice_from_expr(&slice, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Slice(m);
                 }
                 (PtrCtx::Deref(m), PtrKind::SliceCursor(_)) => {

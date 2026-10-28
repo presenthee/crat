@@ -14505,3 +14505,28 @@ pub unsafe extern "C" fn get() -> libc::c_int {
         &[],
     );
 }
+
+#[test]
+fn test_cursor_to_slice_arg_casts_pointee() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn copy_be32(mut pdest: *mut u32, mut psource: *mut u32) {
+    let mut source: *mut libc::c_uchar = psource as *mut libc::c_uchar;
+    let mut dest: *mut libc::c_uchar = pdest as *mut libc::c_uchar;
+    *dest.offset(0 as libc::c_int as isize) = *source.offset(3 as libc::c_int as isize);
+    *dest.offset(3 as libc::c_int as isize) = *source.offset(0 as libc::c_int as isize);
+}
+pub unsafe extern "C" fn load(mut buf: *mut libc::c_uchar, mut n: libc::c_int) -> u32 {
+    let mut p: *mut libc::c_uchar = buf;
+    let mut id: u32 = 0;
+    p = p.offset(n as isize);
+    copy_be32(&mut id, p as *mut u32);
+    p = p.offset(4 as libc::c_int as isize);
+    return id + *p as u32;
+}
+"#,
+        &["bytemuck::cast_slice::<_, u32>("],
+        &[],
+    );
+}
