@@ -1421,7 +1421,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 }
             }
-            ExprKind::Cast(_, cast_ty) => {
+            ExprKind::Cast(inner, cast_ty) => {
+                // Pointer-to-integer cast: the operand may have been promoted,
+                // so turn it back into a raw pointer first.
+                if let Some(hir_expr) = self.ast_to_hir.get_expr(expr_id, self.tcx)
+                    && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind
+                {
+                    let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                    if typeck.expr_ty(hir_expr).is_integral()
+                        && let Some((_, m)) = unwrap_ptr_from_mir_ty(typeck.expr_ty(hir_inner))
+                    {
+                        self.transform_ptr(inner, hir_inner, PtrCtx::Rhs(PtrKind::Raw(m.is_mut())));
+                    }
+                }
                 if let TyKind::BareFn(bare_fn) = &mut cast_ty.kind
                     && let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
                     && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind

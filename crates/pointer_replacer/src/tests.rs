@@ -8236,6 +8236,101 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+/// Round trip through `wrapping_add` (`PtrExprProj::IntegerOp`): the inner
+/// `p as usize` is also visited by the integer-cast arm of `visit_expr`, but
+/// the round-trip rewrite must still convert `p` only once.
+#[test]
+fn test_cast_int_ptr_wrapping_add() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut y: libc::c_int = 43 as libc::c_int;
+    let mut q: *mut libc::c_int = &mut y;
+    let mut s: *mut libc::c_int = &mut y;
+    *q = 1 as libc::c_int;
+    *s = 2 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    q = (p as usize).wrapping_add(0 as usize) as *mut libc::c_int;
+    return *q;
+}
+"#,
+        &[
+            "let mut p: &mut i32",
+            "(((p) as *mut i32) as usize).wrapping_add(",
+        ],
+        &["as *mut i32) as *mut i32"],
+    );
+}
+
+/// Pointer-to-integer cast whose result stays an integer: a `&mut` param is
+/// turned back into a raw pointer before the cast (E0606 otherwise).
+#[test]
+fn test_ptr_to_int_cast_ref_param() {
+    run_test(
+        r#"
+pub unsafe fn bump(mut p: *mut i32) -> usize {
+    *p += 1;
+    p as usize
+}
+"#,
+        &["mut p: &mut i32", "(p) as *mut i32 as usize"],
+        &[],
+    );
+}
+
+/// Same for a slice param: the address comes from `.as_mut_ptr()`.
+#[test]
+fn test_ptr_to_int_cast_slice_param() {
+    run_test(
+        r#"
+pub unsafe fn clear(mut p: *mut i32) -> usize {
+    *p.offset(1 as isize) = 0;
+    p as usize
+}
+"#,
+        &[".as_mut_ptr() as usize"],
+        &[],
+    );
+}
+
+/// Pointer-to-pointer cast before the integer cast: `p as *mut u8 as usize`.
+#[test]
+fn test_ptr_to_int_cast_chain() {
+    run_test(
+        r#"
+pub unsafe fn bump(mut p: *mut i32) -> usize {
+    *p += 1;
+    p as *mut u8 as usize
+}
+"#,
+        &["mut p: &mut i32", "as *mut u8 as usize"],
+        &[],
+    );
+}
+
+/// Signed and C integer targets.
+#[test]
+fn test_ptr_to_int_cast_isize_c_ulong() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe fn addr(mut p: *mut i32) -> libc::c_ulong {
+    *p += 1;
+    (p as isize as libc::c_ulong).wrapping_add(p as libc::c_ulong)
+}
+"#,
+        &[
+            "mut p: &mut i32",
+            "as *mut i32 as isize",
+            "as *mut i32 as libc::c_ulong",
+        ],
+        &[],
+    );
+}
+
 // ===== as_ptr + Raw context tests (lines 549-565) =====
 
 /// as_ptr + Raw, no cast: overlapping borrows from `.as_mut_ptr()` demote both
