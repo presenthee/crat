@@ -305,10 +305,7 @@ impl<'tcx> super::TransformVisitor<'tcx> {
         mutable: bool,
     ) -> Option<ArrayPtr<'e, 'tcx>> {
         if let Some(mut ptr) = self.array_of_ptr_or_offset(expr) {
-            ptr.reborrow = mutable
-                && self
-                    .memcpy_expr_ty(ptr.array)
-                    .is_some_and(|t| matches!(t.kind(), ty::TyKind::Ref(_, _, Mutability::Mut)));
+            ptr.reborrow = mutable && self.memcpy_is_immutable_mut_ref_binding(ptr.array);
             return Some(ptr);
         }
         let e = self.memcpy_pointer_expr(expr)?;
@@ -339,6 +336,25 @@ impl<'tcx> super::TransformVisitor<'tcx> {
             cursor_slice: Some(slice),
             reborrow: false,
         })
+    }
+
+    // `&mut (x)` needs `x` declared `mut`; a `&mut _` binding can be reborrowed instead.
+    fn memcpy_is_immutable_mut_ref_binding(&self, e: &Expr) -> bool {
+        let ExprKind::Path(..) = &e.kind else {
+            return false;
+        };
+        let Some((id, _)) = self.memcpy_place_path(e) else {
+            return false;
+        };
+        matches!(
+            self.tcx.hir_node(id),
+            rustc_hir::Node::Pat(rustc_hir::Pat {
+                kind: rustc_hir::PatKind::Binding(BindingMode(ByRef::No, Mutability::Not), ..),
+                ..
+            })
+        ) && self
+            .memcpy_expr_ty(e)
+            .is_some_and(|t| matches!(t.kind(), ty::TyKind::Ref(_, _, Mutability::Mut)))
     }
 
     fn memcpy_byte_copy_is_eligible(

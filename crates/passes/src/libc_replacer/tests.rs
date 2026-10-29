@@ -1001,10 +1001,15 @@ fn test_memcpy_cursor_scope_is_local() {
 
 #[test]
 fn test_memcpy_cursor_reborrows_slice_parameter() {
-    run_cursor_copy(
-        "pub unsafe fn copy(dst: &mut [u8], src: SliceCursor<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 1); dst[0] += 1; }",
-        true,
-    );
+    for (binding, reborrows) in [("dst", true), ("mut dst", false)] {
+        let res = run_cursor_copy(
+            &format!(
+                "pub unsafe fn copy({binding}: &mut [u8], src: SliceCursor<'_, u8>) {{ memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 1); dst[0] += 1; }}"
+            ),
+            true,
+        );
+        assert_eq!(res.code.contains("*(dst)"), reborrows, "{}", res.code);
+    }
 }
 
 #[test]
