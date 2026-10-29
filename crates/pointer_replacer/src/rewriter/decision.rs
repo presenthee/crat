@@ -1444,37 +1444,21 @@ pub unsafe fn foo(p: *const i32) {
     }
 
     #[test]
-    fn demote_cursor_input_preserves_shared_cursor_lifetime() {
-        let lifetime = Symbol::new(1);
-        let mut sig = SigDecision {
-            input_decs: vec![Some(PtrKind::SliceCursor(false))],
-            input_lifetimes: vec![Some(lifetime)],
-            output_dec: None,
-            output_lifetime: None,
-            signature_locked: false,
-        };
-        let before_lifetime = sig.input_lifetimes[0];
+    fn demote_cursor_input_preserves_mutability_and_lifetime() {
+        for mutable in [false, true] {
+            let lifetime = Symbol::new(1);
+            let mut sig = SigDecision {
+                input_decs: vec![Some(PtrKind::SliceCursor(mutable))],
+                input_lifetimes: vec![Some(lifetime)],
+                output_dec: None,
+                output_lifetime: None,
+                signature_locked: false,
+            };
 
-        assert!(sig.demote_cursor_input(0));
-        assert_eq!(sig.input_decs[0], Some(PtrKind::Slice(false)));
-        assert_eq!(sig.input_lifetimes[0], before_lifetime);
-    }
-
-    #[test]
-    fn demote_cursor_input_preserves_mutable_cursor_lifetime() {
-        let lifetime = Symbol::new(1);
-        let mut sig = SigDecision {
-            input_decs: vec![Some(PtrKind::SliceCursor(true))],
-            input_lifetimes: vec![Some(lifetime)],
-            output_dec: None,
-            output_lifetime: None,
-            signature_locked: false,
-        };
-        let before_lifetime = sig.input_lifetimes[0];
-
-        assert!(sig.demote_cursor_input(0));
-        assert_eq!(sig.input_decs[0], Some(PtrKind::Slice(true)));
-        assert_eq!(sig.input_lifetimes[0], before_lifetime);
+            assert!(sig.demote_cursor_input(0));
+            assert_eq!(sig.input_decs[0], Some(PtrKind::Slice(mutable)));
+            assert_eq!(sig.input_lifetimes[0], Some(lifetime));
+        }
     }
 
     #[test]

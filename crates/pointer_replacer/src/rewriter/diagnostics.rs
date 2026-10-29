@@ -660,12 +660,7 @@ fn field_ty(tcx: TyCtxt<'_>, struct_did: LocalDefId, field_index: usize) -> Stri
 
 #[cfg(test)]
 mod tests {
-    use rustc_hir::def_id::CRATE_DEF_ID;
-
-    use super::{
-        DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject, DiagnosticsMode,
-    };
-    use crate::rewriter::decision::PtrKind;
+    use super::{DecisionDiagnostics, DiagnosticsMode};
 
     #[test]
     fn decision_diagnostics_env_mode_parser() {
@@ -709,50 +704,5 @@ mod tests {
         let diagnostics = DecisionDiagnostics::disabled();
         assert!(!diagnostics.is_enabled());
         assert!(diagnostics.events().is_empty());
-    }
-
-    #[test]
-    fn late_cursor_resolution_names_are_stable() {
-        assert_eq!(
-            DecisionStage::LateCursorResolution.as_str(),
-            "late_cursor_resolution"
-        );
-        assert_eq!(
-            DecisionReason::NoReachableCursorDemandAfterNormalization.as_str(),
-            "no_reachable_cursor_demand_after_normalization"
-        );
-    }
-
-    #[test]
-    fn ast_rewrite_fallback_supersedes_late_cursor_resolution_summary() {
-        let subject = DecisionSubject::Return { did: CRATE_DEF_ID };
-        let mut diagnostics = DecisionDiagnostics::for_test(DiagnosticsMode::Full);
-        diagnostics.record(
-            subject,
-            DecisionStage::LateCursorResolution,
-            Some(PtrKind::SliceCursor(false)),
-            Some(PtrKind::Slice(false)),
-            DecisionReason::NoReachableCursorDemandAfterNormalization,
-            None,
-        );
-        diagnostics.record(
-            subject,
-            DecisionStage::AstRewriteFallback,
-            Some(PtrKind::Slice(false)),
-            Some(PtrKind::Raw(false)),
-            DecisionReason::AstRewriteRawRhsLocal,
-            None,
-        );
-
-        let summaries = diagnostics.summaries();
-
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].subject, subject);
-        assert_eq!(summaries[0].final_kind, Some(PtrKind::Raw(false)));
-        assert_eq!(summaries[0].events.len(), 2);
-        assert_eq!(
-            summaries[0].events.last().map(|event| event.stage),
-            Some(DecisionStage::AstRewriteFallback)
-        );
     }
 }

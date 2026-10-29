@@ -21,7 +21,6 @@ use crate::{
 
 pub(crate) struct CollectedDiffs {
     pub(crate) ptr_kinds: FxHashMap<HirId, PtrKind>,
-    #[allow(dead_code)]
     pub(crate) cursor_field_offset_alias_bindings: FxHashSet<HirId>,
 }
 

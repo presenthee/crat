@@ -33,6 +33,8 @@ pub(crate) enum CursorOwner {
         hir_id: HirId,
     },
     Return(LocalDefId),
+    // Reserved for field demotion; only tests construct it for now.
+    #[allow(dead_code)]
     Field(StructFieldSlot),
 }
 
@@ -395,6 +397,7 @@ pub(crate) enum CursorRetention {
     Poisoned { boundary: CursorLocalNode },
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CursorResolutionStats {
     pub(crate) candidates: usize,
@@ -409,6 +412,7 @@ pub(crate) struct CursorResolutionStats {
 pub(crate) struct CursorResolution {
     demotions: Vec<CursorDemotion>,
     retained: FxHashMap<CursorOwner, CursorRetention>,
+    #[cfg(test)]
     reached_raw_barriers: FxHashSet<CursorLocalNode>,
 }
 
@@ -430,10 +434,12 @@ impl CursorResolution {
         &self.demotions
     }
 
+    #[cfg(test)]
     pub(crate) fn retention(&self, owner: CursorOwner) -> Option<&CursorRetention> {
         self.retained.get(&owner)
     }
 
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> CursorResolutionStats {
         let mut stats = CursorResolutionStats {
             candidates: self.demotions.len() + self.retained.len(),
@@ -717,6 +723,7 @@ pub(crate) fn resolve_late_cursors(
     let mut queue = VecDeque::from(seeds);
     let mut required = FxHashMap::default();
     let mut poisoned = FxHashMap::<usize, CursorLocalNode>::default();
+    #[cfg(test)]
     let mut reached_raw_barriers = FxHashSet::default();
     while let Some(node) = queue.pop_front() {
         let members = match view
@@ -737,6 +744,7 @@ pub(crate) fn resolve_late_cursors(
                 }
             }
             CursorFlow::RawBarrier => {
+                #[cfg(test)]
                 reached_raw_barriers.insert(node);
                 continue;
             }
@@ -769,6 +777,7 @@ pub(crate) fn resolve_late_cursors(
     let mut resolution = CursorResolution {
         demotions: Vec::new(),
         retained: FxHashMap::default(),
+        #[cfg(test)]
         reached_raw_barriers,
     };
     let mut owners: Vec<_> = view.cursor_kinds.keys().copied().collect();
@@ -1248,38 +1257,6 @@ mod tests {
     }
 
     #[test]
-    fn final_view_does_not_model_c_exposure_as_a_freeze_reason() {
-        for attributes in ["#[no_mangle]", "#[export_name = \"exported_f\"]"] {
-            with_program(
-                &format!(
-                    "{attributes} pub unsafe extern \"C\" fn f(p: *mut i32) {{ let _ = p.offset(-1); }}"
-                ),
-                |input, analysis| {
-                    let did = input.functions[0];
-                    let binding = input.tcx.hir_body_owned_by(did).params[0].pat.hir_id;
-                    let view = final_view(
-                        &input,
-                        &analysis,
-                        &signatures(did, vec![Some(PtrKind::SliceCursor(true))], None),
-                        &FxHashMap::from_iter([(binding, PtrKind::SliceCursor(true))]),
-                    );
-                    let result = resolve_late_cursors(&CursorConstraints::default(), &view);
-                    assert_eq!(result.demotions().len(), 1);
-                    assert_eq!(
-                        result.demotions()[0].owner,
-                        CursorOwner::Param {
-                            did,
-                            index: 0,
-                            binding
-                        }
-                    );
-                    assert!(result.retained.is_empty());
-                },
-            );
-        }
-    }
-
-    #[test]
     fn final_view_classifies_all_final_pointer_kinds_and_unchanged_raw() {
         with_program("pub fn f(p: *const i32) {}", |input, analysis| {
             let did = input.functions[0];
@@ -1601,28 +1578,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_then_raw_stops_after_required_cursor() {
-        with_ids(|did, ids| {
-            let mut constraints = CursorConstraints::default();
-            let mut view = FinalCursorDecisionView::default();
-            let a = candidate(&mut view, did, ids[0], 1, true);
-            let b = candidate(&mut view, did, ids[2], 3, true);
-            constraints.local_seeds.insert(node(did, 1));
-            edge(&mut constraints, node(did, 1), node(did, 2));
-            edge(&mut constraints, node(did, 2), node(did, 3));
-            view.flows.insert(node(did, 2), CursorFlow::RawBarrier);
-            let resolution = resolve_late_cursors(&constraints, &view);
-            assert!(matches!(
-                resolution.retained[&a],
-                CursorRetention::Required { .. }
-            ));
-            assert_eq!(resolution.demotions[0].owner, b);
-            assert_eq!(resolution.demotions.len(), 1);
-            assert_eq!(resolution.reached_raw_barriers.len(), 1);
-        });
-    }
-
-    #[test]
     fn transparent_temporary_forwards_demand() {
         with_ids(|did, ids| {
             let mut constraints = CursorConstraints::default();
@@ -1647,31 +1602,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_and_mutable_demotions_preserve_mutability() {
-        with_ids(|did, ids| {
-            let mut view = FinalCursorDecisionView::default();
-            let a = candidate(&mut view, did, ids[0], 1, false);
-            let b = candidate(&mut view, did, ids[1], 2, true);
-            let resolution = resolve_late_cursors(&CursorConstraints::default(), &view);
-            assert_eq!(
-                resolution.demotions,
-                vec![
-                    CursorDemotion {
-                        owner: a,
-                        expected_old_kind: PtrKind::SliceCursor(false),
-                        replacement_kind: PtrKind::Slice(false)
-                    },
-                    CursorDemotion {
-                        owner: b,
-                        expected_old_kind: PtrKind::SliceCursor(true),
-                        replacement_kind: PtrKind::Slice(true)
-                    },
-                ]
-            );
-        });
-    }
-
-    #[test]
     fn owner_fanout_enqueues_every_member_successor() {
         with_ids(|did, ids| {
             let mut constraints = CursorConstraints::default();
@@ -1679,10 +1609,14 @@ mod tests {
             let a = candidate(&mut view, did, ids[0], 1, true);
             let b = candidate(&mut view, did, ids[2], 3, true);
             let c = candidate(&mut view, did, ids[3], 4, false);
+            let d = candidate(&mut view, did, ids[5], 6, true);
             view.owner_members.get_mut(&a).unwrap().push(node(did, 2));
             view.flows.insert(node(did, 2), CursorFlow::Cursor(a));
+            // Node 5 belongs to `a` only through its flow, not `owner_members`.
+            view.flows.insert(node(did, 5), CursorFlow::Cursor(a));
             constraints.local_seeds.insert(node(did, 1));
             edge(&mut constraints, node(did, 1), node(did, 3));
+            edge(&mut constraints, node(did, 5), node(did, 6));
             constraints
                 .return_edges
                 .entry(node(did, 2))
@@ -1700,6 +1634,12 @@ mod tests {
                 resolution.retention(c),
                 Some(&CursorRetention::Required {
                     witness: vec![node(did, 1), node(did, 2), node(did, 4)]
+                })
+            );
+            assert_eq!(
+                resolution.retention(d),
+                Some(&CursorRetention::Required {
+                    witness: vec![node(did, 1), node(did, 5), node(did, 6)]
                 })
             );
         });
@@ -1904,38 +1844,31 @@ mod tests {
         });
     }
 
-    fn check_poisoned_boundary(explicit: bool) {
-        with_ids(move |did, ids| {
-            let mut constraints = CursorConstraints::default();
-            let mut view = FinalCursorDecisionView::default();
-            let owner = candidate(&mut view, did, ids[1], 2, true);
-            constraints.local_seeds.insert(node(did, 1));
-            // The candidate points into the boundary; demand must not reverse
-            // this edge, but poisoning must cross it in the safety graph.
-            edge(&mut constraints, node(did, 2), node(did, 1));
-            if explicit {
-                view.flows
-                    .insert(node(did, 1), CursorFlow::UnsupportedBoundary);
+    #[test]
+    fn unsupported_or_unresolved_boundary_poisons_component() {
+        with_ids(|did, ids| {
+            for explicit in [true, false] {
+                let mut constraints = CursorConstraints::default();
+                let mut view = FinalCursorDecisionView::default();
+                let owner = candidate(&mut view, did, ids[1], 2, true);
+                constraints.local_seeds.insert(node(did, 1));
+                // The candidate points into the boundary; demand must not reverse
+                // this edge, but poisoning must cross it in the safety graph.
+                edge(&mut constraints, node(did, 2), node(did, 1));
+                if explicit {
+                    view.flows
+                        .insert(node(did, 1), CursorFlow::UnsupportedBoundary);
+                }
+                let resolution = resolve_late_cursors(&constraints, &view);
+                assert_eq!(
+                    resolution.retention(owner),
+                    Some(&CursorRetention::Poisoned {
+                        boundary: node(did, 1)
+                    })
+                );
+                assert!(resolution.demotions().is_empty());
             }
-            let resolution = resolve_late_cursors(&constraints, &view);
-            assert_eq!(
-                resolution.retention(owner),
-                Some(&CursorRetention::Poisoned {
-                    boundary: node(did, 1)
-                })
-            );
-            assert!(resolution.demotions().is_empty());
         });
-    }
-
-    #[test]
-    fn unsupported_boundary_poisons_component() {
-        check_poisoned_boundary(true);
-    }
-
-    #[test]
-    fn unresolved_boundary_poisons_component() {
-        check_poisoned_boundary(false);
     }
 
     #[test]
@@ -2025,82 +1958,6 @@ mod tests {
             }
             assert!(graph.contains_key(&isolated_field_seed.into()));
             assert!(graph.contains_key(&isolated_field_key.into()));
-        });
-    }
-
-    #[test]
-    fn resolution_stats_count_every_outcome_by_reason() {
-        with_ids(|did, ids| {
-            let mut constraints = CursorConstraints::default();
-            let mut view = FinalCursorDecisionView::default();
-            let owners: Vec<_> = (1..=6)
-                .map(|i| candidate(&mut view, did, ids[i - 1], i, i % 2 == 0))
-                .collect();
-            constraints
-                .local_seeds
-                .extend([node(did, 1), node(did, 2), node(did, 8)]);
-            edge(&mut constraints, node(did, 1), node(did, 7));
-            edge(&mut constraints, node(did, 2), node(did, 3));
-            edge(&mut constraints, node(did, 8), node(did, 4));
-            view.flows
-                .insert(node(did, 2), CursorFlow::UnsupportedBoundary);
-            view.flows.insert(node(did, 7), CursorFlow::RawBarrier);
-            view.protections.extend([
-                (
-                    ProtectionSite::Owner(owners[0]),
-                    FreezeReason::NotSignDerived,
-                ),
-                (
-                    ProtectionSite::Owner(owners[1]),
-                    FreezeReason::UnresolvedMapping,
-                ),
-                (
-                    ProtectionSite::Node(node(did, 3)),
-                    FreezeReason::SignatureLocked,
-                ),
-                (
-                    ProtectionSite::Node(node(did, 3)),
-                    FreezeReason::SignatureLocked,
-                ),
-            ]);
-            let resolution = resolve_late_cursors(&constraints, &view);
-            assert_eq!(
-                resolution.stats(),
-                CursorResolutionStats {
-                    candidates: 6,
-                    required: 1,
-                    protected: 2,
-                    poisoned: 1,
-                    demoted: 2,
-                    reached_raw_barriers: 1,
-                    protected_by_reason: vec![
-                        (FreezeReason::SignatureLocked, 2),
-                        (FreezeReason::UnresolvedMapping, 2)
-                    ],
-                }
-            );
-            assert!(matches!(
-                resolution.retention(owners[0]),
-                Some(CursorRetention::Required { .. })
-            ));
-            assert!(matches!(
-                resolution.retention(owners[1]),
-                Some(CursorRetention::Protected { .. })
-            ));
-            assert_eq!(
-                resolution.retention(owners[3]),
-                Some(&CursorRetention::Poisoned {
-                    boundary: node(did, 8)
-                })
-            );
-            assert_eq!(
-                resolution
-                    .demotions()
-                    .iter()
-                    .map(|d| d.owner)
-                    .collect::<Vec<_>>(),
-                owners[4..]
-            );
         });
     }
 
@@ -2221,12 +2078,12 @@ mod tests {
                 })
             );
             assert_eq!(
-                first
-                    .demotions()
-                    .iter()
-                    .map(|d| d.owner)
-                    .collect::<Vec<_>>(),
-                vec![owners[4], owners[5], owners[7]]
+                first.demotions(),
+                [(4, false), (5, true), (7, true)].map(|(i, mutable)| CursorDemotion {
+                    owner: owners[i],
+                    expected_old_kind: PtrKind::SliceCursor(mutable),
+                    replacement_kind: PtrKind::Slice(mutable),
+                })
             );
             assert_eq!(
                 first.stats(),
@@ -2244,33 +2101,6 @@ mod tests {
                     ],
                 }
             );
-        });
-    }
-
-    #[test]
-    fn resolver_is_idempotent_after_delta() {
-        with_ids(|did, ids| {
-            let mut constraints = CursorConstraints::default();
-            let mut view = FinalCursorDecisionView::default();
-            let demoted = candidate(&mut view, did, ids[1], 2, true);
-            let required = candidate(&mut view, did, ids[2], 3, false);
-            constraints.local_seeds.extend([node(did, 1), node(did, 3)]);
-            view.flows.insert(node(did, 1), CursorFlow::RawBarrier);
-            edge(&mut constraints, node(did, 1), node(did, 2));
-            let first = resolve_late_cursors(&constraints, &view);
-            assert_eq!(first.demotions().len(), 1);
-            assert_eq!(first.demotions()[0].owner, demoted);
-            for delta in first.demotions() {
-                view.cursor_kinds.remove(&delta.owner);
-                for &member in &view.owner_members[&delta.owner] {
-                    view.flows.insert(member, CursorFlow::UnsupportedBoundary);
-                }
-            }
-            let second = resolve_late_cursors(&constraints, &view);
-            assert!(second.demotions().is_empty());
-            assert_eq!(second.retention(required), first.retention(required));
-            assert_eq!(second.stats().candidates, 1);
-            assert_eq!(second.reached_raw_barriers, first.reached_raw_barriers);
         });
     }
 
@@ -2371,66 +2201,58 @@ mod tests {
         });
     }
 
-    fn check_directed_boundary_after_fanout(flow: Option<CursorFlow>) {
-        with_ids(move |did, ids| {
-            let mut constraints = CursorConstraints::default();
-            let mut view = FinalCursorDecisionView::default();
-            let a = candidate(&mut view, did, ids[0], 1, true);
-            let c = candidate(&mut view, did, ids[3], 4, true);
-            view.owner_members.get_mut(&a).unwrap().push(node(did, 2));
-            if let Some(flow) = flow {
-                view.flows.insert(node(did, 2), flow);
-            }
-            view.flows.insert(node(did, 3), CursorFlow::Transparent);
-            constraints.local_seeds.extend([node(did, 1), node(did, 3)]);
-            edge(&mut constraints, node(did, 3), node(did, 2));
-            edge(&mut constraints, node(did, 4), node(did, 2));
-            let resolution = resolve_late_cursors(&constraints, &view);
-            assert_eq!(
-                resolution.retention(a),
-                Some(&CursorRetention::Required {
-                    witness: vec![node(did, 1)]
-                })
-            );
-            if flow == Some(CursorFlow::RawBarrier) {
+    #[test]
+    fn directed_boundary_after_fanout_poisons_or_stops_demand() {
+        with_ids(|did, ids| {
+            for flow in [
+                None,
+                Some(CursorFlow::UnsupportedBoundary),
+                Some(CursorFlow::RawBarrier),
+            ] {
+                let mut constraints = CursorConstraints::default();
+                let mut view = FinalCursorDecisionView::default();
+                let a = candidate(&mut view, did, ids[0], 1, true);
+                let c = candidate(&mut view, did, ids[3], 4, true);
+                view.owner_members.get_mut(&a).unwrap().push(node(did, 2));
+                if let Some(flow) = flow {
+                    view.flows.insert(node(did, 2), flow);
+                }
+                view.flows.insert(node(did, 3), CursorFlow::Transparent);
+                constraints.local_seeds.extend([node(did, 1), node(did, 3)]);
+                edge(&mut constraints, node(did, 3), node(did, 2));
+                edge(&mut constraints, node(did, 4), node(did, 2));
+                let resolution = resolve_late_cursors(&constraints, &view);
                 assert_eq!(
-                    resolution.reached_raw_barriers,
-                    FxHashSet::from_iter([node(did, 2)])
-                );
-                assert_eq!(resolution.stats().reached_raw_barriers, 1);
-                assert_eq!(
-                    resolution
-                        .demotions()
-                        .iter()
-                        .map(|delta| delta.owner)
-                        .collect::<Vec<_>>(),
-                    vec![c]
-                );
-            } else {
-                assert_eq!(
-                    resolution.retention(c),
-                    Some(&CursorRetention::Poisoned {
-                        boundary: node(did, 2)
+                    resolution.retention(a),
+                    Some(&CursorRetention::Required {
+                        witness: vec![node(did, 1)]
                     })
                 );
-                assert!(resolution.demotions().is_empty());
+                if flow == Some(CursorFlow::RawBarrier) {
+                    assert_eq!(
+                        resolution.reached_raw_barriers,
+                        FxHashSet::from_iter([node(did, 2)])
+                    );
+                    assert_eq!(resolution.stats().reached_raw_barriers, 1);
+                    assert_eq!(
+                        resolution
+                            .demotions()
+                            .iter()
+                            .map(|delta| delta.owner)
+                            .collect::<Vec<_>>(),
+                        vec![c]
+                    );
+                } else {
+                    assert_eq!(
+                        resolution.retention(c),
+                        Some(&CursorRetention::Poisoned {
+                            boundary: node(did, 2)
+                        })
+                    );
+                    assert!(resolution.demotions().is_empty());
+                }
             }
         });
-    }
-
-    #[test]
-    fn directed_missing_flow_after_fanout_poisons_component() {
-        check_directed_boundary_after_fanout(None);
-    }
-
-    #[test]
-    fn directed_unsupported_flow_after_fanout_poisons_component() {
-        check_directed_boundary_after_fanout(Some(CursorFlow::UnsupportedBoundary));
-    }
-
-    #[test]
-    fn directed_raw_flow_after_fanout_records_barrier() {
-        check_directed_boundary_after_fanout(Some(CursorFlow::RawBarrier));
     }
 
     #[test]
@@ -2453,45 +2275,6 @@ mod tests {
                     })
                 );
             }
-            assert!(resolution.demotions().is_empty());
-        });
-    }
-
-    #[test]
-    fn sparse_membership_seed_propagates_after_owner_is_required() {
-        with_ids(|did, ids| {
-            let mut constraints = CursorConstraints::default();
-            let mut view = FinalCursorDecisionView::default();
-            let a = candidate(&mut view, did, ids[0], 1, true);
-            let c = candidate(&mut view, did, ids[3], 4, true);
-            view.flows.insert(node(did, 2), CursorFlow::Cursor(a));
-            constraints.local_seeds.extend([node(did, 1), node(did, 2)]);
-            edge(&mut constraints, node(did, 2), node(did, 4));
-            let resolution = resolve_late_cursors(&constraints, &view);
-            assert_eq!(
-                resolution.retention(a),
-                Some(&CursorRetention::Required {
-                    witness: vec![node(did, 1)]
-                })
-            );
-            assert_eq!(
-                resolution.retention(c),
-                Some(&CursorRetention::Required {
-                    witness: vec![node(did, 2), node(did, 4)]
-                })
-            );
-            assert!(resolution.demotions().is_empty());
-
-            // Known flow membership must also participate in owner fan-out
-            // when the omitted member has no independent seed.
-            constraints.local_seeds.remove(&node(did, 2));
-            let resolution = resolve_late_cursors(&constraints, &view);
-            assert_eq!(
-                resolution.retention(c),
-                Some(&CursorRetention::Required {
-                    witness: vec![node(did, 1), node(did, 2), node(did, 4)],
-                })
-            );
             assert!(resolution.demotions().is_empty());
         });
     }

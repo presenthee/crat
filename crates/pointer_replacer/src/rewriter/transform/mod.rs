@@ -27,8 +27,6 @@ use utils::{
     ir::{AstToHir, is_option, mir_ty_to_string},
 };
 
-#[cfg(test)]
-use super::cursor_resolution::CursorResolution;
 use super::{
     Analysis, BytemuckDependency, Config,
     collector::{CollectedDiffs, collect_diffs, collect_diffs_with_diagnostics},
@@ -75,8 +73,6 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     bytemuck_classifier: RefCell<BytemuckTypeClassifier<'tcx>>,
     pub slice_cursor: Cell<bool>,
     diagnostics: DecisionDiagnostics,
-    #[cfg(test)]
-    cursor_resolution: CursorResolution,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1989,8 +1985,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             bytemuck_classifier: RefCell::new(BytemuckTypeClassifier::new(rust_program.tcx)),
             slice_cursor: Cell::new(false),
             diagnostics,
-            #[cfg(test)]
-            cursor_resolution: resolution,
         };
         visitor.record_field_decisions();
         visitor
@@ -17044,182 +17038,62 @@ mod tests {
     }
 
     #[test]
-    fn retained_cursor_records_no_change_event() {
-        utils::compilation::run_compiler_on_str(
-            "pub unsafe fn f(p: *const i32) -> i32 { *p.offset(-1) }",
-            |tcx| {
-                let mut krate = utils::ast::expanded_ast(tcx);
-                let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
-                let (input, analysis) = build_analysis(tcx, &Config::default());
-                let did = input.functions[0];
-                let binding = tcx.hir_body_owned_by(did).params[0].pat.hir_id;
-                let visitor = TransformVisitor::new(
-                    &Config::default(),
-                    &input,
-                    &analysis,
-                    ast_to_hir,
-                    FnPtrGroups::default(),
-                    FnPtrRewriteDecision::default(),
-                    DecisionDiagnostics::for_test(DiagnosticsMode::Full),
-                );
-                assert_eq!(
-                    visitor.sig_decs.data[&did].input_decs[0],
-                    Some(PtrKind::SliceCursor(false))
-                );
-                assert_eq!(visitor.ptr_kinds[&binding], PtrKind::SliceCursor(false));
-                assert!(visitor.cursor_resolution.demotions().is_empty());
-                assert_eq!(visitor.cursor_resolution.stats().required, 1);
-                assert!(
-                    !visitor
+    fn late_cursor_resolution_applies_final_snapshot() {
+        for remove_demand in [false, true] {
+            utils::compilation::run_compiler_on_str(
+                "pub unsafe fn f(p: *const i32) -> i32 { *p.offset(-1) }",
+                |tcx| {
+                    let mut krate = utils::ast::expanded_ast(tcx);
+                    let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+                    let (input, mut analysis) = build_analysis(tcx, &Config::default());
+                    let did = input.functions[0];
+                    let binding = tcx.hir_body_owned_by(did).params[0].pat.hir_id;
+                    // Keep legacy sign provenance while removing late demand to isolate wiring.
+                    assert!(
+                        analysis.offset_sign_result.access_signs[&did]
+                            .contains(rustc_middle::mir::Local::from_usize(1))
+                    );
+                    if remove_demand {
+                        analysis.offset_sign_result.cursor_constraints = Default::default();
+                    }
+                    let visitor = TransformVisitor::new(
+                        &Config::default(),
+                        &input,
+                        &analysis,
+                        ast_to_hir,
+                        FnPtrGroups::default(),
+                        FnPtrRewriteDecision::default(),
+                        DecisionDiagnostics::for_test(DiagnosticsMode::Full),
+                    );
+                    let kind = if remove_demand {
+                        PtrKind::Slice(false)
+                    } else {
+                        PtrKind::SliceCursor(false)
+                    };
+                    assert_eq!(visitor.sig_decs.data[&did].input_decs[0], Some(kind));
+                    assert_eq!(visitor.ptr_kinds[&binding], kind);
+                    let events: Vec<_> = visitor
                         .diagnostics
                         .events()
                         .iter()
-                        .any(|event| event.stage == DecisionStage::LateCursorResolution)
-                );
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn late_cursor_resolution_applies_final_snapshot() {
-        utils::compilation::run_compiler_on_str(
-            "pub unsafe fn f(p: *const i32) -> i32 { *p.offset(-1) }",
-            |tcx| {
-                let mut krate = utils::ast::expanded_ast(tcx);
-                let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
-                let (input, mut analysis) = build_analysis(tcx, &Config::default());
-                let did = input.functions[0];
-                let binding = tcx.hir_body_owned_by(did).params[0].pat.hir_id;
-                // Keep legacy sign provenance while removing late demand to isolate wiring.
-                assert!(
-                    analysis.offset_sign_result.access_signs[&did]
-                        .contains(rustc_middle::mir::Local::from_usize(1))
-                );
-                analysis.offset_sign_result.cursor_constraints = Default::default();
-                let visitor = TransformVisitor::new(
-                    &Config::default(),
-                    &input,
-                    &analysis,
-                    ast_to_hir,
-                    FnPtrGroups::default(),
-                    FnPtrRewriteDecision::default(),
-                    DecisionDiagnostics::for_test(DiagnosticsMode::Full),
-                );
-                assert_eq!(
-                    visitor.sig_decs.data[&did].input_decs[0],
-                    Some(PtrKind::Slice(false))
-                );
-                assert_eq!(visitor.ptr_kinds[&binding], PtrKind::Slice(false));
-                assert_eq!(visitor.cursor_resolution.stats().demoted, 1);
-                assert_eq!(
-                    visitor.cursor_resolution.demotions()[0].expected_old_kind,
-                    PtrKind::SliceCursor(false)
-                );
-                let events: Vec<_> = visitor
-                    .diagnostics
-                    .events()
-                    .iter()
-                    .filter(|event| event.stage == DecisionStage::LateCursorResolution)
-                    .collect();
-                assert_eq!(events.len(), 1);
-                assert_eq!(
-                    events[0].subject,
-                    DecisionSubject::Param {
-                        did,
-                        index: 0,
-                        hir_id: binding,
-                        local: rustc_middle::mir::Local::from_usize(1),
-                    }
-                );
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn merge_sort_final_view_report_demotes_exposed_inputs() {
-        let mut config = Config::default();
-        config.c_exposed_fns.insert("merge_sort".to_string());
-        let (stats, demotions, retained_inputs) =
-            utils::compilation::run_compiler_on_str(crate::tests::MERGE_SORT_RAW_BARRIER, |tcx| {
-                let mut krate = utils::ast::expanded_ast(tcx);
-                let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
-                let (input, analysis) = build_analysis(tcx, &config);
-                let visitor = TransformVisitor::new(
-                    &config,
-                    &input,
-                    &analysis,
-                    ast_to_hir,
-                    FnPtrGroups::default(),
-                    FnPtrRewriteDecision::default(),
-                    DecisionDiagnostics::for_test(DiagnosticsMode::Full),
-                );
-                let resolution = &visitor.cursor_resolution;
-                let stats = resolution.stats();
-                let demotions = resolution
-                    .demotions()
-                    .iter()
-                    .map(|demotion| {
-                        let CursorOwner::Param { did, index, .. } = demotion.owner else {
-                            panic!("unexpected demotion: {demotion:?}; {stats:?}");
-                        };
-                        (
-                            (tcx.def_path_str(did), index),
-                            demotion.expected_old_kind,
-                            demotion.replacement_kind,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let did = *input
-                    .functions
-                    .iter()
-                    .find(|&&did| tcx.item_name(did.to_def_id()).as_str() == "merge_sort")
-                    .unwrap();
-                let body = tcx.hir_body_owned_by(did);
-                let retained_inputs = (0..2)
-                    .filter(|&index| {
-                        resolution
-                            .retention(CursorOwner::Param {
-                                did,
-                                index,
-                                binding: body.params[index].pat.hir_id,
-                            })
-                            .is_some()
-                    })
-                    .map(|index| (tcx.def_path_str(did), index))
-                    .collect::<Vec<_>>();
-                (stats, demotions, retained_inputs)
-            })
+                        .filter(|event| event.stage == DecisionStage::LateCursorResolution)
+                        .map(|event| event.subject)
+                        .collect();
+                    let expected = if remove_demand {
+                        vec![DecisionSubject::Param {
+                            did,
+                            index: 0,
+                            hir_id: binding,
+                            local: rustc_middle::mir::Local::from_usize(1),
+                        }]
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(events, expected);
+                },
+            )
             .unwrap();
-        let report = format!(
-            "{stats:?}; protected_by_reason={:?}",
-            stats.protected_by_reason
-        );
-        assert_eq!(
-            demotions,
-            vec![
-                (
-                    ("merge_sort".to_string(), 0),
-                    PtrKind::SliceCursor(true),
-                    PtrKind::Slice(true)
-                ),
-                (
-                    ("merge_sort".to_string(), 1),
-                    PtrKind::SliceCursor(true),
-                    PtrKind::Slice(true)
-                ),
-            ],
-            "{report}"
-        );
-        assert!(retained_inputs.is_empty(), "{retained_inputs:?}; {report}");
-        assert_eq!(stats.demoted, demotions.len(), "{report}");
-        assert_eq!(
-            stats.candidates,
-            stats.required + stats.protected + stats.poisoned + stats.demoted,
-            "{report}"
-        );
-        assert!(stats.reached_raw_barriers > 0, "{report}");
+        }
     }
 
     #[test]

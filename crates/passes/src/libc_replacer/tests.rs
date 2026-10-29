@@ -19,9 +19,9 @@ fn run_test(code: &str, includes: &[&str], excludes: &[&str]) -> super::Transfor
 }
 
 #[test]
-fn test_memcpy_discarded_block_results() {
-    for source_ty in ["&[u8]", "SliceCursor<'_, u8>"] {
-        for wrapper in ["{ COPY };", "{ { COPY } };", "unsafe { COPY };"] {
+fn test_libc_discarded_block_results() {
+    for wrapper in ["{ COPY };", "{ { COPY } };", "unsafe { COPY };"] {
+        for source_ty in ["&[u8]", "SliceCursor<'_, u8>"] {
             let body = wrapper.replace(
                 "COPY",
                 "let borrowed = &mut *dst; memcpy(borrowed.buf.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 4)",
@@ -34,12 +34,6 @@ fn test_memcpy_discarded_block_results() {
                 &["memcpy(borrowed"],
             );
         }
-    }
-}
-
-#[test]
-fn test_strncpy_discarded_block_results() {
-    for wrapper in ["{ COPY };", "{ { COPY } };", "unsafe { COPY };"] {
         let body = wrapper.replace("COPY", "strncpy(dst.as_mut_ptr(), src.as_ptr(), 63)");
         run_test(
             &format!(
@@ -59,7 +53,7 @@ pub unsafe fn copy(src: &[i8]) {{ let mut dst = [1i8; 64]; {body} }}
 }
 
 #[test]
-fn test_libc_block_results_are_preserved() {
+fn test_libc_used_results_are_preserved() {
     for (name, elem, pointee, source) in [
         (
             "memcpy",
@@ -76,9 +70,12 @@ fn test_libc_block_results_are_preserved() {
         ("strncpy", "i8", "i8", "src.as_ptr() as *const _"),
     ] {
         for body in [
+            "let result = COPY; result",
             "let result = { COPY }; result",
+            "COPY",
             "{ COPY }",
             "return { COPY };",
+            "identity(COPY)",
             "identity({ COPY })",
             "'out: { COPY }; other",
         ] {
@@ -95,33 +92,6 @@ pub unsafe fn copy(dst: &mut [{elem}], src: &[{elem}], value: u32, cond: bool, o
                 &[&format!("{name}(dst.as_mut_ptr()")],
                 &["copy_from_slice"],
             );
-        }
-    }
-}
-
-#[test]
-fn test_memcpy_used_results_are_preserved() {
-    for source in [
-        "src.as_ptr() as *const _",
-        "&value as *const u32 as *const _",
-    ] {
-        for body in ["let result = COPY; result", "COPY", "identity(COPY)"] {
-            let copy = format!(
-                "memcpy(dst.as_mut_ptr() as *mut _, {source}, core::mem::size_of::<u32>())"
-            );
-            let code = format!(
-                r#"
-extern "C" {{
-    fn memcpy(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void;
-}}
-fn identity(p: *mut core::ffi::c_void) -> *mut core::ffi::c_void {{ p }}
-pub unsafe fn copy(dst: &mut [u8], src: &[u8], value: u32) -> *mut core::ffi::c_void {{
-    {}
-}}
-"#,
-                body.replace("COPY", &copy)
-            );
-            run_test(&code, &["memcpy(dst.as_mut_ptr()"], &["copy_from_slice"]);
         }
     }
 }
@@ -974,14 +944,6 @@ fn test_memcpy_cursor_inline_scalars() {
 }
 
 #[test]
-fn test_memcpy_cursor_count_conflicts_with_source_reborrow() {
-    run_cursor_copy(
-        "pub unsafe fn copy(dst: &mut [u8], mut src: SliceCursorMut<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_deref_mut().offset_by(0).as_ptr() as *const _, src.pos); }",
-        false,
-    );
-}
-
-#[test]
 fn test_memcpy_cursor_fallbacks() {
     for count in ["next()", "{ n += 1; n }", "dst.len()", "dst[0] as usize"] {
         run_cursor_copy(
@@ -999,6 +961,14 @@ fn test_memcpy_cursor_fallbacks() {
         "static mut DST: [u8; 8] = [0; 8]; pub unsafe fn copy(src: SliceCursor<'_, i8>) { memcpy(DST.as_mut_ptr() as *mut _, src.as_ptr() as *const _, 1); }",
         "fn destination(x: &mut [u8]) -> &mut [u8] { x } pub unsafe fn copy(dst: &mut [u8], src: SliceCursor<'_, u8>) { memcpy(destination(dst).as_mut_ptr() as *mut _, src.as_ptr() as *const _, 1); }",
         "fn with_borrow(x: &[u8]) -> &[u8] { x } pub unsafe fn copy(mut dst: SliceCursorMut<'_, u8>, src: &[u8]) { memcpy(dst.as_mut_ptr() as *mut _, with_borrow(src).as_ptr() as *const _, 1); }",
+        // The count reads `src` while the source view reborrows it.
+        "pub unsafe fn copy(dst: &mut [u8], mut src: SliceCursorMut<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_deref_mut().offset_by(0).as_ptr() as *const _, src.pos); }",
+        "struct State { buf: [u8; 8], count: usize } struct Wrapper(State); impl core::ops::Deref for Wrapper { type Target = State; fn deref(&self) -> &State { &self.0 } } impl core::ops::DerefMut for Wrapper { fn deref_mut(&mut self) -> &mut State { &mut self.0 } } pub unsafe fn copy(dst: &mut Wrapper, src: SliceCursor<'_, u8>) { memcpy(dst.buf.as_mut_ptr() as *mut _, src.as_ptr() as *const _, dst.count); }",
+        "pub unsafe fn copy(dst: &mut [u8; 16], src: SliceCursor<'_, u8>) { memcpy(dst[2..].as_mut_ptr().offset(-1) as *mut _, src.as_ptr() as *const _, 1); }",
+        "pub unsafe fn copy(dst: &mut [u8; 16], src: SliceCursor<'_, u8>) { memcpy((dst.as_mut_ptr() as *mut u32).offset(1) as *mut u8 as *mut _, src.as_ptr() as *const _, 1); }",
+        "fn next() -> isize { 1 } pub unsafe fn copy(dst: &mut [u8; 16], src: SliceCursor<'_, u8>) { memcpy(dst.as_mut_ptr().offset(next()) as *mut _, src.as_ptr() as *const _, 1); }",
+        "pub unsafe fn copy(dst: &mut [u8], src: SliceCursor<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr().offset(-1) as *const _, 1); }",
+        "struct State { buf: [u8; 8] } pub unsafe fn copy(dst: *mut State, src: SliceCursor<'_, u8>) { memcpy((*dst).buf.as_mut_ptr().offset(1) as *mut _, src.as_ptr() as *const _, 1); }",
     ] {
         let res = run_cursor_copy(code, false);
         assert!(!res.bytemuck);
@@ -1038,27 +1008,6 @@ fn test_memcpy_cursor_reborrows_slice_parameter() {
 }
 
 #[test]
-fn test_memcpy_cursor_rejects_overloaded_deref() {
-    run_cursor_copy(
-        r#"
-struct State { buf: [u8; 8], count: usize }
-struct Wrapper(State);
-impl core::ops::Deref for Wrapper {
-    type Target = State;
-    fn deref(&self) -> &State { &self.0 }
-}
-impl core::ops::DerefMut for Wrapper {
-    fn deref_mut(&mut self) -> &mut State { &mut self.0 }
-}
-pub unsafe fn copy(dst: &mut Wrapper, src: SliceCursor<'_, u8>) {
-    memcpy(dst.buf.as_mut_ptr() as *mut _, src.as_ptr() as *const _, dst.count);
-}
-"#,
-        false,
-    );
-}
-
-#[test]
 fn test_memcpy_cursor_full_array_offsets() {
     for width in [64, 128] {
         for count in ["fill as usize", "(datalen >> 3) as usize"] {
@@ -1081,30 +1030,6 @@ pub unsafe fn copy(dst: &mut State, src: SliceCursor<'_, u8>, raw: *const u8, le
     run_cursor_copy(
         "pub unsafe fn copy(mut dst: SliceCursorMut<'_, i8>, src: &[u8; 8], offset: isize, raw: *const u8) { let _value = *raw; memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr().offset(offset) as *const _, 2); }",
         true,
-    );
-}
-
-#[test]
-fn test_memcpy_cursor_offset_fallbacks() {
-    for dst in [
-        "dst[2..].as_mut_ptr().offset(-1)",
-        "(dst.as_mut_ptr() as *mut u32).offset(1) as *mut u8",
-        "dst.as_mut_ptr().offset(next())",
-    ] {
-        run_cursor_copy(
-            &format!(
-                "fn next() -> isize {{ 1 }} pub unsafe fn copy(dst: &mut [u8; 16], src: SliceCursor<'_, u8>) {{ memcpy({dst} as *mut _, src.as_ptr() as *const _, 1); }}"
-            ),
-            false,
-        );
-    }
-    run_cursor_copy(
-        "pub unsafe fn copy(dst: &mut [u8], src: SliceCursor<'_, u8>) { memcpy(dst.as_mut_ptr() as *mut _, src.as_ptr().offset(-1) as *const _, 1); }",
-        false,
-    );
-    run_cursor_copy(
-        "struct State { buf: [u8; 8] } pub unsafe fn copy(dst: *mut State, src: SliceCursor<'_, u8>) { memcpy((*dst).buf.as_mut_ptr().offset(1) as *mut _, src.as_ptr() as *const _, 1); }",
-        false,
     );
     run_cursor_copy(
         "pub unsafe fn copy(dst: &mut [u8; 8], src: SliceCursor<'_, u8>) { memcpy(dst.as_mut_ptr().offset(1) as *mut _, src.offset_by(-1).as_ptr() as *const _, 1); }",

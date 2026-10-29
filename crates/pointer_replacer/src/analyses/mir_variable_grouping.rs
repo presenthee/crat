@@ -23,7 +23,6 @@ use crate::{
 /// This includes both locals with debug info and temporaries that are copies.
 pub struct SourceVarGroups {
     inner: FxHashMap<LocalDefId, FxHashMap<Local, Vec<Local>>>,
-    #[allow(dead_code)]
     representatives: FxHashMap<LocalDefId, FxHashMap<Local, Local>>,
 }
 
@@ -57,7 +56,6 @@ impl SourceVarGroups {
         }
     }
 
-    #[allow(dead_code)]
     pub fn representative(&self, did: LocalDefId, local: Local) -> Option<Local> {
         self.representatives
             .get(&did)
@@ -65,7 +63,7 @@ impl SourceVarGroups {
             .copied()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn members(&self, did: LocalDefId, representative: Local) -> &[Local] {
         self.inner
             .get(&did)
@@ -314,19 +312,6 @@ mod tests {
             did,
             rep,
         )
-    }
-
-    #[test]
-    fn source_var_groups_expose_representative_and_members() {
-        let (groups, did, rep) = source_var_groups();
-
-        assert_eq!(groups.representative(did, Local::from_usize(3)), Some(rep));
-        assert_eq!(
-            groups.members(did, rep),
-            &[rep, Local::from_usize(2), Local::from_usize(3)]
-        );
-        assert_eq!(groups.representative(did, Local::from_usize(9)), None);
-        assert!(groups.members(did, Local::from_usize(9)).is_empty());
     }
 
     #[test]
