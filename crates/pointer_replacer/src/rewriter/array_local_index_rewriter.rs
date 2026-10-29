@@ -618,7 +618,6 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
         origin_reporter.as_mut(),
         trace,
     );
-    refine_base_pointer_kinds_from_ast(krate, ast_to_hir, input.tcx, &mut plan);
     prune_unsupported_direct_place_uses(krate, ast_to_hir, input.tcx, &mut plan, trace);
     retain_complete_groups(&mut plan, trace);
     choose_binding_representations(
@@ -902,143 +901,6 @@ fn build_rewrite_plan<'tcx>(
     plan
 }
 
-fn refine_base_pointer_kinds_from_ast(
-    krate: &Crate,
-    ast_to_hir: &AstToHir,
-    tcx: TyCtxt<'_>,
-    plan: &mut RewritePlan,
-) {
-    if plan.by_hir_id.is_empty() {
-        return;
-    }
-    let base_hir_ids = plan
-        .by_hir_id
-        .values()
-        .map(|rewrite| rewrite.base_hir_id)
-        .chain(plan.base_by_key.values().map(|rewrite| rewrite.base_hir_id))
-        .collect();
-    let base_names = plan
-        .by_hir_id
-        .values()
-        .map(|rewrite| rewrite.base_name.clone())
-        .chain(
-            plan.base_by_key
-                .values()
-                .map(|rewrite| rewrite.base_name.clone()),
-        )
-        .collect();
-    let mut visitor = BaseBindingTypeVisitor {
-        ast_to_hir,
-        tcx,
-        base_hir_ids,
-        base_names,
-        base_is_raw_ptr_by_hir_id: FxHashMap::default(),
-        base_is_raw_ptr_by_name: FxHashMap::default(),
-    };
-    visitor.visit_crate(krate);
-    for rewrite in plan.by_hir_id.values_mut() {
-        if let Some(&base_is_raw_ptr) = visitor.base_is_raw_ptr_by_hir_id.get(&rewrite.base_hir_id)
-        {
-            rewrite.base_is_raw_ptr = base_is_raw_ptr;
-        } else if let Some(Some(base_is_raw_ptr)) =
-            visitor.base_is_raw_ptr_by_name.get(&rewrite.base_name)
-        {
-            rewrite.base_is_raw_ptr = *base_is_raw_ptr;
-        }
-    }
-    for rewrite in plan.base_by_key.values_mut() {
-        if let Some(&base_is_raw_ptr) = visitor.base_is_raw_ptr_by_hir_id.get(&rewrite.base_hir_id)
-        {
-            rewrite.base_is_raw_ptr = base_is_raw_ptr;
-        } else if let Some(Some(base_is_raw_ptr)) =
-            visitor.base_is_raw_ptr_by_name.get(&rewrite.base_name)
-        {
-            rewrite.base_is_raw_ptr = *base_is_raw_ptr;
-        }
-    }
-}
-
-struct BaseBindingTypeVisitor<'a, 'tcx> {
-    ast_to_hir: &'a AstToHir,
-    tcx: TyCtxt<'tcx>,
-    base_hir_ids: FxHashSet<HirId>,
-    base_names: FxHashSet<String>,
-    base_is_raw_ptr_by_hir_id: FxHashMap<HirId, bool>,
-    base_is_raw_ptr_by_name: FxHashMap<String, Option<bool>>,
-}
-
-impl AstVisitor<'_> for BaseBindingTypeVisitor<'_, '_> {
-    fn visit_param(&mut self, param: &Param) {
-        self.record_ast_pat_type_by_name(&param.pat, &param.ty);
-        if let Some(hir_id) = self.param_binding_hir_id(param)
-            && self.base_hir_ids.contains(&hir_id)
-        {
-            self.base_is_raw_ptr_by_hir_id
-                .insert(hir_id, ast_ty_is_raw_ptr(&param.ty));
-        }
-        visit::walk_param(self, param);
-    }
-
-    fn visit_local(&mut self, local: &rustc_ast::Local) {
-        if let Some(ty) = &local.ty {
-            self.record_ast_pat_type_by_name(&local.pat, ty);
-        }
-        if let Some(hir_id) = self.local_binding_hir_id(local)
-            && self.base_hir_ids.contains(&hir_id)
-            && let Some(ty) = &local.ty
-        {
-            self.base_is_raw_ptr_by_hir_id
-                .insert(hir_id, ast_ty_is_raw_ptr(ty));
-        }
-        visit::walk_local(self, local);
-    }
-}
-
-impl BaseBindingTypeVisitor<'_, '_> {
-    fn record_ast_pat_type_by_name(&mut self, pat: &Pat, ty: &Ty) {
-        let PatKind::Ident(_, ident, _) = &pat.kind else {
-            return;
-        };
-        let name = ident.name.to_string();
-        if !self.base_names.contains(&name) {
-            return;
-        }
-        let is_raw_ptr = ast_ty_is_raw_ptr(ty);
-        self.base_is_raw_ptr_by_name
-            .entry(name)
-            .and_modify(|existing| {
-                if *existing != Some(is_raw_ptr) {
-                    *existing = None;
-                }
-            })
-            .or_insert(Some(is_raw_ptr));
-    }
-
-    fn param_binding_hir_id(&self, param: &Param) -> Option<HirId> {
-        let hir_param = self.ast_to_hir.get_param(param.id, self.tcx)?;
-        let hir::PatKind::Binding(_, hir_id, _, _) = hir_param.pat.kind else {
-            return None;
-        };
-        Some(hir_id)
-    }
-
-    fn local_binding_hir_id(&self, local: &rustc_ast::Local) -> Option<HirId> {
-        let let_stmt = self.ast_to_hir.get_let_stmt(local.id, self.tcx)?;
-        let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind else {
-            return None;
-        };
-        Some(hir_id)
-    }
-}
-
-fn ast_ty_is_raw_ptr(ty: &Ty) -> bool {
-    match &ty.kind {
-        TyKind::Ptr(_) => true,
-        TyKind::Paren(inner) => ast_ty_is_raw_ptr(inner),
-        _ => false,
-    }
-}
-
 fn call_path_last_segment(expr: &Expr) -> Option<&str> {
     let ExprKind::Path(_, path) = &unwrap_cast_and_paren(expr).kind else {
         return None;
@@ -1273,21 +1135,27 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
         return;
     };
 
-    // Compute (base_name, proxy_hir_ids, field_base, base_steps) depending on
-    // whether the base is a direct local (offset 0) or a field path (offset > 0).
-    // base_steps is the structural projection used for resolution-based matching;
-    // it is empty for a direct-local base (matching keys on the root HirId).
-    let (base_name, proxy_hir_ids, field_base, base_steps): (
+    // Compute (base_name, proxy_hir_ids, field_base, base_steps, base_is_raw_ptr)
+    // depending on whether the base is a direct local (offset 0) or a field path
+    // (offset > 0). base_steps is the structural projection used for resolution-based
+    // matching; it is empty for a direct-local base (matching keys on the root HirId).
+    // base_is_raw_ptr is taken from the type of the named base expression itself.
+    let (base_name, proxy_hir_ids, field_base, base_steps, base_is_raw_ptr): (
         String,
         FxHashSet<HirId>,
         bool,
         Vec<BaseStep>,
+        bool,
     ) = if group.base_slot_offset == 0 {
         (
             context.tcx.hir_name(base_hir_id).to_string(),
             FxHashSet::default(),
             false,
             Vec::new(),
+            matches!(
+                context.body.local_decls[group.base_local].ty.kind(),
+                ty::TyKind::RawPtr(..)
+            ),
         )
     } else {
         let Some(base_slot_info) =
@@ -1316,7 +1184,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
             );
             return;
         };
-        let Some(field_base_steps) =
+        let Some((field_base_steps, field_ty)) =
             slot_path_to_base_steps(&base_slot_info.path, base_ty, context.tcx)
         else {
             context.trace.record(
@@ -1387,8 +1255,14 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
             None
         };
         match immutable_copy_name {
-            Some(name) => (name, proxies, false, Vec::new()),
-            None => (field_path_name, proxies, true, field_base_steps),
+            Some(name) => (name, proxies, false, Vec::new(), true),
+            None => (
+                field_path_name,
+                proxies,
+                true,
+                field_base_steps,
+                matches!(field_ty.kind(), ty::TyKind::RawPtr(..)),
+            ),
         }
     };
     let base_path = BasePath {
@@ -1396,10 +1270,6 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
         steps: base_steps,
     };
 
-    let base_is_raw_ptr = matches!(
-        context.body.local_decls[group.base_local].ty.kind(),
-        ty::TyKind::RawPtr(..)
-    );
     let base_cursor_key = base_cursor_key(base_hir_id, &base_name);
     let group_member_hir_ids = group
         .members
@@ -1692,12 +1562,13 @@ fn slot_path_to_expr_string<'tcx>(
 
 /// structural counterpart of `slot_path_to_expr_string`: resolves the same field
 /// names but emits `BaseStep`s for resolution-based matching. shares the failure
-/// conditions (unresolvable deref/field, `Element`).
+/// conditions (unresolvable deref/field, `Element`). also returns the type reached
+/// at the end of the path.
 fn slot_path_to_base_steps<'tcx>(
     path: &[SlotPathElem],
     mut ty: ty::Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
-) -> Option<Vec<BaseStep>> {
+) -> Option<(Vec<BaseStep>, ty::Ty<'tcx>)> {
     let mut steps = Vec::with_capacity(path.len());
     for elem in path {
         match elem {
@@ -1713,7 +1584,7 @@ fn slot_path_to_base_steps<'tcx>(
             SlotPathElem::Element => return None,
         }
     }
-    Some(steps)
+    Some((steps, ty))
 }
 
 fn local_is_pure_field_base_proxy(body: &rustc_middle::mir::Body<'_>, local: Local) -> bool {

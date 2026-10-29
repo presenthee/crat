@@ -11835,6 +11835,76 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: isize, mut distance:
 }
 
 #[test]
+fn test_array_local_rewriter_field_base_through_aliased_pointer_param() {
+    // the root `s` is declared through a pointer alias; the field base
+    // (*s).out is a raw pointer and must be offset directly.
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out: *mut i8,
+    pub out_end: *mut i8,
+}
+pub type State_t = *mut State;
+
+pub unsafe fn copy_from_back(mut s: State_t, mut length: isize, mut distance: isize) -> i32 {
+    let mut src: *mut i8 = (*s).out.offset(-distance);
+    let mut dst: *mut i8 = (*s).out;
+    (*s).out = (*s).out.offset(length);
+    *dst = *src;
+    dst = dst.offset(1);
+    src = src.offset(1);
+    *dst as i32 + *src as i32
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(!s.contains(".as_ptr()"), "{s}");
+    assert!(s.contains("src_idx"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_direct_base_declared_through_pointer_alias() {
+    let code = r#"
+pub type buf_t = *mut i32;
+pub unsafe fn foo(mut p: buf_t) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(!s.contains(".as_ptr()"), "{s}");
+    assert!(s.contains("q_idx"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_raw_field_of_by_value_struct_type_checks() {
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out: *mut i8,
+    pub out_end: *mut i8,
+}
+
+pub unsafe fn copy_from_back(mut s: State, mut length: isize, mut distance: isize) -> i32 {
+    let mut src: *mut i8 = s.out.offset(-distance);
+    let mut dst: *mut i8 = s.out;
+    s.out = s.out.offset(length);
+    *dst = *src;
+    dst = dst.offset(1);
+    src = src.offset(1);
+    *dst as i32 + *src as i32
+}
+"#;
+    let (s, _) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
+#[test]
 fn test_array_local_rewriter_rewrites_memory_copy_cursors_of_reassigned_pointee_field_base() {
     // (*s).out is caller-visible: the field write is KEPT live (approach D),
     // a shadow counter tracks the advance, and members are index-rewritten.
