@@ -11882,12 +11882,14 @@ pub unsafe fn foo(mut p: buf_t) -> i32 {
 }
 
 #[test]
-fn test_array_local_rewriter_raw_field_of_by_value_struct_type_checks() {
+fn test_array_local_rewriter_raw_field_of_by_value_struct_param() {
+    // the root `s` is not a pointer but the field base s.out is; `out` is not
+    // the first field, so the base is a field path rather than the root local.
     let code = r#"
 #[repr(C)]
 pub struct State {
-    pub out: *mut i8,
     pub out_end: *mut i8,
+    pub out: *mut i8,
 }
 
 pub unsafe fn copy_from_back(mut s: State, mut length: isize, mut distance: isize) -> i32 {
@@ -11900,8 +11902,37 @@ pub unsafe fn copy_from_back(mut s: State, mut length: isize, mut distance: isiz
     *dst as i32 + *src as i32
 }
 "#;
-    let (s, _) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(!s.contains(".as_ptr()"), "{s}");
+    assert!(s.contains("src_idx"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_raw_field_through_reference_param() {
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out_end: *mut i8,
+    pub out: *mut i8,
+}
+
+pub unsafe fn copy_from_back(mut s: &mut State, mut length: isize, mut distance: isize) -> i32 {
+    let mut src: *mut i8 = (*s).out.offset(-distance);
+    let mut dst: *mut i8 = (*s).out;
+    (*s).out = (*s).out.offset(length);
+    *dst = *src;
+    dst = dst.offset(1);
+    src = src.offset(1);
+    *dst as i32 + *src as i32
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(!s.contains(".as_ptr()"), "{s}");
+    assert!(s.contains("src_idx"), "{s}");
 }
 
 #[test]
