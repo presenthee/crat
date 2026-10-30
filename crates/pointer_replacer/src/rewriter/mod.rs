@@ -21,6 +21,7 @@ use crate::{
         },
         fn_ptr_groups::FnPtrGroups,
         fn_ptr_rewrite_decision::FnPtrRewriteDecision,
+        mir_variable_grouping::SourceVarGroups,
         offset_sign::sign::OffsetSignResult,
         output_params::OutputParams,
         ownership::{
@@ -36,6 +37,7 @@ use crate::{
 pub(crate) mod array_local_index_rewriter;
 pub(crate) mod array_local_trace;
 pub(crate) mod collector;
+mod cursor_resolution;
 pub(crate) mod decision;
 pub(crate) mod diagnostics;
 mod epoch_split;
@@ -73,6 +75,8 @@ pub struct Analysis {
     pub(crate) offset_sign_result: OffsetSignResult,
     pub(crate) nullity_result: analyses::nullity::NullityResult,
     pub(crate) struct_copy_result: StructCopyAnalysisResult,
+    #[allow(dead_code)]
+    pub(crate) source_var_groups: SourceVarGroups,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -150,10 +154,10 @@ pub fn initial_pointer_decisions(
     let (input, analysis, fn_ptr_groups, _) = analyze(config, options, tcx);
     let lifetime_plans = lifetimes::LifetimePlans::new(&input, &analysis);
     let signatures = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
-    let bindings = collector::collect_diffs(&input, &analysis, &signatures, &fn_ptr_groups);
+    let diffs = collector::collect_diffs(&input, &analysis, &signatures, &fn_ptr_groups);
     InitialPointerDecisions {
         signatures,
-        bindings,
+        bindings: diffs.ptr_kinds,
     }
 }
 
@@ -225,6 +229,7 @@ fn analyze<'tcx>(
         offset_sign_result,
         nullity_result,
         struct_copy_result,
+        source_var_groups,
     };
 
     let fn_ptr_groups = FnPtrGroups::build(
