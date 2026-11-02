@@ -137,3 +137,107 @@ fn supported_nonstorage_and_alias_projections() {
     assert_eq!(obs[1].slots.len(), 1);
     assert!(obs[2].slots.is_empty());
 }
+
+#[test]
+fn foreign_types_are_terminal_leaves() {
+    let obs = observations(
+        r#"
+        #![feature(extern_types)]
+        unsafe extern "C" { type Opaque; }
+        fn f(a: *mut Opaque, b: Option<&mut Opaque>, c: &mut &mut Opaque,
+             d: &mut *mut Opaque, e: *const *mut Opaque,
+             f: Option<*mut Opaque>, g: [*const Opaque; 4]) {}
+    "#,
+    );
+    use PointerKind::{OptRefMut, RawConst, RawMut, RefMut};
+    let expected = [
+        vec![("root", RawMut, false)],
+        vec![("root", OptRefMut, true)],
+        vec![("root", RefMut, false), ("root.pointee", RefMut, false)],
+        vec![("root", RefMut, false), ("root.pointee", RawMut, false)],
+        vec![("root", RawConst, false), ("root.pointee", RawMut, false)],
+        vec![("root", RawMut, true)],
+        vec![("root.element", RawConst, false)],
+    ];
+    assert_eq!(obs.len(), expected.len());
+    for (i, (o, slots)) in obs.iter().zip(expected).enumerate() {
+        assert_eq!(
+            o.slots
+                .iter()
+                .map(|s| (s.path.as_str(), s.kind, s.optional))
+                .collect::<Vec<_>>(),
+            slots
+        );
+        let promoted = i == 1 || i == 2;
+        assert_eq!(
+            o.raw_presence,
+            if promoted {
+                Presence::Absent
+            } else {
+                Presence::Present
+            }
+        );
+        assert_eq!(o.data_representation, Presence::Present);
+        assert!(o.slots_complete && o.raw_slots_complete, "{i}: {o:?}");
+        assert!(o.diagnostics.is_empty(), "{i}: {o:?}");
+        assert_eq!(
+            endpoint_state(o),
+            if promoted {
+                EndpointState::Promoted
+            } else {
+                EndpointState::Raw
+            }
+        );
+        validate_observation(o).unwrap();
+    }
+}
+
+#[test]
+fn foreign_type_aliases_preserve_observations() {
+    let obs = observations(
+        r#"
+        #![feature(extern_types)]
+        unsafe extern "C" { type Opaque; type UnrelatedName; }
+        type Raw = *mut Opaque;
+        type Borrow<'a> = Option<&'a mut Opaque>;
+        fn f(a: *mut Opaque, b: Raw, c: *mut UnrelatedName,
+             d: Option<&mut Opaque>, e: Borrow<'_>, f: Option<&mut UnrelatedName>) {}
+    "#,
+    );
+    assert_eq!(obs[0], obs[1]);
+    assert_eq!(obs[0], obs[2]);
+    assert_eq!(obs[3], obs[4]);
+    assert_eq!(obs[3], obs[5]);
+    for o in &obs {
+        assert!(o.slots_complete && o.raw_slots_complete);
+        assert!(o.diagnostics.is_empty());
+        validate_observation(o).unwrap();
+    }
+}
+
+#[test]
+fn foreign_leaf_does_not_mask_other_unknowns() {
+    let obs = observations(
+        r#"
+        #![feature(extern_types)]
+        unsafe extern "C" { type Opaque; }
+        fn f<T>(a: (&Opaque, T), b: &T, c: std::ptr::NonNull<u8>,
+                d: *mut std::ptr::NonNull<u8>) {}
+    "#,
+    );
+    for o in &obs[..3] {
+        assert_eq!(o.raw_presence, Presence::Unknown);
+    }
+    for o in &obs[..2] {
+        assert_eq!(o.data_representation, Presence::Present);
+        assert_eq!(o.slots.len(), 1);
+        assert_eq!(o.slots[0].kind, PointerKind::Ref);
+    }
+    assert_eq!(obs[3].raw_presence, Presence::Present);
+    assert_eq!(obs[3].slots[0].kind, PointerKind::RawMut);
+    for o in &obs {
+        assert!(!o.slots_complete && !o.raw_slots_complete);
+        assert!(!o.diagnostics.is_empty());
+        validate_observation(o).unwrap();
+    }
+}

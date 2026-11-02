@@ -277,3 +277,189 @@ fn partial_inventory_can_publish_valid_artifacts() {
     assert_eq!(done["availability"]["final_raw_definitions"]["status"],"unavailable");
     assert_eq!(done["availability"]["baseline_origins"]["reasons"][0]["code"],"baseline_raw_presence_unknown");
 }
+
+#[test]
+fn foreign_type_rewrite_has_complete_primary_measurement() {
+    use std::collections::BTreeSet;
+
+    use utils::pointer_inventory::{PointerKind, PointerSlot, Presence};
+
+    let f = Fixture::new();
+    fs::write(
+        f.input().join("lib.rs"),
+        r#"
+#![feature(extern_types)]
+unsafe extern "C" {
+    type Context;
+    fn acquire() -> *mut Context;
+    fn use_context(p: *mut Context);
+}
+pub unsafe fn use_optional() {
+    let mut ctx = acquire();
+    if ctx.is_null() { return; }
+    use_context(ctx);
+    use_context(ctx);
+}
+"#,
+    )
+    .unwrap();
+    for (profile, enabled) in [("base", false), ("full", true)] {
+        let origin = f.seed();
+        let root = f.0.join(profile);
+        fs::create_dir(&root).unwrap();
+        let config = root.join("config.toml");
+        let flags = [
+            "struct_arrays",
+            "struct_param_fields",
+            "epoch_split",
+            "aliasing",
+            "array_local_provenance",
+            "slice_cursor",
+        ];
+        fs::write(
+            &config,
+            format!(
+                "[pointer]\n{}",
+                flags
+                    .iter()
+                    .map(|flag| format!("enable_{flag} = {enabled}\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let mut map: DeclarationMap = serde_json::from_slice(&fs::read(&origin).unwrap()).unwrap();
+        map.profile = Some(profile.into());
+        fs::write(&origin, serde_json::to_vec(&map).unwrap()).unwrap();
+        let measurement = root.join("measurement");
+        for observed in [false, true] {
+            let output = root.join(if observed { "measured" } else { "ordinary" });
+            fs::create_dir(&output).unwrap();
+            let mut cmd = command(env!("CARGO_BIN_EXE_crat"));
+            cmd.args(["--pass", "pointer", "--config"])
+                .arg(&config)
+                .arg("-o")
+                .arg(output);
+            if observed {
+                cmd.arg("--pointer-origin-map")
+                    .arg(&origin)
+                    .arg("--pointer-measurement-dir")
+                    .arg(&measurement);
+            }
+            let out = cmd.arg(f.input()).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{profile}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let source = fs::read_to_string(root.join("measured/tiny crate/lib.rs")).unwrap();
+        assert_eq!(
+            source,
+            fs::read_to_string(root.join("ordinary/tiny crate/lib.rs")).unwrap()
+        );
+        assert!(source.contains("match"), "{source}");
+        let input: Inventory =
+            serde_json::from_slice(&fs::read(measurement.join("input-inventory.json")).unwrap())
+                .unwrap();
+        let final_inventory: Inventory =
+            serde_json::from_slice(&fs::read(measurement.join("final-inventory.json")).unwrap())
+                .unwrap();
+        let ctx = input
+            .declarations
+            .iter()
+            .find(|d| d.name.as_deref() == Some("ctx"))
+            .unwrap();
+        let before = &input.observations[&ctx.declaration_id];
+        assert_eq!(before.raw_presence, Presence::Present);
+        assert!(before.slots_complete && before.raw_slots_complete);
+        let final_ctx = final_inventory
+            .declarations
+            .iter()
+            .find(|d| d.name.as_deref() == Some("ctx"))
+            .unwrap();
+        assert_eq!(ctx.declaration_id, final_ctx.declaration_id);
+        let after = &final_inventory.observations[&ctx.declaration_id];
+        assert_eq!(after.raw_presence, Presence::Absent);
+        assert_eq!(after.data_representation, Presence::Present);
+        assert!(after.slots_complete && after.raw_slots_complete);
+        assert!(after.diagnostics.is_empty());
+        assert_eq!(
+            after.slots,
+            vec![PointerSlot {
+                path: "root".into(),
+                kind: PointerKind::OptRefMut,
+                optional: true
+            }]
+        );
+        for (inventory, filename) in [
+            (&input, "input-declaration-map.json"),
+            (&final_inventory, "final-declaration-map.json"),
+        ] {
+            assert!(inventory.structural_errors.is_empty());
+            let map: DeclarationMap =
+                serde_json::from_slice(&fs::read(measurement.join(filename)).unwrap()).unwrap();
+            let ids: BTreeSet<_> = inventory
+                .declarations
+                .iter()
+                .map(|d| &d.declaration_id)
+                .collect();
+            assert_eq!(ids, inventory.observations.keys().collect());
+            assert_eq!(ids, map.entries.iter().map(|e| &e.id).collect());
+        }
+        let done: Value =
+            serde_json::from_slice(&fs::read(measurement.join("complete.json")).unwrap()).unwrap();
+        assert_eq!(done["status"], "artifacts_complete");
+        assert_eq!(done["schema_version"], 2);
+        assert_eq!(done["counting_contract"], "raw-origins-v2");
+        for metric in [
+            "baseline_origins",
+            "origin_categories",
+            "final_raw_definitions",
+        ] {
+            assert_eq!(
+                done["availability"][metric]["status"], "complete",
+                "{profile}/{metric}"
+            );
+        }
+        let out = command(env!("CARGO_BIN_EXE_crat-finder"))
+            .arg("pointers")
+            .arg(root.join("measured/tiny crate"))
+            .arg("--pointer-declaration-map")
+            .arg(measurement.join("final-declaration-map.json"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let independent: Inventory = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(independent.structural_errors.is_empty());
+        assert_eq!(
+            independent
+                .declarations
+                .iter()
+                .map(|d| &d.declaration_id)
+                .collect::<BTreeSet<_>>(),
+            final_inventory
+                .declarations
+                .iter()
+                .map(|d| &d.declaration_id)
+                .collect()
+        );
+        let normalize = |mut inventory: Inventory| {
+            for o in inventory.observations.values_mut() {
+                o.slots.sort_by(|a, b| a.path.cmp(&b.path));
+                for d in &mut o.diagnostics {
+                    d.ty.clear();
+                    d.affects.sort();
+                }
+                o.diagnostics.sort_by(|a, b| {
+                    (&a.code, &a.path, &a.affects).cmp(&(&b.code, &b.path, &b.affects))
+                });
+            }
+            inventory.observations
+        };
+        assert_eq!(normalize(independent), normalize(final_inventory));
+    }
+}

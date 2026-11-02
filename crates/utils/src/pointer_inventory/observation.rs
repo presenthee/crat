@@ -361,6 +361,8 @@ fn walk_type<'tcx>(
         | ty::Never
         | ty::FnDef(..)
         | ty::Closure(..) => (),
+        // Foreign object layouts are outside the declaration-type projection.
+        ty::Foreign(_) => (),
         _ => unknown(diagnostics, "unresolved_type"),
     }
 }
