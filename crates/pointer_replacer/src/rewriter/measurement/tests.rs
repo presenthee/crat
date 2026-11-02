@@ -954,3 +954,51 @@ pub unsafe fn bytes(h: House) -> u8 { first(&h as *const House as *const u8) }
     assert!(emission.source.contains("bytemuck::NoUninit"), "{}", emission.source);
     assert!(inventory.declarations.iter().any(|d| d.scope == Scope::Support));
 }
+
+#[test]
+fn measurement_borrow_constant_patterns_are_not_declarations() {
+    let code = r#"
+const TAG: i32 = 1;
+pub fn classify(tag: i32) -> i32 { match tag { TAG => 7, _ => 0 } }
+"#;
+    let (_, after, _, _) = measure_borrow(code);
+    assert!(!after.declarations.iter().any(|d|
+        d.site == ::utils::pointer_inventory::Site::Local && d.name.as_deref() == Some("TAG")));
+}
+
+#[test]
+fn measurement_borrow_opaque_option_match_has_no_none_binding() {
+    let code = r#"
+#![feature(extern_types)]
+unsafe extern "C" { type Context; fn acquire() -> *mut Context; fn use_context(p: *mut Context); }
+pub unsafe fn use_optional() {
+    let mut ctx = acquire();
+    if ctx.is_null() { return; }
+    use_context(ctx);
+    use_context(ctx);
+}
+"#;
+    let (_, after, _, emission) = measure_borrow(code);
+    assert!(emission.source.contains("match &"), "{}", emission.source);
+    assert!(!after.declarations.iter().any(|d| d.name.as_deref() == Some("None")));
+}
+
+#[test]
+fn measurement_borrow_slice_wrapper_preserves_nested_closure() {
+    let code = r#"
+unsafe extern "C" { fn next(p: *mut i8) -> *mut i8; }
+pub unsafe fn tokenize() -> i8 {
+    let mut row = next(std::ptr::null_mut());
+    if row.is_null() { return 0; }
+    let mut col = next(row);
+    if col.is_null() { return 0; }
+    *col.offset(1) = 3;
+    *col
+}
+"#;
+    let (_, after, _, emission) = measure_borrow_config(code, &super::super::Config { enable_slice_cursor: false, ..Default::default() });
+    assert!(emission.source.contains("from_raw_parts"), "{}", emission.source);
+    assert!(emission.source.contains("map_or"), "{}", emission.source);
+    assert!(after.declarations.iter().any(|d|
+        d.site == ::utils::pointer_inventory::Site::Param && d.name.as_deref() == Some("_x")));
+}

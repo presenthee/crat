@@ -7050,7 +7050,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             utils::expr!(
                 "match &{}({}) {{
                     Some(x) => *x as *{} {},
-                    None => std::ptr::null{}(),
+                    std::option::Option::None => std::ptr::null{}(),
                 }}",
                 if m && m1 { "mut " } else { "" },
                 pprust::expr_to_string(e),
@@ -7364,20 +7364,25 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 target_ptr,
             )
         } else {
-            utils::expr!(
+            let mut wrapper = utils::expr!(
                 "{{
-                    let _x = {};
+                    let _x = ();
                     if _x.is_null() {{
                         &{}[]
                     }} else {{
                         std::slice::from_raw_parts{}(_x as *{} _, 1_000_000)
                     }}
                 }}",
-                pprust::expr_to_string(e),
                 if m { "mut " } else { "" },
                 if m { "_mut" } else { "" },
                 target_ptr,
-            )
+            );
+            // Keep declarations already rewritten inside the call (for example
+            // map_or closure parameters/returns) and their observer identities.
+            let ExprKind::Block(block, _) = &mut wrapper.kind else { unreachable!() };
+            let StmtKind::Let(local) = &mut block.stmts[0].kind else { unreachable!() };
+            local.kind = LocalKind::Init(P(e.clone()));
+            wrapper
         }
     }
 

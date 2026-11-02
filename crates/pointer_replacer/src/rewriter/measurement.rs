@@ -330,6 +330,7 @@ impl Measurement {
             .map(|s| s.node)
             .filter(|n| {
                 !self.nodes.contains_key(n)
+                    && !self.ignored.contains(n)
                     && !self.outputs.contains_key(n)
                     && !self.derived.values().any(|(nodes, _)| nodes.contains(n))
             })
