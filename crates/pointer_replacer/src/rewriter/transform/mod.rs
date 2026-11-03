@@ -1935,6 +1935,20 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if !raw_cast_call_inputs.is_empty() {
                 changed = true;
             }
+            let upcast_call_inputs = downgrade_upcast_call_inputs(rust_program.tcx, &mut sig_decs);
+            for &(did, idx) in &upcast_call_inputs {
+                record_signature_input_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    did,
+                    idx,
+                    DecisionReason::UpcastCallInput,
+                );
+            }
+            if !upcast_call_inputs.is_empty() {
+                changed = true;
+            }
             let cursor_input_downgrades = downgrade_cursor_inputs_from_unanchored_raw_callers(
                 rust_program.tcx,
                 &mut sig_decs,
@@ -11556,6 +11570,114 @@ fn downgrade_raw_cast_call_inputs(
             tcx,
             sig_decs,
             ptr_kinds,
+            changed: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        changed.extend(visitor.changed);
+    }
+    changed
+}
+
+/// Keeps a callee parameter raw when a call passes a pointer cast to a pointee
+/// with larger alignment (e.g. a byte buffer passed as `p as *mut u16`). The
+/// promoted parameter would need a `bytemuck` cast that panics on misaligned
+/// addresses or uneven lengths.
+fn downgrade_upcast_call_inputs(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+) -> FxHashSet<(LocalDefId, usize)> {
+    struct UpcastCallVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        changed: FxHashSet<(LocalDefId, usize)>,
+    }
+
+    impl<'tcx> UpcastCallVisitor<'_, 'tcx> {
+        fn is_upcast_arg(
+            &self,
+            typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+            arg: &'tcx hir::Expr<'tcx>,
+        ) -> bool {
+            let Some((target_ty, _)) = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(arg)) else {
+                return false;
+            };
+            let mut source = arg;
+            while let hir::ExprKind::Cast(inner, _) | hir::ExprKind::DropTemps(inner) = source.kind
+                && unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(inner)).is_some()
+            {
+                source = inner;
+            }
+            if source.hir_id == arg.hir_id {
+                return false;
+            }
+            let Some((source_ty, _)) = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(source))
+            else {
+                return false;
+            };
+            if source_ty.is_c_void(self.tcx) {
+                return false;
+            }
+            let typing_env = ty::TypingEnv::post_analysis(self.tcx, arg.hir_id.owner.to_def_id());
+            let (Ok(source_layout), Ok(target_layout)) = (
+                self.tcx.layout_of(typing_env.as_query_input(source_ty)),
+                self.tcx.layout_of(typing_env.as_query_input(target_ty)),
+            ) else {
+                return false;
+            };
+            target_layout.align.abi > source_layout.align.abi
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for UpcastCallVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            let hir::ExprKind::Call(_, args) = expr.kind else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+            let Some(callee_did) = hir_called_local_fn(self.tcx, expr) else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+            let typeck = self.tcx.typeck(expr.hir_id.owner);
+            for (idx, arg) in args.iter().enumerate() {
+                if !self.is_upcast_arg(typeck, arg) {
+                    continue;
+                }
+                let Some((_, mutability)) = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(arg))
+                else {
+                    continue;
+                };
+                let Some(sig_dec) = self.sig_decs.data.get_mut(&callee_did) else {
+                    break;
+                };
+                if sig_dec.signature_locked {
+                    break;
+                }
+                let raw = PtrKind::Raw(mutability.is_mut());
+                if sig_dec.input_decs.get(idx).copied().flatten() != Some(raw) {
+                    sig_dec.set_input_dec(idx, Some(raw));
+                    self.changed.insert((callee_did, idx));
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut changed = FxHashSet::default();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body);
+        let mut visitor = UpcastCallVisitor {
+            tcx,
+            sig_decs,
             changed: FxHashSet::default(),
         };
         visitor.visit_body(body);

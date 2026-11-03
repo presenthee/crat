@@ -150,6 +150,7 @@ pub enum DecisionReason {
     FreedBorrowOutput,
     FreedBorrowOutputTiedInput,
     RawCastCallInput,
+    UpcastCallInput,
     NoReachableCursorDemandAfterNormalization,
     CursorInputFromUnanchoredRawCaller,
     OwnedFieldFreeRequiresMutableInput,
@@ -247,6 +248,7 @@ impl DecisionReason {
             Self::FreedBorrowOutput => "freed_borrow_output",
             Self::FreedBorrowOutputTiedInput => "freed_borrow_output_tied_input",
             Self::RawCastCallInput => "raw_cast_call_input",
+            Self::UpcastCallInput => "upcast_call_input",
             Self::NoReachableCursorDemandAfterNormalization => {
                 "no_reachable_cursor_demand_after_normalization"
             }

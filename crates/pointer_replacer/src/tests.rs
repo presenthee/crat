@@ -8331,6 +8331,82 @@ pub unsafe fn addr(mut p: *mut i32) -> libc::c_ulong {
     );
 }
 
+/// A byte buffer passed as `p as *mut u16`: a `&mut [u16]` parameter would need
+/// a `bytemuck` cast that panics on misaligned addresses, so it stays raw.
+#[test]
+fn test_upcast_call_arg_keeps_param_raw() {
+    run_test(
+        r#"
+pub unsafe fn copy_be16(mut pdest: *mut u16, mut psource: *mut u16) {
+    let mut source: *mut u8 = psource as *mut u8;
+    let mut dest: *mut u8 = pdest as *mut u8;
+    *dest.offset(0) = *source.offset(1);
+    *dest.offset(1) = *source.offset(0);
+}
+pub unsafe fn put(mut buf: *mut u8, mut v: u16) {
+    let mut p: *mut u8 = buf;
+    *p = 1;
+    p = p.offset(1);
+    copy_be16(p as *mut u16, &mut v as *mut u16);
+}
+"#,
+        &["mut pdest: *mut u16"],
+        &["cast_slice_mut::<_, u16>"],
+    );
+}
+
+#[test]
+fn test_same_align_cast_call_arg_still_promoted() {
+    run_test(
+        r#"
+pub unsafe fn inc(mut p: *mut u32) {
+    *p = (*p).wrapping_add(1);
+}
+pub unsafe fn f() -> i32 {
+    let mut x: i32 = 0;
+    inc(&mut x as *mut i32 as *mut u32);
+    x
+}
+"#,
+        &["mut p: &mut u32"],
+        &[],
+    );
+}
+
+#[test]
+fn test_downcast_call_arg_still_promoted() {
+    run_test(
+        r#"
+pub unsafe fn second(mut p: *mut u8) -> u8 {
+    *p.offset(1)
+}
+pub unsafe fn g(mut buf: *mut u32) -> u8 {
+    *buf = 7;
+    second(buf as *mut u8)
+}
+"#,
+        &["mut p: &[u8]"],
+        &[],
+    );
+}
+
+#[test]
+fn test_void_ptr_cast_call_arg_not_demoted() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe fn get16(mut p: *mut u16) -> u16 {
+    *p
+}
+pub unsafe fn h(mut v: *mut libc::c_void) -> u16 {
+    get16(v as *mut u16)
+}
+"#,
+        &["mut p: &u16"],
+        &[],
+    );
+}
+
 // ===== as_ptr + Raw context tests (lines 549-565) =====
 
 /// as_ptr + Raw, no cast: overlapping borrows from `.as_mut_ptr()` demote both
@@ -14720,6 +14796,27 @@ pub unsafe extern "C" fn load(mut buf: *mut libc::c_uchar, mut n: libc::c_int) -
     copy_be32(&mut id, p as *mut u32);
     p = p.offset(4 as libc::c_int as isize);
     return id + *p as u32;
+}
+"#,
+        &["mut psource: *mut u32", "(p).as_ptr().cast_mut() as *mut _"],
+        &["bytemuck::cast_slice::<_, u32>("],
+    );
+}
+
+#[test]
+fn test_cursor_to_slice_arg_casts_pointee_same_align() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn sum2(mut psource: *mut u32) -> u32 {
+    (*psource.offset(0)).wrapping_add(*psource.offset(1))
+}
+pub unsafe extern "C" fn load(mut buf: *mut libc::c_int, mut n: libc::c_int) -> u32 {
+    let mut p: *mut libc::c_int = buf;
+    p = p.offset(n as isize);
+    let mut s: u32 = sum2(p as *mut u32);
+    p = p.offset(2 as libc::c_int as isize);
+    return s.wrapping_add(*p as u32);
 }
 "#,
         &["bytemuck::cast_slice::<_, u32>("],
