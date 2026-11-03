@@ -21,18 +21,53 @@ use rustc_middle::{
 use rustc_mir_dataflow::{
     Analysis, Forward, JoinSemiLattice, ResultsCursor, fmt::DebugWithContext,
 };
-use rustc_span::def_id::LocalDefId;
+use rustc_span::def_id::{DefId, LocalDefId};
 use utils::graph;
 
-use crate::{analyses::borrow::StructFieldSlot, utils::rustc::RustProgram};
+use crate::{
+    analyses::borrow::StructFieldSlot,
+    utils::rustc::{RustProgram, is_borrow_only_foreign_buffer_arg},
+};
 
 // Analysis output
+
+pub(crate) type CursorLocalNode = (LocalDefId, Local);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CursorFieldNode {
+    Local(LocalDefId, Local),
+    Field(StructFieldSlot),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CursorConstraints {
+    pub(crate) local_seeds: FxHashSet<CursorLocalNode>,
+    pub(crate) local_edges: FxHashMap<CursorLocalNode, FxHashSet<CursorLocalNode>>,
+    pub(crate) return_edges: FxHashMap<CursorLocalNode, FxHashSet<CursorLocalNode>>,
+    pub(crate) unmodeled_call_nodes: FxHashSet<CursorLocalNode>,
+    pub(crate) field_seeds: FxHashSet<CursorFieldNode>,
+    pub(crate) field_edges: FxHashMap<CursorFieldNode, FxHashSet<CursorFieldNode>>,
+}
 #[derive(Debug, Default)]
 pub struct OffsetSignResult {
     pub access_signs: FxHashMap<LocalDefId, DenseBitSet<Local>>,
     pub field_access_signs: FxHashSet<StructFieldSlot>,
+    pub(crate) cursor_constraints: CursorConstraints,
 }
 
+fn is_direct_borrow_only_foreign_buffer_arg(
+    tcx: TyCtxt<'_>,
+    fn_def_id: Option<DefId>,
+    arg_index: usize,
+) -> bool {
+    let Some(def_id) = fn_def_id else {
+        return false;
+    };
+    if !tcx.is_foreign_item(def_id) {
+        return false;
+    }
+    is_borrow_only_foreign_buffer_arg(tcx.item_name(def_id).as_str(), arg_index)
+}
 /// abstract-value lattice combining concrete constants with sign
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbsValue {
@@ -1076,20 +1111,17 @@ fn eval_integer_terminator_call<'tcx>(
 }
 
 // graph structure used for propagation
-type Node = (LocalDefId, Local);
-type SignGraph = FxHashMap<Node, FxHashSet<Node>>;
+type SignGraph = FxHashMap<CursorLocalNode, FxHashSet<CursorLocalNode>>;
+type FieldSignGraph = FxHashMap<CursorFieldNode, FxHashSet<CursorFieldNode>>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum FieldNode {
-    Local(LocalDefId, Local),
-    Field(StructFieldSlot),
-}
-
-type FieldSignGraph = FxHashMap<FieldNode, FxHashSet<FieldNode>>;
-
-fn add_field_edge(graph: &mut FieldSignGraph, lhs: FieldNode, rhs: FieldNode) {
+fn add_field_edge(graph: &mut FieldSignGraph, lhs: CursorFieldNode, rhs: CursorFieldNode) {
     graph.entry(lhs).or_default().insert(rhs);
     graph.entry(rhs).or_default();
+}
+
+fn add_complete_field_edge(graph: &mut FieldSignGraph, lhs: CursorFieldNode, rhs: CursorFieldNode) {
+    add_field_edge(graph, lhs, rhs);
+    graph.entry(rhs).or_default().insert(lhs);
 }
 
 // collect flow-edges of offset inforamtion in program
@@ -1099,10 +1131,17 @@ struct Collector<'mir, 'tcx, 'a> {
     def_id: LocalDefId,
     body: &'mir Body<'tcx>,
     cursor: &'a mut ResultsCursor<'mir, 'tcx, Signedness<'a, 'tcx>>,
-    graph: &'a mut FxHashMap<Node, FxHashSet<Node>>,
-    tainted: &'a mut FxHashSet<Node>,
-    field_graph: &'a mut FieldSignGraph,
-    field_tainted: &'a mut FxHashSet<FieldNode>,
+    modeled_functions: &'a FxHashSet<LocalDefId>,
+    legacy_local_edges: &'a mut SignGraph,
+    complete_local_edges: &'a mut SignGraph,
+    return_edges: &'a mut SignGraph,
+    unmodeled_call_nodes: &'a mut FxHashSet<CursorLocalNode>,
+    tainted: &'a mut FxHashSet<CursorLocalNode>,
+    legacy_field_edges: &'a mut FieldSignGraph,
+    complete_field_edges: &'a mut FieldSignGraph,
+    field_tainted: &'a mut FxHashSet<CursorFieldNode>,
+    local_seeds: &'a mut FxHashSet<CursorLocalNode>,
+    field_seeds: &'a mut FxHashSet<CursorFieldNode>,
     addr_takens: &'a FxHashSet<Local>,
 }
 
@@ -1167,18 +1206,20 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
             if let Some(dst) = copied_place_from_rvalue(rvalue) {
                 let lhs = raw_pointer_field_slot(self.body, *place)
-                    .map(FieldNode::Field)
+                    .map(CursorFieldNode::Field)
                     .or_else(|| {
                         (!contains_deref(place))
-                            .then_some(FieldNode::Local(self.def_id, place.local))
+                            .then_some(CursorFieldNode::Local(self.def_id, place.local))
                     });
                 let rhs = raw_pointer_field_slot(self.body, dst)
-                    .map(FieldNode::Field)
+                    .map(CursorFieldNode::Field)
                     .or_else(|| {
-                        (!contains_deref(&dst)).then_some(FieldNode::Local(self.def_id, dst.local))
+                        (!contains_deref(&dst))
+                            .then_some(CursorFieldNode::Local(self.def_id, dst.local))
                     });
                 if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
-                    add_field_edge(self.field_graph, lhs, rhs);
+                    add_field_edge(self.legacy_field_edges, lhs, rhs);
+                    add_complete_field_edge(self.complete_field_edges, lhs, rhs);
                 }
             }
 
@@ -1192,7 +1233,11 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
 
                         for local in self.addr_takens.iter() {
                             let lhs = (self.def_id, *local);
-                            self.graph.entry(lhs).or_default().insert(rhs);
+                            self.legacy_local_edges.entry(lhs).or_default().insert(rhs);
+                            self.complete_local_edges
+                                .entry(lhs)
+                                .or_default()
+                                .insert(rhs);
                         }
                     }
                     _ => {}
@@ -1209,7 +1254,11 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
                     // cursor requirement on q, so we add p -> q
                     let lhs = (self.def_id, place.local);
                     let rhs = (self.def_id, dst.local);
-                    self.graph.entry(lhs).or_default().insert(rhs);
+                    self.legacy_local_edges.entry(lhs).or_default().insert(rhs);
+                    self.complete_local_edges
+                        .entry(lhs)
+                        .or_default()
+                        .insert(rhs);
                 }
                 _ => {}
             }
@@ -1217,17 +1266,26 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
     }
 
     fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Location) {
-        if let TerminatorKind::Call {
+        let TerminatorKind::Call {
             func,
             args,
             destination,
             ..
         } = &terminator.kind
-            && let Operand::Constant(box constant) = func
-        {
-            let ty = constant.const_.ty();
-            let ty::TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-            let name = self.tcx.def_path(*def_id).to_string_no_crate_verbose();
+        else {
+            return;
+        };
+
+        let fn_def_id = match func {
+            Operand::Constant(box constant) => match constant.const_.ty().kind() {
+                ty::TyKind::FnDef(def_id, _) => Some(*def_id),
+                _ => None,
+            },
+            Operand::Copy(_) | Operand::Move(_) => None,
+        };
+
+        if let Some(def_id) = fn_def_id {
+            let name = self.tcx.def_path(def_id).to_string_no_crate_verbose();
             if is_pointer_offset_like_call(&name) {
                 if let Operand::Copy(place) | Operand::Move(place) = &args[0].node {
                     // check if the offset argument is negative.
@@ -1237,57 +1295,128 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
                         let state = self.cursor.get();
                         let offset_val = eval_operand(&offset_arg.node, &state.0, self.tcx);
                         if offset_val.needs_cursor() {
-                            self.tainted.insert((self.def_id, place.local));
+                            let local_node = (self.def_id, place.local);
+                            self.tainted.insert(local_node);
+                            self.local_seeds.insert(local_node);
                             let field_node = raw_pointer_field_slot(self.body, *place)
-                                .map(FieldNode::Field)
-                                .unwrap_or(FieldNode::Local(self.def_id, place.local));
-                            self.field_graph.entry(field_node).or_default();
+                                .map(CursorFieldNode::Field)
+                                .unwrap_or(CursorFieldNode::Local(self.def_id, place.local));
+                            self.legacy_field_edges.entry(field_node).or_default();
+                            self.complete_field_edges.entry(field_node).or_default();
                             self.field_tainted.insert(field_node);
+                            self.field_seeds.insert(field_node);
                         }
                     }
                 }
-            } else {
-                // collect flow edges for offset arguments
-                // if f(a) is called on f(p), add p -> a
-                for (idx, arg) in args.iter().enumerate() {
-                    if let Operand::Copy(place) | Operand::Move(place) = &arg.node
-                        && let Some(local_def_id) = def_id.as_local()
-                    {
-                        let caller_arg = (self.def_id, place.local);
-                        let param = Local::from_usize(idx + 1); // skip return
-                        let callee_param = (local_def_id, param);
-                        // if callee param needs cursor, corresponding caller arg also needs it
-                        self.graph
-                            .entry(callee_param)
-                            .or_default()
-                            .insert(caller_arg);
+                return;
+            }
+        }
 
-                        let lhs = FieldNode::Local(local_def_id, param);
-                        let rhs = raw_pointer_field_slot(self.body, *place)
-                            .map(FieldNode::Field)
-                            .unwrap_or(FieldNode::Local(self.def_id, place.local));
-                        add_field_edge(self.field_graph, lhs, rhs);
-                    }
-                }
-                // if caller destination is tainted, callee's return slot also needs cursor
-                if let Some(local_def_id) = def_id.as_local()
-                    && !contains_deref(destination)
-                    && self
-                        .graph
-                        .contains_key(&(local_def_id, Local::from_usize(0)))
-                {
-                    let ret = Local::from_usize(0);
-                    self.graph
-                        .entry((self.def_id, destination.local))
+        let modeled_function = fn_def_id
+            .and_then(|def_id| def_id.as_local())
+            .filter(|local_def_id| self.modeled_functions.contains(local_def_id));
+        if let Some(local_def_id) = modeled_function {
+            let fixed_arg_count = self
+                .tcx
+                .fn_sig(local_def_id.to_def_id())
+                .skip_binder()
+                .inputs()
+                .skip_binder()
+                .len();
+            for (idx, arg) in args.iter().take(fixed_arg_count).enumerate() {
+                if let Operand::Copy(place) | Operand::Move(place) = &arg.node {
+                    let caller_arg = (self.def_id, place.local);
+                    let param = Local::from_usize(idx + 1);
+                    let callee_param = (local_def_id, param);
+                    self.complete_local_edges
+                        .entry(callee_param)
                         .or_default()
-                        .insert((local_def_id, ret));
+                        .insert(caller_arg);
 
-                    let lhs = raw_pointer_field_slot(self.body, *destination)
-                        .map(FieldNode::Field)
-                        .unwrap_or(FieldNode::Local(self.def_id, destination.local));
-                    add_field_edge(self.field_graph, lhs, FieldNode::Local(local_def_id, ret));
+                    let lhs = CursorFieldNode::Local(local_def_id, param);
+                    let rhs = raw_pointer_field_slot(self.body, *place)
+                        .map(CursorFieldNode::Field)
+                        .unwrap_or(CursorFieldNode::Local(self.def_id, place.local));
+                    add_complete_field_edge(self.complete_field_edges, lhs, rhs);
                 }
-            };
+            }
+
+            if destination.ty(self.body, self.tcx).ty.is_raw_ptr() && !contains_deref(destination) {
+                let ret = Local::from_usize(0);
+                self.return_edges
+                    .entry((self.def_id, destination.local))
+                    .or_default()
+                    .insert((local_def_id, ret));
+
+                let lhs = raw_pointer_field_slot(self.body, *destination)
+                    .map(CursorFieldNode::Field)
+                    .unwrap_or(CursorFieldNode::Local(self.def_id, destination.local));
+                add_complete_field_edge(
+                    self.complete_field_edges,
+                    lhs,
+                    CursorFieldNode::Local(local_def_id, ret),
+                );
+            }
+        } else {
+            for (arg_index, arg) in args.iter().enumerate() {
+                if arg.node.ty(self.body, self.tcx).is_raw_ptr()
+                    && let Operand::Copy(place) | Operand::Move(place) = &arg.node
+                    && !is_direct_borrow_only_foreign_buffer_arg(self.tcx, fn_def_id, arg_index)
+                {
+                    self.unmodeled_call_nodes.insert((self.def_id, place.local));
+                }
+            }
+
+            if destination.ty(self.body, self.tcx).ty.is_raw_ptr() && !contains_deref(destination) {
+                self.unmodeled_call_nodes
+                    .insert((self.def_id, destination.local));
+            }
+        }
+
+        let Some(local_def_id) = fn_def_id.and_then(|def_id| def_id.as_local()) else {
+            return;
+        };
+
+        // collect flow edges for offset arguments
+        // if f(a) is called on f(p), add p -> a
+        for (idx, arg) in args.iter().enumerate() {
+            if let Operand::Copy(place) | Operand::Move(place) = &arg.node {
+                let caller_arg = (self.def_id, place.local);
+                let param = Local::from_usize(idx + 1); // skip return
+                let callee_param = (local_def_id, param);
+                // if callee param needs cursor, corresponding caller arg also needs it
+                self.legacy_local_edges
+                    .entry(callee_param)
+                    .or_default()
+                    .insert(caller_arg);
+
+                let lhs = CursorFieldNode::Local(local_def_id, param);
+                let rhs = raw_pointer_field_slot(self.body, *place)
+                    .map(CursorFieldNode::Field)
+                    .unwrap_or(CursorFieldNode::Local(self.def_id, place.local));
+                add_field_edge(self.legacy_field_edges, lhs, rhs);
+            }
+        }
+        // if caller destination is tainted, callee's return slot also needs cursor
+        if !contains_deref(destination)
+            && self
+                .legacy_local_edges
+                .contains_key(&(local_def_id, Local::from_usize(0)))
+        {
+            let ret = Local::from_usize(0);
+            self.legacy_local_edges
+                .entry((self.def_id, destination.local))
+                .or_default()
+                .insert((local_def_id, ret));
+
+            let lhs = raw_pointer_field_slot(self.body, *destination)
+                .map(CursorFieldNode::Field)
+                .unwrap_or(CursorFieldNode::Local(self.def_id, destination.local));
+            add_field_edge(
+                self.legacy_field_edges,
+                lhs,
+                CursorFieldNode::Local(local_def_id, ret),
+            );
         }
     }
 }
@@ -1378,19 +1507,39 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
     // phase 0: collect per-parameter caller argument summaries
     let caller_summary = collect_caller_summaries(rust_program, tcx, &branch_conditions);
 
-    let mut graph: SignGraph = FxHashMap::default();
-    let mut tainted: FxHashSet<Node> = FxHashSet::default();
-    let mut field_graph: FieldSignGraph = FxHashMap::default();
-    let mut field_tainted: FxHashSet<FieldNode> = FxHashSet::default();
-    let mut access_signs: FxHashMap<LocalDefId, DenseBitSet<Local>> = FxHashMap::default();
+    let modeled_functions = rust_program.functions.iter().copied().collect();
+
+    let mut legacy_local_edges = SignGraph::default();
+    let mut legacy_field_edges = FieldSignGraph::default();
+
+    let mut local_edges = SignGraph::default();
+    let mut return_edges = SignGraph::default();
+    let mut field_edges = FieldSignGraph::default();
+
+    let mut tainted = FxHashSet::default();
+    let mut field_tainted = FxHashSet::default();
+    let mut local_seeds = FxHashSet::default();
+    let mut field_seeds = FxHashSet::default();
+    let mut unmodeled_call_nodes = FxHashSet::default();
+    let mut access_signs = FxHashMap::default();
+
+    for &def_id in &rust_program.functions {
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+        for (local, _) in body.local_decls.iter_enumerated() {
+            local_edges.entry((def_id, local)).or_default();
+            field_edges
+                .entry(CursorFieldNode::Local(def_id, local))
+                .or_default();
+        }
+    }
 
     // phase 1: re-run analysis with caller-refined parameter initializations
     for &def_id in &rust_program.functions {
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
 
         for (local, _) in body.local_decls.iter_enumerated() {
-            graph.insert((def_id, local), FxHashSet::default());
-            field_graph.insert(FieldNode::Local(def_id, local), FxHashSet::default());
+            legacy_local_edges.insert((def_id, local), FxHashSet::default());
+            legacy_field_edges.insert(CursorFieldNode::Local(def_id, local), FxHashSet::default());
         }
 
         // extract per-function caller param vals; empty = no known callers = type-based fallback
@@ -1417,17 +1566,24 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
             def_id,
             body: &body,
             cursor: &mut cursor,
-            graph: &mut graph,
+            modeled_functions: &modeled_functions,
+            legacy_local_edges: &mut legacy_local_edges,
+            complete_local_edges: &mut local_edges,
+            return_edges: &mut return_edges,
+            unmodeled_call_nodes: &mut unmodeled_call_nodes,
             tainted: &mut tainted,
-            field_graph: &mut field_graph,
+            legacy_field_edges: &mut legacy_field_edges,
+            complete_field_edges: &mut field_edges,
             field_tainted: &mut field_tainted,
+            local_seeds: &mut local_seeds,
+            field_seeds: &mut field_seeds,
             addr_takens: &addr_takens,
         };
         collector.visit_body(&body);
     }
 
     // phase 2: propagate taint through graph using SCC-based worklist.
-    let sccs = graph::sccs_copied::<_, false>(&graph);
+    let sccs = graph::sccs_copied::<_, false>(&legacy_local_edges);
 
     // seed the worklist with every SCC that contains an initially-tainted node.
     let mut worklist: VecDeque<graph::SccId> = tainted
@@ -1463,7 +1619,7 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
         access_signs.insert(def_id, access_sign);
     }
 
-    let field_sccs = graph::sccs_copied::<_, false>(&field_graph);
+    let field_sccs = graph::sccs_copied::<_, false>(&legacy_field_edges);
     let mut field_worklist: VecDeque<graph::SccId> = field_tainted
         .iter()
         .filter_map(|node| field_sccs.indices.get(node).copied())
@@ -1480,13 +1636,21 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
         .iter()
         .flat_map(|&scc_id| &field_sccs.scc_elems[scc_id])
         .filter_map(|node| match node {
-            FieldNode::Field(field) => Some(*field),
-            FieldNode::Local(..) => None,
+            CursorFieldNode::Field(field) => Some(*field),
+            CursorFieldNode::Local(..) => None,
         })
         .collect();
 
     OffsetSignResult {
         access_signs,
         field_access_signs,
+        cursor_constraints: CursorConstraints {
+            local_seeds,
+            local_edges,
+            return_edges,
+            unmodeled_call_nodes,
+            field_seeds,
+            field_edges,
+        },
     }
 }

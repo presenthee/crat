@@ -82,6 +82,7 @@ pub enum DecisionStage {
     Downgrade,
     FieldDemotion,
     AbiPreservation,
+    LateCursorResolution,
     AstRewriteFallback,
     Final,
 }
@@ -100,6 +101,7 @@ impl DecisionStage {
             Self::Downgrade => "downgrade",
             Self::FieldDemotion => "field_demotion",
             Self::AbiPreservation => "abi_preservation",
+            Self::LateCursorResolution => "late_cursor_resolution",
             Self::AstRewriteFallback => "ast_rewrite_fallback",
             Self::Final => "final",
         }
@@ -148,6 +150,7 @@ pub enum DecisionReason {
     FreedBorrowOutput,
     FreedBorrowOutputTiedInput,
     RawCastCallInput,
+    NoReachableCursorDemandAfterNormalization,
     CursorInputFromUnanchoredRawCaller,
     OwnedFieldFreeRequiresMutableInput,
     RawCallResult,
@@ -243,6 +246,9 @@ impl DecisionReason {
             Self::FreedBorrowOutput => "freed_borrow_output",
             Self::FreedBorrowOutputTiedInput => "freed_borrow_output_tied_input",
             Self::RawCastCallInput => "raw_cast_call_input",
+            Self::NoReachableCursorDemandAfterNormalization => {
+                "no_reachable_cursor_demand_after_normalization"
+            }
             Self::CursorInputFromUnanchoredRawCaller => "cursor_input_from_unanchored_raw_caller",
             Self::OwnedFieldFreeRequiresMutableInput => "owned_field_free_requires_mutable_input",
             Self::RawCallResult => "raw_call_result",
