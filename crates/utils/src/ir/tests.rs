@@ -366,6 +366,55 @@ fn test_thir_to_mir_valued_break() {
 }
 
 #[test]
+fn test_thir_to_mir_tail_assign() {
+    compilation::run_compiler_on_str(
+        "unsafe fn f(p: *mut u8, b: *mut i32) {
+            { let i = *b as isize; *p.offset(i) = 0 }
+            { let i = *b as isize; *p.offset(i) += 1 }
+            { let i = *b as isize; *p.offset(i) = 2; }
+        }",
+        |tcx| {
+            let def_id = tcx
+                .hir_free_items()
+                .find_map(|item_id| {
+                    let item = tcx.hir_item(item_id);
+                    matches!(item.kind, hir::ItemKind::Fn { ident, .. } if ident.as_str() == "f")
+                        .then_some(item.owner_id.def_id)
+                })
+                .unwrap();
+            let mapping = map_thir_to_mir(def_id, false, tcx);
+            let (thir, _) = tcx.thir_body(def_id).unwrap();
+            let thir = thir.borrow();
+            let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+            let body = body.borrow();
+            let assigns = thir
+                .exprs
+                .iter_enumerated()
+                .filter(|(_, expr)| {
+                    matches!(
+                        expr.kind,
+                        rustc_middle::thir::ExprKind::Assign { .. }
+                            | rustc_middle::thir::ExprKind::AssignOp { .. }
+                    )
+                })
+                .map(|(expr_id, _)| expr_id)
+                .collect::<Vec<_>>();
+            assert_eq!(assigns.len(), 3);
+            for expr_id in assigns {
+                let locs = &mapping.expr_to_locs[&expr_id];
+                assert_eq!(locs.len(), 1);
+                let stmt = &body.basic_blocks[locs[0].block].statements[locs[0].statement_index];
+                let rustc_middle::mir::StatementKind::Assign(box (_, rhs)) = &stmt.kind else {
+                    panic!()
+                };
+                assert!(!rhs.ty(&body.local_decls, tcx).is_unit());
+            }
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn test_expr_match() {
     run_test(
         "

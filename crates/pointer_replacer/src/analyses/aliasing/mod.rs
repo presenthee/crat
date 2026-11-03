@@ -408,17 +408,16 @@ pub fn gate_candidates<'tcx>(
             // Exact prefix first: it copies the fewest bytes and needs no
             // knowledge of the base.
             let extent = extents.extent(candidate.callee, imm, &ctx);
-            if let Extent::Const(bytes) = extent {
-                if let Some(size) = elem_size
-                    && size > 0
-                    && bytes % size == 0
-                {
-                    copies.push(CopyPlan::ExactPrefix {
-                        arg_index: imm,
-                        elems: bytes / size,
-                    });
-                    continue;
-                }
+            if let Extent::Const(bytes) = extent
+                && let Some(size) = elem_size
+                && size > 0
+                && bytes % size == 0
+            {
+                copies.push(CopyPlan::ExactPrefix {
+                    arg_index: imm,
+                    elems: bytes / size,
+                });
+                continue;
             }
             // Whole-array fallback: the base must be a caller-local array of
             // known length, and the callee must never observe the pointer's

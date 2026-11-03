@@ -150,6 +150,7 @@ pub enum DecisionReason {
     FreedBorrowOutput,
     FreedBorrowOutputTiedInput,
     RawCastCallInput,
+    UpcastCallInput,
     NoReachableCursorDemandAfterNormalization,
     CursorInputFromUnanchoredRawCaller,
     OwnedFieldFreeRequiresMutableInput,
@@ -185,6 +186,7 @@ pub enum DecisionReason {
     BorrowFieldShapeUnnamedFields,
     BorrowFieldShapePreserveCopy,
     BorrowFieldShapeByValueOutput,
+    BorrowFieldShapeUnionStorage,
     BorrowFieldConflictDemotion,
     NonRawFieldType,
     NonScalarPointee,
@@ -246,6 +248,7 @@ impl DecisionReason {
             Self::FreedBorrowOutput => "freed_borrow_output",
             Self::FreedBorrowOutputTiedInput => "freed_borrow_output_tied_input",
             Self::RawCastCallInput => "raw_cast_call_input",
+            Self::UpcastCallInput => "upcast_call_input",
             Self::NoReachableCursorDemandAfterNormalization => {
                 "no_reachable_cursor_demand_after_normalization"
             }
@@ -287,6 +290,7 @@ impl DecisionReason {
             Self::BorrowFieldShapeUnnamedFields => "borrow_field_shape_unnamed_fields",
             Self::BorrowFieldShapePreserveCopy => "borrow_field_shape_preserve_copy",
             Self::BorrowFieldShapeByValueOutput => "borrow_field_shape_by_value_output",
+            Self::BorrowFieldShapeUnionStorage => "borrow_field_shape_union_storage",
             Self::BorrowFieldConflictDemotion => "borrow_field_conflict_demotion",
             Self::NonRawFieldType => "non_raw_field_type",
             Self::NonScalarPointee => "non_scalar_pointee",
@@ -464,7 +468,8 @@ impl DecisionDiagnostics {
                     DecisionReason::BorrowFieldConflictDemotion
                     | DecisionReason::BorrowFieldShapeUnnamedFields
                     | DecisionReason::BorrowFieldShapePreserveCopy
-                    | DecisionReason::BorrowFieldShapeByValueOutput => borrow_demoted += 1,
+                    | DecisionReason::BorrowFieldShapeByValueOutput
+                    | DecisionReason::BorrowFieldShapeUnionStorage => borrow_demoted += 1,
                     DecisionReason::OwnershipFieldSelectedOptBox => ownership_selected += 1,
                     DecisionReason::NonRawFieldType
                     | DecisionReason::NonScalarPointee
