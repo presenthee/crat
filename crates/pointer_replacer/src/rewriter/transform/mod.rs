@@ -18288,6 +18288,7 @@ mod tests {
                         FnPtrGroups::default(),
                         FnPtrRewriteDecision::default(),
                         DecisionDiagnostics::for_test(DiagnosticsMode::Full),
+                        None,
                     );
                     let kind = if remove_demand {
                         PtrKind::Slice(false)

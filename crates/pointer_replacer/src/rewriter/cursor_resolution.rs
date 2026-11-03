@@ -862,6 +862,7 @@ mod tests {
             offset_sign_result.access_signs =
                 source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
             let analysis = Analysis {
+                enable_slice_cursor: true,
                 borrow_promotion_result,
                 borrow_lifetime_flows,
                 promoted_mut_ref_result,
