@@ -160,10 +160,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let Some(struct_did) = self.local_struct_did_for_ast_ty(&impl_item.self_ty) else {
                     return;
                 };
-                if !self.struct_has_field_rewrite_candidate(struct_did) {
+                let lifetimes = self.ordered_struct_lifetimes(struct_did);
+                if !self.struct_has_field_rewrite_candidate(struct_did) && lifetimes.is_empty() {
                     return;
                 }
-                let lifetimes = self.ordered_struct_lifetimes(struct_did);
                 if !lifetimes.is_empty() {
                     super::lifetimes::ensure_lifetime_params(&mut impl_item.generics, &lifetimes);
                     self.add_struct_lifetime_args_to_ty_with_lifetimes(
@@ -181,7 +181,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     self.rewrite_struct_definition(struct_did, generics, fields);
                     for (field_idx, field) in fields.iter_mut().enumerate() {
                         let fi = FieldIdx::from_usize(field_idx);
-                        if let TyKind::BareFn(bare_fn) = &mut field.ty.kind
+                        if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut field.ty)
                             && let Some(decs) =
                                 self.fn_ptr_rewrite.field_decisions.get(&(struct_did, fi))
                         {
@@ -191,6 +191,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                         }
                     }
+                    let lifetimes = self.ordered_struct_lifetimes(struct_did);
+                    self.impl_self_lifetimes.push((struct_did, lifetimes));
+                    mut_visit::walk_item(self, item);
+                    self.impl_self_lifetimes.pop();
+                    return;
                 }
             }
             ItemKind::Fn(box fn_item) => {
@@ -201,11 +206,66 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     .mir_drops_elaborated_and_const_checked(def_id)
                     .borrow();
                 let sig_dec = self.sig_decs.data.get(&def_id).unwrap();
+                let mut input_lifetimes = sig_dec.input_lifetimes.clone();
+                let related_params = self.assignment_related_param_indices(def_id);
+                let related_lifetime = sig_dec
+                    .output_lifetime
+                    .unwrap_or_else(|| Symbol::intern("crat"));
+                if !related_params.is_empty() {
+                    for &param_index in &related_params {
+                        let pointee_has_promoted_lifetimes = mir_body
+                            .local_decls
+                            .get(rustc_middle::mir::Local::from_u32((param_index + 1) as u32))
+                            .and_then(|decl| unwrap_ptr_from_mir_ty(decl.ty))
+                            .is_some_and(|(inner_ty, _)| {
+                                !self.lifetimes_for_ty(inner_ty).is_empty()
+                            });
+                        if !pointee_has_promoted_lifetimes
+                            && let Some(input_lifetime) = input_lifetimes.get_mut(param_index)
+                        {
+                            *input_lifetime = Some(related_lifetime);
+                        }
+                    }
+                }
+                let mut input_inner_lifetimes = vec![None; sig_dec.input_decs.len()];
+                let mut used_inner_lifetimes = FxHashSet::default();
+                for (param_index, local_decl) in mir_body
+                    .local_decls
+                    .iter()
+                    .skip(1)
+                    .take(sig_dec.input_decs.len())
+                    .enumerate()
+                {
+                    let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(local_decl.ty) else {
+                        continue;
+                    };
+                    let Some(default_lifetime) = self.lifetimes_for_ty(inner_ty).first().copied()
+                    else {
+                        continue;
+                    };
+                    let lifetime = if related_params.contains(&param_index) {
+                        related_lifetime
+                    } else if used_inner_lifetimes.insert(default_lifetime) {
+                        default_lifetime
+                    } else {
+                        Symbol::intern(&format!("crat_inner_{param_index}"))
+                    };
+                    used_inner_lifetimes.insert(lifetime);
+                    input_inner_lifetimes[param_index] = Some(lifetime);
+                }
+                let return_inner_ty = mir_body
+                    .local_decls
+                    .get(rustc_middle::mir::Local::from_u32(0))
+                    .and_then(|decl| unwrap_ptr_from_mir_ty(decl.ty).map(|(inner, _)| inner));
+                let output_inner_lifetime = return_inner_ty.and_then(|inner_ty| {
+                    sig_dec
+                        .output_lifetime
+                        .or_else(|| self.lifetimes_for_ty(inner_ty).first().copied())
+                });
 
                 if !sig_dec.signature_locked {
                     let mut planned_lifetimes = Vec::new();
-                    for lifetime in sig_dec
-                        .input_lifetimes
+                    for lifetime in input_lifetimes
                         .iter()
                         .copied()
                         .flatten()
@@ -215,20 +275,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             planned_lifetimes.push(lifetime);
                         }
                     }
-                    for (local_decl, input_dec) in
-                        mir_body.local_decls.iter().skip(1).zip(&sig_dec.input_decs)
+                    for lifetime in input_inner_lifetimes
+                        .iter()
+                        .copied()
+                        .flatten()
+                        .chain(output_inner_lifetime)
                     {
-                        if input_dec.is_some()
-                            && let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(local_decl.ty)
-                        {
-                            self.extend_lifetimes_for_ty(&mut planned_lifetimes, inner_ty);
-                        }
-                    }
-                    if sig_dec.output_dec.is_some() {
-                        let return_decl =
-                            &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
-                        if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty) {
-                            self.extend_lifetimes_for_ty(&mut planned_lifetimes, inner_ty);
+                        if !planned_lifetimes.contains(&lifetime) {
+                            planned_lifetimes.push(lifetime);
                         }
                     }
                     super::lifetimes::ensure_lifetime_params(
@@ -246,8 +300,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     .enumerate()
                 {
                     self.mark_param_mut_if_needed(param);
-                    let input_lifetime =
-                        sig_dec.input_lifetimes.get(param_index).copied().flatten();
+                    let input_lifetime = input_lifetimes.get(param_index).copied().flatten();
+                    let input_inner_lifetime =
+                        input_inner_lifetimes.get(param_index).copied().flatten();
                     if matches!(local_decl.ty.kind(), ty::TyKind::Ref(..))
                         && input_lifetime.is_none()
                     {
@@ -262,7 +317,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = self.mk_ref_ty_with_lifetime(inner_ty, *m, input_lifetime);
+                            *param.ty = self.mk_ref_ty_with_lifetime(
+                                inner_ty,
+                                *m,
+                                input_lifetime,
+                                input_inner_lifetime,
+                            );
                         }
                         Some(PtrKind::OptRef(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -272,8 +332,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty =
-                                self.mk_opt_ref_ty_with_lifetime(inner_ty, *m, input_lifetime);
+                            *param.ty = self.mk_opt_ref_ty_with_lifetime(
+                                inner_ty,
+                                *m,
+                                input_lifetime,
+                                input_inner_lifetime,
+                            );
                         }
                         Some(PtrKind::Box) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -303,8 +367,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty =
-                                self.mk_slice_ty_with_lifetime(inner_ty, *m, input_lifetime);
+                            *param.ty = self.mk_slice_ty_with_lifetime(
+                                inner_ty,
+                                *m,
+                                input_lifetime,
+                                input_inner_lifetime,
+                            );
                         }
                         Some(PtrKind::Raw(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -314,7 +382,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = self.mk_raw_ptr_ty(inner_ty, *m);
+                            *param.ty = self.mk_raw_ptr_ty_with_lifetime(
+                                inner_ty,
+                                *m,
+                                input_inner_lifetime,
+                            );
                         }
                         Some(PtrKind::SliceCursor(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -324,8 +396,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty =
-                                self.mk_cursor_ty_with_lifetime(inner_ty, *m, input_lifetime);
+                            *param.ty = self.mk_cursor_ty_with_lifetime(
+                                inner_ty,
+                                *m,
+                                input_lifetime,
+                                input_inner_lifetime,
+                            );
                             self.slice_cursor.set(true);
                         }
                         Some(PtrKind::BoxedSlice) => {
@@ -349,7 +425,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             *param.ty = self.mk_opt_boxed_slice_ty(inner_ty);
                         }
                         None => {
-                            if let TyKind::BareFn(bare_fn) = &mut param.ty.kind
+                            if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut param.ty)
                                 && let Some(hir_id) =
                                     self.ast_to_hir.local_map.get(&param.pat.id).copied()
                                 && let Some(decs) =
@@ -409,21 +485,39 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         && let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output
                     {
                         *ret_ty = P(match output_dec {
-                            PtrKind::Ref(m) => {
-                                self.mk_ref_ty_with_lifetime(inner_ty, m, output_lifetime)
-                            }
-                            PtrKind::OptRef(m) => {
-                                self.mk_opt_ref_ty_with_lifetime(inner_ty, m, output_lifetime)
-                            }
+                            PtrKind::Ref(m) => self.mk_ref_ty_with_lifetime(
+                                inner_ty,
+                                m,
+                                output_lifetime,
+                                output_inner_lifetime,
+                            ),
+                            PtrKind::OptRef(m) => self.mk_opt_ref_ty_with_lifetime(
+                                inner_ty,
+                                m,
+                                output_lifetime,
+                                output_inner_lifetime,
+                            ),
                             PtrKind::Box => self.mk_box_ty(inner_ty),
                             PtrKind::OptBox => self.mk_opt_box_ty(inner_ty),
-                            PtrKind::Raw(m) => self.mk_raw_ptr_ty(inner_ty, m),
+                            PtrKind::Raw(m) => {
+                                self.mk_raw_ptr_ty_with_lifetime(inner_ty, m, output_inner_lifetime)
+                            }
                             PtrKind::BoxedSlice => self.mk_boxed_slice_ty(inner_ty),
                             PtrKind::OptBoxedSlice => self.mk_opt_boxed_slice_ty(inner_ty),
-                            PtrKind::Slice(m) => self.mk_slice_ty(inner_ty, m),
+                            PtrKind::Slice(m) => self.mk_slice_ty_with_lifetime(
+                                inner_ty,
+                                m,
+                                output_lifetime,
+                                output_inner_lifetime,
+                            ),
                             PtrKind::SliceCursor(m) => {
                                 self.slice_cursor.set(true);
-                                self.mk_cursor_ty(inner_ty, m)
+                                self.mk_cursor_ty_with_lifetime(
+                                    inner_ty,
+                                    m,
+                                    output_lifetime,
+                                    output_inner_lifetime,
+                                )
                             }
                         });
                     }
@@ -459,7 +553,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 };
                 for (field_idx, field) in fields.iter_mut().enumerate() {
                     let fi = FieldIdx::from_usize(field_idx);
-                    if let TyKind::BareFn(bare_fn) = &mut field.ty.kind
+                    if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut field.ty)
                         && let Some(decs) = self
                             .fn_ptr_rewrite
                             .field_decisions
@@ -484,13 +578,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.slice_cursor.set(true);
                     }
                 }
+                let lifetimes = self.lifetimes_for_ty(self.tcx.type_of(alias_def_id).skip_binder());
+                if !lifetimes.is_empty() {
+                    super::lifetimes::ensure_lifetime_params(&mut ty_alias.generics, &lifetimes);
+                    self.impl_self_lifetimes.push((alias_def_id, lifetimes));
+                    mut_visit::walk_item(self, item);
+                    self.impl_self_lifetimes.pop();
+                    return;
+                }
             }
             ItemKind::Static(box static_item) => {
-                // only bare fn-ptr statics (fn(...)) are covered; Option<fn(...)> statics
-                // are not in annotation_decisions and their BareFn match fails here
                 let static_def_id = self.ast_to_hir.global_map[&node_id];
                 let static_hir_id = self.tcx.local_def_id_to_hir_id(static_def_id);
-                if let TyKind::BareFn(bare_fn) = &mut static_item.ty.kind
+                if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut static_item.ty)
                     && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&static_hir_id)
                 {
                     let decs = decs.clone();
@@ -534,11 +634,46 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 
     fn flat_map_stmt(&mut self, s: Stmt) -> smallvec::SmallVec<[Stmt; 1]> {
+        // C2Rust emits no-op path statements after updates (for example
+        // `p = p.offset(1); p;`). Detect them before walking the statement:
+        // pointer rewriting can turn the path into an offset expression, at
+        // which point it is no longer recognizable as the original no-op.
+        if let StmtKind::Semi(expr) = &s.kind {
+            let original_is_path = self
+                .ast_to_hir
+                .get_expr(expr.id, self.tcx)
+                .is_some_and(|hir_expr| matches!(hir_expr.kind, hir::ExprKind::Path(..)));
+            if matches!(expr.kind, ExprKind::Path(..)) || original_is_path {
+                return smallvec::SmallVec::new();
+            }
+        }
         let stmts = mut_visit::walk_flat_map_stmt(self, s);
         let mut new_stmts = smallvec::SmallVec::new();
         for s in stmts {
             match &s.kind {
+                // C2Rust emits no-op path statements after updates (for
+                // example `p = p.offset(1); p;`). Once a raw pointer becomes a
+                // non-Copy reference container, retaining that statement moves
+                // the value and breaks its next use.
+                StmtKind::Semi(expr) if matches!(expr.kind, ExprKind::Path(..)) => {}
+                StmtKind::Semi(expr) if is_noop_pointer_offset_expr(expr) => {}
                 StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
+                    if let ExprKind::Assign(lhs, rhs, _) = &expr.kind
+                        && let ExprKind::Index(base, index, _) = &lhs.kind
+                        && matches!(unwrap_paren(base).kind, ExprKind::Path(..))
+                        && utils::ast::has_side_effects(index)
+                    {
+                        new_stmts.push(utils::stmt!(
+                            "let __crat_index = {};",
+                            pprust::expr_to_string(index),
+                        ));
+                        new_stmts.push(utils::stmt!(
+                            "{}[__crat_index] = {};",
+                            pprust::expr_to_string(base),
+                            pprust::expr_to_string(rhs),
+                        ));
+                        continue;
+                    }
                     if let ExprKind::Assign(lhs, rhs, _) = &expr.kind
                         && let ExprKind::AddrOf(BorrowKind::Ref, mutability, rhs_inner) = &rhs.kind
                         && let ExprKind::MethodCall(_) = rhs_inner.kind
@@ -667,8 +802,23 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
             if let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &mut local.kind {
                 let hir_rhs = let_stmt.init.unwrap();
+                let reborrow_mut_opt_ref = if matches!(lhs_kind, PtrKind::OptRef(true))
+                    && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) =
+                        utils::hir::unwrap_drop_temps(hir_rhs).kind
+                    && let Res::Local(source_hir_id) = path.res
+                {
+                    matches!(
+                        self.effective_ptr_kind(source_hir_id),
+                        Some(PtrKind::OptRef(true))
+                    ) && self.local_is_used_after_span(source_hir_id, let_stmt.span)
+                } else {
+                    false
+                };
                 if !self.try_bridge_raw_root(rhs, hir_rhs, lhs_kind, lhs_inner_ty, Some(hir_id)) {
                     self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                }
+                if reborrow_mut_opt_ref {
+                    *rhs = utils::expr!("({}).as_deref_mut()", pprust::expr_to_string(rhs));
                 }
             }
         }
@@ -706,6 +856,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     self.expr_ctx(hir_expr),
                     ExprCtx::ImmediatelyAddrTaken | ExprCtx::AddrTaken(_)
                 ) {
+                    self.simplify_promoted_ref_field_base(base, hir_base);
                     return;
                 }
                 self.simplify_promoted_ref_field_base(base, hir_base);
@@ -915,8 +1066,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
                 // for indirect calls via a fn-ptr binding, look up joint decisions
                 let fn_ptr_decisions: Option<&Vec<Option<PtrKind>>> = if sig_dec.is_none() {
-                    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
+                    let mut fn_ptr_expr = utils::hir::unwrap_drop_temps(func);
+                    if let hir::ExprKind::MethodCall(method_seg, receiver, _, _) = fn_ptr_expr.kind
+                        && matches!(method_seg.ident.name.as_str(), "expect" | "unwrap")
+                    {
+                        fn_ptr_expr = utils::hir::unwrap_drop_temps(receiver);
+                    }
+                    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = fn_ptr_expr.kind
                         && let Res::Local(binding_hir_id) = path.res
+                        && !self.local_binding_initialized_by_transmute(binding_hir_id)
                     {
                         self.fn_ptr_rewrite
                             .annotation_decisions
@@ -937,6 +1095,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     };
 
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                let is_ctor = matches!(
+                    func.kind,
+                    hir::ExprKind::Path(hir::QPath::Resolved(_, path))
+                        if matches!(path.res, Res::Def(DefKind::Ctor(..), _))
+                );
 
                 if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
                     *expr = free_rewrite;
@@ -960,6 +1123,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         })
                         .or_else(|| {
                             unwrap_ptr_from_mir_ty(ty).map(|(_, m)| {
+                                // a constructor's field type is fixed by the constructed type
+                                if is_ctor {
+                                    return PtrKind::Raw(m.is_mut());
+                                }
                                 PtrKind::Raw(
                                     self.get_mutability_decision(harg).unwrap_or(m.is_mut()),
                                 )
@@ -968,6 +1135,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let Some(param_kind) = param_kind else { continue };
 
                     self.transform_rhs(arg, harg, param_kind);
+                    if param_kind == PtrKind::Raw(false)
+                        && let ExprKind::AddrOf(BorrowKind::Ref, mutability, _) = &mut arg.kind
+                    {
+                        *mutability = Mutability::Not;
+                    }
                     if param_kind == PtrKind::OptRef(true)
                         && (hir_path_source_kind(self.tcx, &self.ptr_kinds, harg)
                             == Some(PtrKind::OptRef(true))
@@ -1028,10 +1200,22 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 } else if let Some(hir_receiver) = hir_receiver
                     && let Some(pe) = self.ptr_expr(receiver, hir_receiver)
-                    && matches!(self.ptr_source_kind(&pe), Some(PtrKind::OptRef(_)))
                     && !pe.projs.is_empty()
+                    && let Some(ptr_kind) = self.ptr_source_kind(&pe)
                 {
-                    *expr = utils::expr!("({}).is_none()", pprust::expr_to_string(pe.base));
+                    match ptr_kind {
+                        PtrKind::OptRef(_) | PtrKind::OptBox | PtrKind::OptBoxedSlice => {
+                            *expr = utils::expr!("({}).is_none()", pprust::expr_to_string(pe.base));
+                        }
+                        PtrKind::Slice(_) | PtrKind::SliceCursor(_) => {
+                            *expr =
+                                utils::expr!("({}).is_empty()", pprust::expr_to_string(pe.base));
+                        }
+                        PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice => {
+                            *expr = utils::expr!("false");
+                        }
+                        PtrKind::Raw(_) => {}
+                    }
                 } else if matches!(receiver.kind, ExprKind::Path(_, _))
                     && let Some(hir_id) = self.hir_id_of_path(receiver.id)
                     && let Some(ptr_kind) = self.effective_ptr_kind(hir_id)
@@ -1080,10 +1264,17 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 args,
                 ..
             }) if seg.ident.name.as_str() == "offset_from" => {
-                let hir_receiver = self.ast_to_hir.get_expr(receiver.id, self.tcx).unwrap();
+                // earlier rewrites can replace either operand with a freshly
+                // synthesized expression whose AST id has no HIR counterpart.
+                // the method-call id is preserved, so recover both original
+                // operands from the parent call instead.
+                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let hir::ExprKind::MethodCall(_, hir_receiver, hir_args, _) = hir_expr.kind else {
+                    panic!("{hir_expr:?}")
+                };
                 self.transform_ptr(receiver, hir_receiver, PtrCtx::Rhs(PtrKind::Raw(true)));
                 let [arg] = &mut args[..] else { panic!() };
-                let hir_arg = self.ast_to_hir.get_expr(arg.id, self.tcx).unwrap();
+                let [hir_arg] = hir_args else { panic!() };
                 self.transform_ptr(arg, hir_arg, PtrCtx::Rhs(PtrKind::Raw(true)));
             }
             ExprKind::Ret(Some(ret)) => {
@@ -1169,16 +1360,33 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let inner = unwrap_addr_of_deref(unwrap_cast_and_paren(e));
                     let hir_inner = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_e));
                     let pe = self.ptr_expr(inner, hir_inner);
-                    if let Some(pe) = pe
-                        && self.ptr_expr_base_is_cursor(&pe)
+                    if let Some(pe) = &pe
+                        && self.ptr_expr_base_is_cursor(pe)
                         && let Some(offset) = combined_cursor_offset(&pe.projs)
                         && !pe.addr_of
                         && !pe.as_ptr
                         && !pe.cast_int
                     {
-                        let base_str = pprust::expr_to_string(pe.base);
+                        let mut base_str = pprust::expr_to_string(pe.base);
+                        // the cursor's overloaded index must not implicitly borrow through a raw
+                        // pointer (`dangerous_implicit_autorefs`)
+                        if self.place_derefs_raw_local(pe.hir_base) {
+                            base_str = format!("&{}({base_str})", if m { "mut " } else { "" });
+                        }
                         let offset_str = pprust::expr_to_string(&offset);
                         *expr = utils::expr!("({})[{}]", base_str, offset_str)
+                    } else if let Some(pe) = pe
+                        && self.ptr_expr_base_is_slice_local(&pe)
+                        && let Some(offset) = combined_slice_offset(&pe.projs)
+                        && !pe.addr_of
+                        && !pe.as_ptr
+                        && !pe.cast_int
+                    {
+                        // index directly instead of `(&mut (base)[off..])[0]`, whose explicit
+                        // borrow is not two-phase and conflicts with uses of `base` in method args
+                        let base_str = pprust::expr_to_string(pe.base);
+                        let offset_str = pprust::expr_to_string(&offset);
+                        *expr = utils::expr!("({})[({}) as usize]", base_str, offset_str)
                     } else {
                         match self.transform_ptr(e, hir_e, PtrCtx::Deref(m)) {
                             PtrKind::Raw(_) => {}
@@ -1213,7 +1421,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 }
             }
-            ExprKind::Cast(_, cast_ty) => {
+            ExprKind::Cast(inner, cast_ty) => {
+                // Pointer-to-integer cast: the operand may have been promoted,
+                // so turn it back into a raw pointer first.
+                if let Some(hir_expr) = self.ast_to_hir.get_expr(expr_id, self.tcx)
+                    && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind
+                {
+                    let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                    if typeck.expr_ty(hir_expr).is_integral()
+                        && let Some((_, m)) = unwrap_ptr_from_mir_ty(typeck.expr_ty(hir_inner))
+                    {
+                        self.transform_ptr(inner, hir_inner, PtrCtx::Rhs(PtrKind::Raw(m.is_mut())));
+                    }
+                }
                 if let TyKind::BareFn(bare_fn) = &mut cast_ty.kind
                     && let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
                     && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind
@@ -1223,10 +1443,20 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         && let hir::def::Res::Def(_, def_id) = path.res
                         && let Some(local_did) = def_id.as_local()
                         && self.fn_ptr_rewrite.direct_rewrite.contains(&local_did)
-                        && let Some(decs) = self.fn_ptr_rewrite.individual_decisions.get(&local_did)
+                        && let Some(sig_dec) = self.sig_decs.data.get(&local_did)
                     {
-                        let decs = decs.clone();
-                        if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                        let decs = sig_dec.input_decs.clone();
+                        let mut used_slice_cursor = rewrite_bare_fn_inputs(bare_fn, &decs);
+                        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                        if let ty::TyKind::FnPtr(fn_sig, _) = typeck.expr_ty(hir_expr).kind() {
+                            used_slice_cursor |= rewrite_aliased_bare_fn_inputs(
+                                bare_fn,
+                                &decs,
+                                fn_sig.inputs().skip_binder(),
+                                self.tcx,
+                            );
+                        }
+                        if used_slice_cursor {
                             self.slice_cursor.set(true);
                         }
                     }
@@ -1684,6 +1914,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if freed_borrow_outputs.changed() {
                 changed = true;
             }
+            if downgrade_nullable_struct_inputs_tied_to_borrow_outputs(
+                rust_program.tcx,
+                &mut sig_decs,
+            ) {
+                changed = true;
+            }
             let raw_cast_call_inputs =
                 downgrade_raw_cast_call_inputs(rust_program.tcx, &mut sig_decs, &ptr_kinds);
             for &(did, idx) in &raw_cast_call_inputs {
@@ -1697,6 +1933,20 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 );
             }
             if !raw_cast_call_inputs.is_empty() {
+                changed = true;
+            }
+            let upcast_call_inputs = downgrade_upcast_call_inputs(rust_program.tcx, &mut sig_decs);
+            for &(did, idx) in &upcast_call_inputs {
+                record_signature_input_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    did,
+                    idx,
+                    DecisionReason::UpcastCallInput,
+                );
+            }
+            if !upcast_call_inputs.is_empty() {
                 changed = true;
             }
             let cursor_input_downgrades = downgrade_cursor_inputs_from_unanchored_raw_callers(
@@ -2436,9 +2686,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let Some(struct_did) = self.local_struct_did_for_ast_ty(&impl_item.self_ty) else {
             return false;
         };
-        self.analysis
+        (self
+            .analysis
             .struct_copy_result
             .should_remove_generated_impl(struct_did)
+            && self.struct_has_non_copy_field_candidate(struct_did))
             || self.struct_has_owning_box_field_candidate(struct_did)
     }
 
@@ -2471,13 +2723,40 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             })
     }
 
+    fn struct_has_non_copy_field_candidate(&self, struct_did: LocalDefId) -> bool {
+        self.tcx
+            .adt_def(struct_did)
+            .non_enum_variant()
+            .fields
+            .iter_enumerated()
+            .any(|(field_index, _)| {
+                self.field_ptr_kind(StructFieldSlot {
+                    struct_did,
+                    field_index: field_index.index(),
+                })
+                .is_some_and(|kind| kind.is_mut() || kind.is_owning_box_like())
+            })
+    }
+
     fn ordered_struct_lifetimes(&self, struct_did: LocalDefId) -> Vec<Symbol> {
+        self.ordered_struct_lifetimes_inner(struct_did, &mut FxHashSet::default())
+    }
+
+    fn ordered_struct_lifetimes_inner(
+        &self,
+        struct_did: LocalDefId,
+        visiting: &mut FxHashSet<LocalDefId>,
+    ) -> Vec<Symbol> {
+        if !visiting.insert(struct_did) {
+            return vec![];
+        }
         let Some(plan) = self.lifetime_plans.structs.get(&struct_did) else {
+            visiting.remove(&struct_did);
             return vec![];
         };
         let mut field_lifetimes: Vec<_> = plan.field_lifetimes.iter().collect();
         field_lifetimes.sort_by_key(|(field_index, _)| **field_index);
-        field_lifetimes
+        let mut lifetimes = field_lifetimes
             .into_iter()
             .filter(|(field_index, _)| {
                 matches!(
@@ -2494,7 +2773,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 )
             })
             .map(|(_, lifetime)| *lifetime)
-            .collect()
+            .collect::<Vec<_>>();
+        for dependency in &plan.dependent_structs {
+            for lifetime in self.ordered_struct_lifetimes_inner(*dependency, visiting) {
+                if !lifetimes.contains(&lifetime) {
+                    lifetimes.push(lifetime);
+                }
+            }
+        }
+        visiting.remove(&struct_did);
+        lifetimes
     }
 
     fn rewrite_struct_definition(
@@ -2607,14 +2895,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn add_struct_lifetime_args_to_ty(&self, ty: &mut Ty) {
-        let Some((struct_did, lifetimes)) = self.struct_lifetimes_for_ty(ty) else {
+        let Some((_struct_did, lifetimes)) = self.struct_lifetimes_for_ty(ty) else {
             return;
         };
-        if self
-            .impl_self_lifetimes
-            .last()
-            .is_some_and(|(impl_struct_did, _)| *impl_struct_did == struct_did)
-        {
+        if !self.impl_self_lifetimes.is_empty() {
             self.add_struct_lifetime_args_to_ty_with_lifetimes(ty, &lifetimes);
         } else {
             self.add_struct_lifetime_args_to_ty_with_lifetime_count(ty, lifetimes.len());
@@ -2622,12 +2906,28 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn struct_lifetimes_for_ty(&self, ty: &Ty) -> Option<(LocalDefId, Vec<Symbol>)> {
-        let struct_did = self.local_struct_did_for_ast_ty(ty)?;
-        let lifetimes = self.ordered_struct_lifetimes(struct_did);
+        let hir_ty = self.ast_to_hir.get_ty(ty.id, self.tcx)?;
+        let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = hir_ty.kind else {
+            return None;
+        };
+        let (type_did, lifetimes) = match path.res {
+            Res::Def(DefKind::Struct, def_id) => {
+                let struct_did = def_id.as_local()?;
+                (struct_did, self.ordered_struct_lifetimes(struct_did))
+            }
+            Res::Def(DefKind::TyAlias, def_id) => {
+                let alias_did = def_id.as_local()?;
+                (
+                    alias_did,
+                    self.lifetimes_for_ty(self.tcx.type_of(alias_did).skip_binder()),
+                )
+            }
+            _ => return None,
+        };
         if lifetimes.is_empty() {
             return None;
         }
-        Some((struct_did, lifetimes))
+        Some((type_did, lifetimes))
     }
 
     fn local_struct_did_for_ast_ty(&self, ty: &Ty) -> Option<LocalDefId> {
@@ -2765,10 +3065,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let hir::QPath::Resolved(_, path) = qpath else {
             return None;
         };
-        let Res::Def(DefKind::Struct, def_id) = path.res else {
-            return None;
-        };
-        def_id.as_local()
+        match path.res {
+            Res::Def(DefKind::Struct, def_id) => def_id.as_local(),
+            Res::Def(DefKind::TyAlias, def_id) => {
+                let alias_did = def_id.as_local()?;
+                let ty::TyKind::Adt(adt_def, _) = self.tcx.type_of(alias_did).skip_binder().kind()
+                else {
+                    return None;
+                };
+                adt_def.did().as_local()
+            }
+            _ => None,
+        }
     }
 
     fn field_index_by_name(&self, struct_did: LocalDefId, field_name: Symbol) -> Option<usize> {
@@ -2780,14 +3088,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             .find_map(|(field_index, field)| {
                 (field.name == field_name).then_some(field_index.index())
             })
-    }
-
-    fn extend_lifetimes_for_ty(&self, lifetimes: &mut Vec<Symbol>, ty: ty::Ty<'tcx>) {
-        for lifetime in self.lifetimes_for_ty(ty) {
-            if !lifetimes.contains(&lifetime) {
-                lifetimes.push(lifetime);
-            }
-        }
     }
 
     fn lifetimes_for_ty(&self, ty: ty::Ty<'tcx>) -> Vec<Symbol> {
@@ -2830,6 +3130,15 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
     fn anonymous_ty_name(&self, ty: ty::Ty<'tcx>) -> String {
         self.promoted_mir_ty_name(ty, false)
+    }
+
+    fn ty_name_with_lifetime(&self, ty: ty::Ty<'tcx>, lifetime: Option<Symbol>) -> String {
+        let ty = self.anonymous_ty_name(ty);
+        if let Some(lifetime) = lifetime {
+            ty.replace("'_", &format!("'{}", lifetime.as_str()))
+        } else {
+            ty
+        }
     }
 
     fn promoted_mir_ty_name(&self, ty: ty::Ty<'tcx>, use_named_struct_lifetimes: bool) -> String {
@@ -2936,8 +3245,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         ty: ty::Ty<'tcx>,
         mutability: bool,
         lifetime: Option<Symbol>,
+        inner_lifetime: Option<Symbol>,
     ) -> Ty {
-        let ty = self.ty_name(ty);
+        let ty = self.ty_name_with_lifetime(ty, inner_lifetime);
         let m = if mutability { "mut " } else { "" };
         let lifetime = lifetime
             .map(|lifetime| format!("'{} ", lifetime.as_str()))
@@ -2956,8 +3266,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         ty: ty::Ty<'tcx>,
         mutability: bool,
         lifetime: Option<Symbol>,
+        inner_lifetime: Option<Symbol>,
     ) -> Ty {
-        let ty = self.ty_name(ty);
+        let ty = self.ty_name_with_lifetime(ty, inner_lifetime);
         let m = if mutability { "mut " } else { "" };
         let lifetime = lifetime
             .map(|lifetime| format!("'{} ", lifetime.as_str()))
@@ -2996,7 +3307,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn mk_cursor_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
-        let ty = self.ty_name(ty);
+        let ty = self.anonymous_ty_name(ty);
         if mutability {
             utils::ty!("crate::slice_cursor::SliceCursorMut<'_, {ty}>")
         } else {
@@ -3009,8 +3320,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         ty: ty::Ty<'tcx>,
         mutability: bool,
         lifetime: Option<Symbol>,
+        inner_lifetime: Option<Symbol>,
     ) -> Ty {
-        let ty = self.ty_name(ty);
+        let ty = self.ty_name_with_lifetime(ty, inner_lifetime);
         let cursor = if mutability {
             "SliceCursorMut"
         } else {
@@ -3023,7 +3335,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn mk_slice_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
-        let ty = self.ty_name(ty);
+        let ty = self.anonymous_ty_name(ty);
         if mutability {
             utils::ty!("&mut [{ty}]")
         } else {
@@ -3036,8 +3348,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         ty: ty::Ty<'tcx>,
         mutability: bool,
         lifetime: Option<Symbol>,
+        inner_lifetime: Option<Symbol>,
     ) -> Ty {
-        let ty = self.ty_name(ty);
+        let ty = self.ty_name_with_lifetime(ty, inner_lifetime);
         let m = if mutability { "mut " } else { "" };
         let lifetime = lifetime
             .map(|lifetime| format!("'{} ", lifetime.as_str()))
@@ -3046,7 +3359,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn mk_raw_ptr_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
-        let ty = self.ty_name(ty);
+        let ty = self.anonymous_ty_name(ty);
+        let m = if mutability { "mut" } else { "const" };
+        utils::ty!("*{m} {ty}")
+    }
+
+    fn mk_raw_ptr_ty_with_lifetime(
+        &self,
+        ty: ty::Ty<'tcx>,
+        mutability: bool,
+        inner_lifetime: Option<Symbol>,
+    ) -> Ty {
+        let ty = self.ty_name_with_lifetime(ty, inner_lifetime);
         let m = if mutability { "mut" } else { "const" };
         utils::ty!("*{m} {ty}")
     }
@@ -3059,7 +3383,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         field_kind: PtrKind,
     ) -> Expr {
         let field_expr = pprust::expr_to_string(field_expr);
-        let inner_ty = self.ty_name(inner_ty);
+        let inner_ty = self.anonymous_ty_name(inner_ty);
         match field_kind {
             PtrKind::OptRef(_) | PtrKind::OptBox => {
                 if mutability {
@@ -3449,6 +3773,26 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         finder.found
     }
 
+    fn local_binding_initialized_by_transmute(&self, binding_hir_id: HirId) -> bool {
+        let hir::Node::LetStmt(let_stmt) = self.tcx.parent_hir_node(binding_hir_id) else {
+            return false;
+        };
+        let Some(init) = let_stmt.init else {
+            return false;
+        };
+        let init = utils::hir::unwrap_drop_temps(init);
+        let hir::ExprKind::Call(callee, _) = init.kind else {
+            return false;
+        };
+        let callee = utils::hir::unwrap_drop_temps(callee);
+        let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = callee.kind else {
+            return false;
+        };
+        path.segments
+            .last()
+            .is_some_and(|segment| segment.ident.name == rustc_span::sym::transmute)
+    }
+
     fn effective_ptr_kind(&self, hir_id: HirId) -> Option<PtrKind> {
         let kind = self.ptr_kinds.get(&hir_id).copied()?;
         if self.forced_raw_bindings.contains(&hir_id) {
@@ -3721,6 +4065,141 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         visitor.found
     }
 
+    fn assignment_related_param_indices(&self, def_id: LocalDefId) -> FxHashSet<usize> {
+        struct AssignmentVisitor<'a, 'tcx> {
+            tcx: TyCtxt<'tcx>,
+            param_indices: &'a FxHashMap<HirId, usize>,
+            promoted_fields: &'a FxHashSet<StructFieldSlot>,
+            related: FxHashSet<usize>,
+        }
+
+        fn root_param(
+            expr: &hir::Expr<'_>,
+            param_indices: &FxHashMap<HirId, usize>,
+        ) -> Option<usize> {
+            let expr = hir_unwrap_casts(expr);
+            match expr.kind {
+                hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+                    let Res::Local(hir_id) = path.res else {
+                        return None;
+                    };
+                    param_indices.get(&hir_id).copied()
+                }
+                hir::ExprKind::Unary(UnOp::Deref, inner)
+                | hir::ExprKind::Field(inner, _)
+                | hir::ExprKind::AddrOf(_, _, inner) => root_param(inner, param_indices),
+                _ => None,
+            }
+        }
+
+        impl<'tcx> Visitor<'tcx> for AssignmentVisitor<'_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                    && let Some(lhs_index) = root_param(lhs, self.param_indices)
+                    && let Some(rhs_index) = root_param(rhs, self.param_indices)
+                    && lhs_index != rhs_index
+                {
+                    // an unpromoted raw field does not carry a Rust lifetime.
+                    // Copying its address into a promoted field must not extend
+                    // the borrow of the source struct.
+                    if hir_struct_field_slot(self.tcx, hir_unwrap_casts(rhs))
+                        .is_some_and(|field| !self.promoted_fields.contains(&field))
+                    {
+                        intravisit::walk_expr(self, expr);
+                        return;
+                    }
+                    let typeck = self.tcx.typeck(expr.hir_id.owner);
+                    let carries_lifetime = |ty: ty::Ty<'_>| {
+                        matches!(ty.kind(), ty::TyKind::RawPtr(..) | ty::TyKind::Adt(..))
+                    };
+                    if carries_lifetime(typeck.expr_ty(lhs))
+                        && carries_lifetime(typeck.expr_ty(rhs))
+                    {
+                        self.related.insert(lhs_index);
+                        self.related.insert(rhs_index);
+                    }
+                } else if let hir::ExprKind::Binary(op, lhs, rhs) = expr.kind
+                    && matches!(op.node, BinOpKind::Eq | BinOpKind::Ne)
+                    && let Some(lhs_index) = root_param(lhs, self.param_indices)
+                    && let Some(rhs_index) = root_param(rhs, self.param_indices)
+                    && lhs_index != rhs_index
+                {
+                    let typeck = self.tcx.typeck(expr.hir_id.owner);
+                    let points_to_adt = |ty: ty::Ty<'_>| {
+                        unwrap_ptr_from_mir_ty(ty)
+                            .is_some_and(|(inner, _)| matches!(inner.kind(), ty::TyKind::Adt(..)))
+                    };
+                    if points_to_adt(typeck.expr_ty(lhs)) && points_to_adt(typeck.expr_ty(rhs)) {
+                        self.related.insert(lhs_index);
+                        self.related.insert(rhs_index);
+                    }
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let body = self.tcx.hir_body_owned_by(def_id);
+        let param_indices = body
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(index, param)| {
+                let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind else {
+                    return None;
+                };
+                Some((hir_id, index))
+            })
+            .collect::<FxHashMap<_, _>>();
+        let mut promoted_fields: FxHashSet<StructFieldSlot> = self
+            .analysis
+            .borrow_promotion_result
+            .mutable_fields
+            .union(&self.analysis.borrow_promotion_result.shared_fields)
+            .copied()
+            .collect();
+        promoted_fields.retain(|field| !self.demoted_fields.contains(field));
+        let mut visitor = AssignmentVisitor {
+            tcx: self.tcx,
+            param_indices: &param_indices,
+            promoted_fields: &promoted_fields,
+            related: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        visitor.related
+    }
+
+    fn local_is_used_after_span(&self, target_hir_id: HirId, span: rustc_span::Span) -> bool {
+        struct LaterUseVisitor {
+            target_hir_id: HirId,
+            after: rustc_span::BytePos,
+            found: bool,
+        }
+
+        impl<'tcx> Visitor<'tcx> for LaterUseVisitor {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if self.found {
+                    return;
+                }
+                if expr.span.lo() >= self.after
+                    && matches!(expr.kind, hir::ExprKind::Path(hir::QPath::Resolved(_, path)) if path.res == Res::Local(self.target_hir_id))
+                {
+                    self.found = true;
+                    return;
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let body = self.tcx.hir_body_owned_by(target_hir_id.owner.def_id);
+        let mut visitor = LaterUseVisitor {
+            target_hir_id,
+            after: span.hi(),
+            found: false,
+        };
+        visitor.visit_body(body);
+        visitor.found
+    }
+
     fn local_binding_needs_mut_for_owned_field_free(&self, target_hir_id: HirId) -> bool {
         struct OwnedFieldFreeVisitor<'a, 'analysis, 'tcx> {
             transform: &'a TransformVisitor<'analysis, 'tcx>,
@@ -3765,7 +4244,25 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn transform_ptr(&self, ptr: &mut Expr, hir_ptr: &hir::Expr<'tcx>, ctx: PtrCtx) -> PtrKind {
+        self.transform_ptr_with_cast_ty(ptr, hir_ptr, ctx, None)
+    }
+
+    /// `cast_ty` is the type of a stripped cast around an enclosing block whose tail is `ptr`.
+    fn transform_ptr_with_cast_ty(
+        &self,
+        ptr: &mut Expr,
+        hir_ptr: &hir::Expr<'tcx>,
+        ctx: PtrCtx,
+        cast_ty: Option<ty::Ty<'tcx>>,
+    ) -> PtrKind {
         let allocator_root_expr = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr)).clone();
+        // Raw-pointer casts describe the old representation. Once the target
+        // is a reference-like representation, retaining an outer cast can
+        // produce expressions such as `&T as *mut T`. The original HIR still
+        // carries the cast and supplies the pointee types needed below.
+        if matches!(ctx, PtrCtx::Rhs(kind) if !matches!(kind, PtrKind::Raw(_))) {
+            *ptr = allocator_root_expr.clone();
+        }
         let e = unwrap_addr_of_deref_mut(unwrap_cast_and_paren_mut(ptr));
         let hir_e = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_ptr));
 
@@ -3797,13 +4294,24 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
 
         if let ExprKind::Block(block, _) = &mut e.kind {
-            let hir::ExprKind::Block(hir_block, _) = hir_e.kind else {
-                panic!("{}", pprust::expr_to_string(e));
-            };
             let StmtKind::Expr(inner) = &mut block.stmts.last_mut().unwrap().kind else {
                 panic!("{}", pprust::expr_to_string(e));
             };
-            return self.transform_ptr(inner, hir_block.expr.unwrap(), ctx);
+            // argument-reborrow rewriting can wrap an original pointer
+            // expression in an AST-only block. In that case the block's tail
+            // still represents the original HIR expression.
+            let hir_inner = if let hir::ExprKind::Block(hir_block, _) = hir_e.kind {
+                hir_block.expr.unwrap()
+            } else {
+                hir_e
+            };
+            // the tail's own type misses the cast stripped around the block
+            let cast_ty = if hir_expr_starts_with_cast(hir_ptr) {
+                Some(self.tcx.typeck(hir_ptr.hir_id.owner).expr_ty_adjusted(hir_ptr))
+            } else {
+                cast_ty
+            };
+            return self.transform_ptr_with_cast_ty(inner, hir_inner, ctx, cast_ty);
         }
 
         if is_null_ptr_constructor(&allocator_root_expr) {
@@ -3856,6 +4364,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             && let Some(pe) = self.ptr_expr(e, hir_e)
             && pe.projs.is_empty()
             && !hir_expr_starts_with_cast(hir_ptr)
+            && cast_ty.is_none()
             && self.ptr_source_kind(&pe) == Some(kind)
         {
             return kind;
@@ -3863,7 +4372,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
         if let PtrCtx::Rhs(kind @ (PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice)) = ctx {
             debug_assert!(!kind.is_optional());
-            self.transform_ptr(ptr, hir_ptr, PtrCtx::Rhs(kind.optional_variant()));
+            self.transform_ptr_with_cast_ty(
+                ptr,
+                hir_ptr,
+                PtrCtx::Rhs(kind.optional_variant()),
+                cast_ty,
+            );
             *ptr = match kind {
                 PtrKind::Ref(m) if opt_ref_receiver_should_borrow(ptr) => {
                     utils::expr!(
@@ -3878,10 +4392,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
 
         if let PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) = ctx {
-            let lhs_ty = self
-                .tcx
-                .typeck(hir_ptr.hir_id.owner)
-                .expr_ty_adjusted(hir_ptr);
+            let lhs_ty = cast_ty.unwrap_or_else(|| {
+                self.tcx
+                    .typeck(hir_ptr.hir_id.owner)
+                    .expr_ty_adjusted(hir_ptr)
+            });
             let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx)
                 .unwrap_or_else(|| panic!("{} {}", lhs_ty, pprust::expr_to_string(ptr)));
             if let Some(kind) = self.try_materialize_box_allocator_root(
@@ -3897,7 +4412,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
         let e = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr));
         let typeck = self.tcx.typeck(hir_ptr.hir_id.owner);
-        let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
+        let lhs_ty = cast_ty.unwrap_or_else(|| typeck.expr_ty_adjusted(hir_ptr));
         let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
         if let PtrCtx::Rhs(
             kind @ (PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)),
@@ -4097,6 +4612,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         | PtrExprProj::IntegerBinOp(..)
                 )
             }) {
+                // A slice created from the addressed value starts at that value and cannot
+                // represent a backwards offset.  This occurs in layout-sensitive C code that
+                // walks from one repr(C) field into preceding fields.  Keep the original raw
+                // expression for raw/dereference uses instead of turning the negative offset
+                // into a huge usize slice index.
+                let has_backward_offset = pe.projs.iter().any(|proj| match proj {
+                    PtrExprProj::Offset(offset) => ast_expr_is_syntactically_negative(offset),
+                    PtrExprProj::IntegerOp(_, OpKind::WrappingSub) => true,
+                    _ => false,
+                });
                 let m = match ctx {
                     PtrCtx::Rhs(PtrKind::Ref(m)) => m,
                     PtrCtx::Rhs(PtrKind::Raw(m))
@@ -4113,6 +4638,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         panic!("unsupported M4A box target for addr_of arithmetic")
                     }
                 };
+                if has_backward_offset
+                    && matches!(ctx, PtrCtx::Rhs(PtrKind::Raw(_)) | PtrCtx::Deref(_))
+                {
+                    return PtrKind::Raw(m);
+                }
                 // Create initial slice from the single element:
                 //   std::slice::from_mut(&mut x) or std::slice::from_ref(&x)
                 let base_str = pprust::expr_to_string(pe.base);
@@ -4268,17 +4798,19 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     unreachable!("non-optional pointer targets are handled before addr_of")
                 }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
-                    if !need_cast && !ty_updated {
+                    let source_mut = m && addr_source_mut;
+                    if !need_cast && !ty_updated && source_mut == m {
                         *ptr = utils::expr!(
                             "&raw {} ({})",
-                            if m { "mut" } else { "const" },
+                            if source_mut { "mut" } else { "const" },
                             pprust::expr_to_string(e),
                         );
                     } else {
                         *ptr = utils::expr!(
-                            "&raw {0} ({1}) as *{0} {2}",
-                            if m { "mut" } else { "const" },
+                            "&raw {} ({}) as *{} {}",
+                            if source_mut { "mut" } else { "const" },
                             pprust::expr_to_string(e),
+                            if m { "mut" } else { "const" },
                             mir_ty_to_string(lhs_inner_ty, self.tcx),
                         );
                     }
@@ -4623,7 +5155,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
         }
 
-        if let Some(rhs_kind) = self.ptr_source_kind(&pe) {
+        // an untracked reference-typed source (e.g., a punning accessor's `&mut T`) is not a
+        // raw pointer
+        let source_kind = self.ptr_source_kind(&pe).or_else(|| {
+            if let ty::TyKind::Ref(_, _, m1) = pe.base_ty.kind()
+                && pe.base_kind == PtrExprBaseKind::Other
+                && pe.projs.is_empty()
+                && matches!(
+                    ctx,
+                    PtrCtx::Rhs(PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_))
+                )
+            {
+                Some(PtrKind::Ref(m1.is_mut()))
+            } else {
+                None
+            }
+        });
+        if let Some(rhs_kind) = source_kind {
             match (ctx, rhs_kind) {
                 (PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m), PtrKind::Raw(m1)) => {
                     if m && !m1 {
@@ -4907,7 +5455,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
                 (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::SliceCursor(_)) => {
                     let base = self.projected_expr(&pe, m, false);
-                    *ptr = self.cursor_or_slice_to_slice_expr(&base, m);
+                    let slice = self.cursor_or_slice_to_slice_expr(&base, m);
+                    *ptr = self.plain_slice_from_expr(&slice, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Slice(m);
                 }
                 (PtrCtx::Deref(m), PtrKind::SliceCursor(_)) => {
@@ -5094,9 +5643,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     return PtrKind::Raw(m);
                 }
                 PtrCtx::Rhs(PtrKind::OptRef(m)) => {
-                    assert!(!m, "{}", pprust::expr_to_string(ptr));
-                    if lhs_inner_ty == self.tcx.types.u8 {
+                    if m && lhs_inner_ty == self.tcx.types.u8 {
+                        *ptr = utils::expr!(
+                            "Box::leak(({}).to_vec().into_boxed_slice()).first_mut()",
+                            pprust::expr_to_string(e)
+                        );
+                    } else if m {
+                        assert!(lhs_inner_ty.is_numeric());
+                        self.bytemuck.set(true);
+                        *ptr = utils::expr!(
+                            "bytemuck::cast_slice_mut(Box::leak(({}).to_vec().into_boxed_slice())).first_mut()",
+                            pprust::expr_to_string(e)
+                        );
+                    } else if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = utils::expr!("{}.first()", pprust::expr_to_string(e));
+                    } else if ty_is_byte_sized_raw_inner(lhs_inner_ty) {
+                        let slice = immutable_byte_str_slice(self.tcx, e, lhs_inner_ty);
+                        *ptr = utils::expr!("({}).first()", pprust::expr_to_string(&slice));
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
                         self.bytemuck.set(true);
@@ -5111,12 +5674,29 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     panic!("unsupported M4A box target for byte string source")
                 }
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
-                    assert!(!m, "{}", pprust::expr_to_string(ptr));
                     self.slice_cursor.set(true);
-                    if lhs_inner_ty == self.tcx.types.u8 {
+                    if m && lhs_inner_ty == self.tcx.types.u8 {
+                        *ptr = utils::expr!(
+                            "crate::slice_cursor::SliceCursorMut::new(Box::leak(({}).to_vec().into_boxed_slice()))",
+                            pprust::expr_to_string(e)
+                        );
+                    } else if m {
+                        assert!(lhs_inner_ty.is_numeric());
+                        self.bytemuck.set(true);
+                        *ptr = utils::expr!(
+                            "crate::slice_cursor::SliceCursorMut::new(bytemuck::cast_slice_mut(Box::leak(({}).to_vec().into_boxed_slice())))",
+                            pprust::expr_to_string(e),
+                        );
+                    } else if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = utils::expr!(
                             "crate::slice_cursor::SliceCursor::new({})",
                             pprust::expr_to_string(e)
+                        );
+                    } else if ty_is_byte_sized_raw_inner(lhs_inner_ty) {
+                        let slice = immutable_byte_str_slice(self.tcx, e, lhs_inner_ty);
+                        *ptr = utils::expr!(
+                            "crate::slice_cursor::SliceCursor::new({})",
+                            pprust::expr_to_string(&slice)
                         );
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
@@ -5129,9 +5709,22 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     return PtrKind::SliceCursor(m);
                 }
                 PtrCtx::Rhs(PtrKind::Slice(m)) => {
-                    assert!(!m, "{}", pprust::expr_to_string(ptr));
-                    if lhs_inner_ty == self.tcx.types.u8 {
+                    if m && lhs_inner_ty == self.tcx.types.u8 {
+                        *ptr = utils::expr!(
+                            "Box::leak(({}).to_vec().into_boxed_slice())",
+                            pprust::expr_to_string(e)
+                        );
+                    } else if m {
+                        assert!(lhs_inner_ty.is_numeric());
+                        self.bytemuck.set(true);
+                        *ptr = utils::expr!(
+                            "bytemuck::cast_slice_mut(Box::leak(({}).to_vec().into_boxed_slice()))",
+                            pprust::expr_to_string(e),
+                        );
+                    } else if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = e.clone();
+                    } else if ty_is_byte_sized_raw_inner(lhs_inner_ty) {
+                        *ptr = immutable_byte_str_slice(self.tcx, e, lhs_inner_ty);
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
                         self.bytemuck.set(true);
@@ -5225,7 +5818,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             e.clone()
         } else {
             let s = pprust::expr_to_string(e);
-            if m {
+            if m && is_offset_by_method_call(e) {
+                utils::expr!("({}).into_slice_mut()", s)
+            } else if m {
                 utils::expr!("({}).as_slice_mut()", s)
             } else {
                 utils::expr!("({}).as_slice()", s)
@@ -5261,6 +5856,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 .and_then(|field| self.field_ptr_kind(field))
                 .is_some_and(|kind| matches!(kind, PtrKind::SliceCursor(_))),
         }
+    }
+
+    fn ptr_expr_base_is_slice_local(&self, pe: &PtrExpr<'_, 'tcx>) -> bool {
+        matches!(
+            pe.base_kind,
+            PtrExprBaseKind::Path(Res::Local(hir_id))
+                if matches!(self.effective_ptr_kind(hir_id), Some(PtrKind::Slice(_)))
+        )
     }
 
     fn allocator_root<'a>(&self, expr: &'a Expr) -> Option<AllocatorRoot<'a>> {
@@ -5414,7 +6017,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             (PtrKind::OptBoxedSlice, AllocatorRoot::Calloc { count, elem_size }) => {
                 *ptr = utils::expr!(
-                    "Some(std::iter::repeat_with(|| {0}).take((({1}) * ({2}) / std::mem::size_of::<{3}>()) as usize).collect::<Vec<{3}>>().into_boxed_slice())",
+                    "Some(std::iter::repeat_with(|| {0}).take((({1}) as usize).wrapping_mul(({2}) as usize) / std::mem::size_of::<{3}>()).collect::<Vec<{3}>>().into_boxed_slice())",
                     default_expr_str,
                     pprust::expr_to_string(count),
                     pprust::expr_to_string(elem_size),
@@ -5424,7 +6027,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             (PtrKind::BoxedSlice, AllocatorRoot::Calloc { count, elem_size }) => {
                 *ptr = utils::expr!(
-                    "std::iter::repeat_with(|| {0}).take((({1}) * ({2}) / std::mem::size_of::<{3}>()) as usize).collect::<Vec<{3}>>().into_boxed_slice()",
+                    "std::iter::repeat_with(|| {0}).take((({1}) as usize).wrapping_mul(({2}) as usize) / std::mem::size_of::<{3}>()).collect::<Vec<{3}>>().into_boxed_slice()",
                     default_expr_str,
                     pprust::expr_to_string(count),
                     pprust::expr_to_string(elem_size),
@@ -5434,7 +6037,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             (PtrKind::OptBoxedSlice, AllocatorRoot::Malloc { bytes }) => {
                 *ptr = utils::expr!(
-                    "Some(std::iter::repeat_with(|| {0}).take((({1}) / std::mem::size_of::<{2}>()) as usize).collect::<Vec<{2}>>().into_boxed_slice())",
+                    "Some(std::iter::repeat_with(|| {0}).take((({1}) as usize) / std::mem::size_of::<{2}>()).collect::<Vec<{2}>>().into_boxed_slice())",
                     default_expr_str,
                     pprust::expr_to_string(bytes),
                     ty,
@@ -5443,7 +6046,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             (PtrKind::BoxedSlice, AllocatorRoot::Malloc { bytes }) => {
                 *ptr = utils::expr!(
-                    "std::iter::repeat_with(|| {0}).take((({1}) / std::mem::size_of::<{2}>()) as usize).collect::<Vec<{2}>>().into_boxed_slice()",
+                    "std::iter::repeat_with(|| {0}).take((({1}) as usize) / std::mem::size_of::<{2}>()).collect::<Vec<{2}>>().into_boxed_slice()",
                     default_expr_str,
                     pprust::expr_to_string(bytes),
                     ty,
@@ -6673,77 +7276,36 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         &self,
         e: &Expr,
         m: bool,
-        m1: bool,
-        lhs_inner_ty: ty::Ty<'tcx>,
-        rhs_inner_ty: ty::Ty<'tcx>,
+        _m1: bool,
+        _lhs_inner_ty: ty::Ty<'tcx>,
+        _rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
-        let need_cast = lhs_inner_ty != rhs_inner_ty;
-        let cast_mut = if m && !m1 { " as *mut _" } else { "" };
+        let target_ptr = if m { "mut" } else { "const" };
         if let Some(name) = method_call_name(e)
             && let name = name.as_str()
             && (name == "offset" || name == "as_mut_ptr" || name == "as_ptr")
         {
             // we assume that the pointer is not null when such methods are called
-            if let Some(slice) = self.plain_slice_from_as_ptr_receiver(e, m, lhs_inner_ty) {
+            if let Some(slice) = self.plain_slice_from_as_ptr_receiver(e, m, _lhs_inner_ty) {
                 return slice;
             }
-            if !need_cast {
-                utils::expr!(
-                    "std::slice::from_raw_parts{}(({}){}, 1_000_000)",
-                    if m { "_mut" } else { "" },
-                    pprust::expr_to_string(e),
-                    cast_mut,
-                )
-            } else {
-                utils::expr!(
-                    "std::slice::from_raw_parts{}(({}){} as *{} _, 1_000_000)",
-                    if m { "_mut" } else { "" },
-                    pprust::expr_to_string(e),
-                    cast_mut,
-                    if m { "mut" } else { "const" },
-                )
-            }
-        } else if !utils::ast::has_side_effects(e) {
-            if !need_cast {
-                utils::expr!(
-                    "if ({0}).is_null() {{
-                        &{1}[]
-                    }} else {{
-                        std::slice::from_raw_parts{2}(({0}){3}, 1_000_000)
-                    }}",
-                    pprust::expr_to_string(e),
-                    if m { "mut " } else { "" },
-                    if m { "_mut" } else { "" },
-                    cast_mut,
-                )
-            } else {
-                utils::expr!(
-                    "if ({0}).is_null() {{
-                        &{1}[]
-                    }} else {{
-                        std::slice::from_raw_parts{2}(({0}){3} as *{4} _, 1_000_000)
-                    }}",
-                    pprust::expr_to_string(e),
-                    if m { "mut " } else { "" },
-                    if m { "_mut" } else { "" },
-                    cast_mut,
-                    if m { "mut" } else { "const" },
-                )
-            }
-        } else if !need_cast {
             utils::expr!(
-                "{{
-                    let _x = {};
-                    if _x.is_null() {{
-                        &{}[]
-                    }} else {{
-                        std::slice::from_raw_parts{}(_x{}, 1_000_000)
-                    }}
+                "std::slice::from_raw_parts{}(({}) as *{} _, 1_000_000)",
+                if m { "_mut" } else { "" },
+                pprust::expr_to_string(e),
+                target_ptr,
+            )
+        } else if !utils::ast::has_side_effects(e) {
+            utils::expr!(
+                "if ({0}).is_null() {{
+                    &{1}[]
+                }} else {{
+                    std::slice::from_raw_parts{2}(({0}) as *{3} _, 1_000_000)
                 }}",
                 pprust::expr_to_string(e),
                 if m { "mut " } else { "" },
                 if m { "_mut" } else { "" },
-                cast_mut,
+                target_ptr,
             )
         } else {
             utils::expr!(
@@ -6752,14 +7314,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     if _x.is_null() {{
                         &{}[]
                     }} else {{
-                        std::slice::from_raw_parts{}(_x{} as *{} _, 1_000_000)
+                        std::slice::from_raw_parts{}(_x as *{} _, 1_000_000)
                     }}
                 }}",
                 pprust::expr_to_string(e),
                 if m { "mut " } else { "" },
                 if m { "_mut" } else { "" },
-                cast_mut,
-                if m { "mut" } else { "const" },
+                target_ptr,
             )
         }
     }
@@ -7447,6 +8008,21 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
     }
 
+    /// Whether the place `expr` is reached through a dereference of a raw-pointer local that
+    /// stays raw after rewriting.
+    fn place_derefs_raw_local(&self, expr: &hir::Expr<'tcx>) -> bool {
+        let PathOrDeref::Deref(hir_id) = self.behind_subscripts(expr) else {
+            return false;
+        };
+        let hir::ExprKind::Unary(UnOp::Deref, ptr) = hir_unwrap_subscript(expr).kind else {
+            return false;
+        };
+        self.tcx.typeck(ptr.hir_id.owner).expr_ty(ptr).is_raw_ptr()
+            && self
+                .effective_ptr_kind(hir_id)
+                .is_none_or(|kind| matches!(kind, PtrKind::Raw(_)))
+    }
+
     fn projected_base_mutability(&self, pe: &PtrExpr<'_, 'tcx>, fallback: bool) -> bool {
         match self.behind_subscripts(pe.hir_base) {
             PathOrDeref::Deref(hir_id) => self
@@ -7458,6 +8034,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn is_base_not_a_raw_ptr(&self, pe: &PtrExpr<'_, 'tcx>) -> bool {
+        // C flexible-array members are emitted by C2Rust as `[T; 0]` and their
+        // backing allocation extends past the nominal Rust field.  Treating
+        // such a field as a normal array would create an empty slice and lose
+        // the allocated tail.
+        if matches!(
+            pe.base_ty.kind(),
+            ty::TyKind::Array(_, len) if len.try_to_target_usize(self.tcx) == Some(0)
+        ) {
+            return false;
+        }
         match pe.base_kind {
             PtrExprBaseKind::Path(_) | PtrExprBaseKind::Alloca | PtrExprBaseKind::Array => true,
             PtrExprBaseKind::Other => match self.behind_subscripts(pe.hir_base) {
@@ -7521,7 +8107,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         );
                     } else if is_data_container || is_plain_slice {
                         // Base is a data container (Vec, array) — return a re-sliced expression.
-                        let base_str = pprust::expr_to_string(&e);
+                        let mut base_str = pprust::expr_to_string(&e);
+                        if is_plain_slice && !self.is_base_not_a_raw_ptr(pe) {
+                            base_str = format!("&{}({base_str})", if m { "mut " } else { "" });
+                        }
                         if is_array {
                             e = utils::expr!(
                                 "(&{}({}))[({}) as usize..]",
@@ -7820,6 +8409,59 @@ fn rewrite_bare_fn_inputs(
     used_slice_cursor
 }
 
+fn rewrite_aliased_bare_fn_inputs<'tcx>(
+    bare_fn: &mut rustc_ast::BareFnTy,
+    decisions: &[Option<PtrKind>],
+    input_tys: &[ty::Ty<'tcx>],
+    tcx: TyCtxt<'tcx>,
+) -> bool {
+    let mut used_slice_cursor = false;
+    for ((param, decision), input_ty) in
+        bare_fn.decl.inputs.iter_mut().zip(decisions).zip(input_tys)
+    {
+        let Some(kind) = decision else { continue };
+        if matches!(param.ty.kind, TyKind::Ptr(..)) {
+            continue;
+        }
+        let ty::TyKind::RawPtr(inner_ty, _) = input_ty.kind() else {
+            continue;
+        };
+        let inner_str = mir_ty_to_string(*inner_ty, tcx);
+        let new_ty = match kind {
+            PtrKind::Ref(m) => {
+                let m = if *m { "mut " } else { "" };
+                utils::ty!("&{m}{inner_str}")
+            }
+            PtrKind::OptRef(m) => {
+                let m = if *m { "mut " } else { "" };
+                utils::ty!("Option<&{m}{inner_str}>")
+            }
+            PtrKind::Slice(m) => {
+                let m = if *m { "mut " } else { "" };
+                utils::ty!("&{m}[{inner_str}]")
+            }
+            PtrKind::Raw(m) => {
+                let m = if *m { "mut" } else { "const" };
+                utils::ty!("*{m} {inner_str}")
+            }
+            PtrKind::Box => utils::ty!("Box<{inner_str}>"),
+            PtrKind::OptBox => utils::ty!("Option<Box<{inner_str}>>"),
+            PtrKind::BoxedSlice => utils::ty!("Box<[{inner_str}]>"),
+            PtrKind::OptBoxedSlice => utils::ty!("Option<Box<[{inner_str}]>>"),
+            PtrKind::SliceCursor(m) => {
+                used_slice_cursor = true;
+                if *m {
+                    utils::ty!("crate::slice_cursor::SliceCursorMut<'_, {inner_str}>")
+                } else {
+                    utils::ty!("crate::slice_cursor::SliceCursor<'_, {inner_str}>")
+                }
+            }
+        };
+        param.ty = P(new_ty);
+    }
+    used_slice_cursor
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PtrExprBaseKind {
     Path(Res),
@@ -7960,6 +8602,17 @@ fn combined_cursor_offset(projs: &[PtrExprProj<'_, '_>]) -> Option<Expr> {
         })
         .collect::<Option<Vec<_>>>()?;
     combined_offsets(&offsets, true)
+}
+
+fn combined_slice_offset(projs: &[PtrExprProj<'_, '_>]) -> Option<Expr> {
+    let offsets = projs
+        .iter()
+        .map(|proj| match proj {
+            PtrExprProj::Offset(offset) => Some(*offset),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    combined_offsets(&offsets, false)
 }
 
 #[derive(Default)]
@@ -8666,6 +9319,17 @@ fn ty_is_byte_sized_raw_inner(ty: ty::Ty<'_>) -> bool {
     matches!(
         ty.kind(),
         ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8)
+    )
+}
+
+fn immutable_byte_str_slice<'tcx>(tcx: TyCtxt<'tcx>, expr: &Expr, inner_ty: ty::Ty<'tcx>) -> Expr {
+    let expr = pprust::expr_to_string(expr);
+    let inner_ty = mir_ty_to_string(inner_ty, tcx);
+    utils::expr!(
+        "unsafe {{ std::slice::from_raw_parts(({}).as_ptr() as *const {}, ({}).len()) }}",
+        expr,
+        inner_ty,
+        expr,
     )
 }
 
@@ -10749,6 +11413,38 @@ fn downgrade_freed_borrow_outputs(
     changed
 }
 
+fn downgrade_nullable_struct_inputs_tied_to_borrow_outputs(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+) -> bool {
+    let mut changed = false;
+    for (&did, sig_dec) in &mut sig_decs.data {
+        if sig_dec.signature_locked || !sig_dec.output_dec.is_some_and(is_borrow_like_decision) {
+            continue;
+        }
+        let Some(output_lifetime) = sig_dec.output_lifetime else {
+            continue;
+        };
+        let fn_sig = tcx.fn_sig(did).skip_binder().skip_binder();
+        for (idx, input_ty) in fn_sig.inputs().iter().copied().enumerate() {
+            if sig_dec.input_lifetimes.get(idx).copied().flatten() != Some(output_lifetime)
+                || !matches!(sig_dec.input_decs.get(idx), Some(Some(PtrKind::OptRef(_))))
+            {
+                continue;
+            }
+            let Some((pointee_ty, mutability)) = unwrap_ptr_from_mir_ty(input_ty) else {
+                continue;
+            };
+            if !matches!(pointee_ty.kind(), ty::TyKind::Adt(..)) {
+                continue;
+            }
+            sig_dec.set_input_dec(idx, Some(PtrKind::Raw(mutability.is_mut())));
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn fn_output_may_return_input(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {
     let sig = tcx.fn_sig(did).skip_binder().skip_binder();
     let input_len = sig.inputs().len();
@@ -10882,6 +11578,114 @@ fn downgrade_raw_cast_call_inputs(
     changed
 }
 
+/// Keeps a callee parameter raw when a call passes a pointer cast to a pointee
+/// with larger alignment (e.g. a byte buffer passed as `p as *mut u16`). The
+/// promoted parameter would need a `bytemuck` cast that panics on misaligned
+/// addresses or uneven lengths.
+fn downgrade_upcast_call_inputs(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+) -> FxHashSet<(LocalDefId, usize)> {
+    struct UpcastCallVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        changed: FxHashSet<(LocalDefId, usize)>,
+    }
+
+    impl<'tcx> UpcastCallVisitor<'_, 'tcx> {
+        fn is_upcast_arg(
+            &self,
+            typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+            arg: &'tcx hir::Expr<'tcx>,
+        ) -> bool {
+            let Some((target_ty, _)) = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(arg)) else {
+                return false;
+            };
+            let mut source = arg;
+            while let hir::ExprKind::Cast(inner, _) | hir::ExprKind::DropTemps(inner) = source.kind
+                && unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(inner)).is_some()
+            {
+                source = inner;
+            }
+            if source.hir_id == arg.hir_id {
+                return false;
+            }
+            let Some((source_ty, _)) = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(source))
+            else {
+                return false;
+            };
+            if source_ty.is_c_void(self.tcx) {
+                return false;
+            }
+            let typing_env = ty::TypingEnv::post_analysis(self.tcx, arg.hir_id.owner.to_def_id());
+            let (Ok(source_layout), Ok(target_layout)) = (
+                self.tcx.layout_of(typing_env.as_query_input(source_ty)),
+                self.tcx.layout_of(typing_env.as_query_input(target_ty)),
+            ) else {
+                return false;
+            };
+            target_layout.align.abi > source_layout.align.abi
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for UpcastCallVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            let hir::ExprKind::Call(_, args) = expr.kind else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+            let Some(callee_did) = hir_called_local_fn(self.tcx, expr) else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+            let typeck = self.tcx.typeck(expr.hir_id.owner);
+            for (idx, arg) in args.iter().enumerate() {
+                if !self.is_upcast_arg(typeck, arg) {
+                    continue;
+                }
+                let Some((_, mutability)) = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(arg))
+                else {
+                    continue;
+                };
+                let Some(sig_dec) = self.sig_decs.data.get_mut(&callee_did) else {
+                    break;
+                };
+                if sig_dec.signature_locked {
+                    break;
+                }
+                let raw = PtrKind::Raw(mutability.is_mut());
+                if sig_dec.input_decs.get(idx).copied().flatten() != Some(raw) {
+                    sig_dec.set_input_dec(idx, Some(raw));
+                    self.changed.insert((callee_did, idx));
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut changed = FxHashSet::default();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body);
+        let mut visitor = UpcastCallVisitor {
+            tcx,
+            sig_decs,
+            changed: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        changed.extend(visitor.changed);
+    }
+    changed
+}
+
 fn downgrade_cursor_inputs_from_unanchored_raw_callers(
     tcx: TyCtxt<'_>,
     sig_decs: &mut SigDecisions,
@@ -10925,7 +11729,7 @@ fn downgrade_cursor_inputs_from_unanchored_raw_callers(
                         else {
                             return None;
                         };
-                        if !callee_input_has_syntactic_negative_offset(self.tcx, callee_did, idx) {
+                        if !callee_input_may_offset_backward(self.tcx, callee_did, idx) {
                             return None;
                         }
                         hir_expr_is_unanchored_raw_pointer_arg(
@@ -10983,11 +11787,7 @@ fn downgrade_cursor_inputs_from_unanchored_raw_callers(
     changed
 }
 
-fn callee_input_has_syntactic_negative_offset(
-    tcx: TyCtxt<'_>,
-    did: LocalDefId,
-    idx: usize,
-) -> bool {
+fn callee_input_may_offset_backward(tcx: TyCtxt<'_>, did: LocalDefId, idx: usize) -> bool {
     let Some(param_hir_id) = callee_input_param_binding(tcx, did, idx) else {
         return false;
     };
@@ -11007,9 +11807,10 @@ fn callee_input_has_syntactic_negative_offset(
                 && hir_unwrapped_local_id(receiver) == Some(self.param_hir_id)
                 && match seg.ident.name.as_str() {
                     "sub" | "wrapping_sub" => true,
-                    "offset" | "wrapping_offset" => args
-                        .first()
-                        .is_some_and(|arg| hir_expr_is_syntactically_negative(self.tcx, arg)),
+                    "offset" | "wrapping_offset" => args.first().is_some_and(|arg| {
+                        hir_expr_is_syntactically_negative(self.tcx, arg)
+                            || !hir_expr_is_definitely_nonnegative_offset(self.tcx, arg)
+                    }),
                     _ => false,
                 }
             {
@@ -11047,6 +11848,24 @@ fn hir_expr_is_syntactically_negative(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> 
         .span_to_snippet(expr.span)
         .ok()
         .is_some_and(|snippet| snippet.trim_start().starts_with('-'))
+}
+
+fn hir_expr_is_definitely_nonnegative_offset(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    let expr = hir_unwrap_casts(expr);
+    if matches!(expr.kind, hir::ExprKind::Lit(_)) {
+        return !hir_expr_is_syntactically_negative(tcx, expr);
+    }
+    let ty = tcx.typeck(expr.hir_id.owner).expr_ty(expr);
+    ty.is_integral() && !ty.is_signed()
+}
+
+fn ast_expr_is_syntactically_negative(expr: &Expr) -> bool {
+    let expr = unwrap_paren(expr);
+    match &expr.kind {
+        ExprKind::Unary(UnOp::Neg, _) => true,
+        ExprKind::Cast(inner, _) => ast_expr_is_syntactically_negative(inner),
+        _ => false,
+    }
 }
 
 fn collect_unanchored_raw_pointer_locals(
@@ -11174,7 +11993,9 @@ fn hir_expr_is_unanchored_raw_pointer_source(
                 hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, receiver)
             }
             "as_ptr" | "as_mut_ptr" => {
-                if hir_expr_ty_is_raw_ptr(tcx, receiver) {
+                if hir_expr_ty_is_slice_or_array(tcx, receiver) {
+                    false
+                } else if hir_expr_ty_is_raw_ptr(tcx, receiver) {
                     hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, receiver)
                 } else {
                     false
@@ -11196,6 +12017,25 @@ fn is_cursor_anchor_decision(kind: PtrKind) -> bool {
 
 fn hir_expr_ty_is_raw_ptr(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
     unwrap_ptr_from_mir_ty(tcx.typeck(expr.hir_id.owner).expr_ty_adjusted(expr)).is_some()
+}
+
+fn is_noop_pointer_offset_expr(expr: &Expr) -> bool {
+    let expr = unwrap_cast_and_paren(expr);
+    let ExprKind::MethodCall(call) = &expr.kind else {
+        return false;
+    };
+    call.seg.ident.name.as_str() == "offset"
+        && call
+            .args
+            .first()
+            .is_some_and(|receiver| matches!(unwrap_paren(receiver).kind, ExprKind::Path(..)))
+}
+
+fn is_offset_by_method_call(expr: &Expr) -> bool {
+    matches!(
+        &unwrap_cast_and_paren(expr).kind,
+        ExprKind::MethodCall(call) if call.seg.ident.name.as_str() == "offset_by"
+    )
 }
 
 fn raw_pointer_map_or_closure_body<'a, 'tcx>(
@@ -11251,13 +12091,18 @@ fn hir_expr_uses_non_pointer_local(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> boo
 }
 
 fn hir_expr_ty_is_slice_or_array(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
-    match tcx.typeck(expr.hir_id.owner).expr_ty_adjusted(expr).kind() {
-        ty::TyKind::Array(..) | ty::TyKind::Slice(..) => true,
-        ty::TyKind::Ref(_, inner, _) => {
-            matches!(inner.kind(), ty::TyKind::Array(..) | ty::TyKind::Slice(..))
+    fn is_slice_or_array(ty: ty::Ty<'_>) -> bool {
+        match ty.kind() {
+            ty::TyKind::Array(..) | ty::TyKind::Slice(..) => true,
+            ty::TyKind::Ref(_, inner, _) => {
+                matches!(inner.kind(), ty::TyKind::Array(..) | ty::TyKind::Slice(..))
+            }
+            _ => false,
         }
-        _ => false,
     }
+
+    let typeck = tcx.typeck(expr.hir_id.owner);
+    is_slice_or_array(typeck.expr_ty(expr)) || is_slice_or_array(typeck.expr_ty_adjusted(expr))
 }
 
 fn downgrade_unsupported_box_outputs<'tcx>(
@@ -13462,7 +14307,36 @@ fn collect_raw_call_result_bindings(
             {
                 self.bindings.insert(hir_id);
             }
+            match expr.kind {
+                hir::ExprKind::Match(scrutinee, arms, _)
+                    if hir_is_call_result(self.tcx, scrutinee) =>
+                {
+                    for arm in arms {
+                        self.insert_pattern_bindings(arm.pat);
+                    }
+                }
+                hir::ExprKind::Let(let_expr) if hir_is_call_result(self.tcx, let_expr.init) => {
+                    self.insert_pattern_bindings(let_expr.pat);
+                }
+                _ => {}
+            }
             intravisit::walk_expr(self, expr);
+        }
+    }
+
+    impl RawCallResultVisitor<'_, '_> {
+        // A binding nested in a pattern over a call result (`Ok(v)`, `Some(v)`) takes the
+        // callee's payload type, which is never rewritten.
+        fn insert_pattern_bindings(&mut self, pat: &hir::Pat<'_>) {
+            if matches!(pat.kind, hir::PatKind::Binding(..)) {
+                return;
+            }
+            let typeck = self.tcx.typeck(pat.hir_id.owner);
+            pat.each_binding(|_, hir_id, _, _| {
+                if typeck.node_type(hir_id).is_raw_ptr() {
+                    self.bindings.insert(hir_id);
+                }
+            });
         }
     }
 
@@ -13489,6 +14363,41 @@ fn collect_raw_call_result_bindings(
         bindings.extend(visitor.bindings);
     }
     bindings
+}
+
+/// Whether `expr` is a call, possibly through block tails, tuple fields, and a local
+/// initialized by the call (e.g., `{ let rv = f(); rv }` or `rv.1` after `let rv = f()`).
+fn hir_is_call_result(tcx: TyCtxt<'_>, mut expr: &hir::Expr<'_>) -> bool {
+    loop {
+        match expr.kind {
+            hir::ExprKind::Block(
+                hir::Block {
+                    expr: Some(tail), ..
+                },
+                _,
+            ) => expr = tail,
+            hir::ExprKind::Field(base, _)
+                if matches!(
+                    tcx.typeck(base.hir_id.owner).expr_ty(base).kind(),
+                    ty::TyKind::Tuple(_)
+                ) =>
+            {
+                expr = base
+            }
+            hir::ExprKind::Call(..) => return true,
+            hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+                let Res::Local(hir_id) = path.res else {
+                    return false;
+                };
+                return matches!(
+                    tcx.parent_hir_node(hir_id),
+                    hir::Node::LetStmt(hir::LetStmt { init: Some(init), .. })
+                        if matches!(init.kind, hir::ExprKind::Call(..))
+                );
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn collect_raw_local_assignment_bindings(
@@ -14224,6 +15133,71 @@ fn collect_demoted_promoted_fields(
         sig_decs,
         ptr_kinds,
     );
+    let bitfield_structs = tcx
+        .hir_free_items()
+        .filter_map(|item_id| {
+            let item = tcx.hir_item(item_id);
+            let hir::ItemKind::Impl(impl_) = item.kind else {
+                return None;
+            };
+            if impl_.of_trait.is_some()
+                || !tcx.is_automatically_derived(item_id.owner_id.def_id.to_def_id())
+            {
+                return None;
+            }
+            let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = impl_.self_ty.kind else {
+                return None;
+            };
+            let Res::Def(_, did) = path.res else {
+                return None;
+            };
+            did.as_local()
+        })
+        .collect::<FxHashSet<_>>();
+    for bitfield_struct in bitfield_structs {
+        let mut visiting = FxHashSet::default();
+        collect_promoted_fields_in_union_storage(
+            tcx,
+            tcx.type_of(bitfield_struct).skip_binder(),
+            &promoted_fields,
+            &mut demoted_fields,
+            &mut visiting,
+        );
+    }
+    struct CrossStructPointerCastVisitor<'a, 'tcx> {
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        promoted_fields: &'a FxHashSet<StructFieldSlot>,
+        demoted_fields: FxHashSet<StructFieldSlot>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for CrossStructPointerCastVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Cast(inner, _) = expr.kind
+                && let Some((from_ty, _)) = unwrap_ptr_from_mir_ty(self.typeck.expr_ty(inner))
+                && let Some((to_ty, _)) = unwrap_ptr_from_mir_ty(self.typeck.expr_ty(expr))
+                && let Some(from_did) = hir_local_struct_did_from_ty(from_ty)
+                && let Some(to_did) = hir_local_struct_did_from_ty(to_ty)
+                && from_did != to_did
+            {
+                self.demoted_fields.extend(
+                    self.promoted_fields
+                        .iter()
+                        .filter(|field| field.struct_did == from_did || field.struct_did == to_did)
+                        .copied(),
+                );
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    for_each_hir_fn_body(tcx, |body, typeck| {
+        let mut visitor = CrossStructPointerCastVisitor {
+            typeck,
+            promoted_fields: &promoted_fields,
+            demoted_fields: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        demoted_fields.extend(visitor.demoted_fields);
+    });
     demoted_fields.extend(
         collect_field_conflict_demotion_reasons(tcx, analysis, sig_decs, ptr_kinds)
             .keys()
@@ -14247,11 +15221,12 @@ enum ConflictDemotionReason {
     RawBindingFromField,
     RawLocalCallArg,
     RawUnknownCallArg,
+    AddressTakenNestedPointer,
 }
 
 impl ConflictDemotionReason {
     #[allow(dead_code)]
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::ActiveBorrowOverlap,
         Self::LocalAssignmentWhileBorrowed,
         Self::ConflictingReborrow,
@@ -14263,6 +15238,7 @@ impl ConflictDemotionReason {
         Self::RawBindingFromField,
         Self::RawLocalCallArg,
         Self::RawUnknownCallArg,
+        Self::AddressTakenNestedPointer,
     ];
 
     #[allow(dead_code)]
@@ -14279,6 +15255,7 @@ impl ConflictDemotionReason {
             Self::RawBindingFromField => "raw_binding_from_field",
             Self::RawLocalCallArg => "raw_local_call_arg",
             Self::RawUnknownCallArg => "raw_unknown_call_arg",
+            Self::AddressTakenNestedPointer => "address_taken_nested_pointer",
         }
     }
 }
@@ -14660,6 +15637,17 @@ fn collect_field_conflict_demotion_reasons(
             };
             for arg in args.iter() {
                 self.record_moved_mutable_fields_from_raw_pointee_arg(arg);
+                // rewriting only the outer `*mut *const T` parameter produces
+                // `&mut *const T`; it cannot accept the address of a field that
+                // was independently promoted to a slice or reference.
+                if let ty::TyKind::RawPtr(inner_ty, _) = self.typeck.expr_ty_adjusted(arg).kind()
+                    && inner_ty.is_raw_ptr()
+                {
+                    self.record_promoted_fields_in_expr(
+                        arg,
+                        ConflictDemotionReason::AddressTakenNestedPointer,
+                    );
+                }
             }
         }
 
@@ -14814,12 +15802,16 @@ fn collect_raw_field_source_bindings(
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         promoted_fields: &'a FxHashSet<StructFieldSlot>,
         demoted_fields: &'a FxHashSet<StructFieldSlot>,
+        raw_field_locals: FxHashSet<HirId>,
         bindings: FxHashSet<HirId>,
         callees: FxHashSet<LocalDefId>,
     }
 
     impl<'tcx> DemotedFieldSourceVisitor<'_, 'tcx> {
         fn field_stays_raw(&self, field: StructFieldSlot) -> bool {
+            if self.promoted_fields.contains(&field) && !self.demoted_fields.contains(&field) {
+                return false;
+            }
             if scalar_owning_raw_field_inner_ty(self.tcx, self.analysis, field).is_some() {
                 return ownership_field_ptr_kind(
                     self.tcx,
@@ -14862,9 +15854,26 @@ fn collect_raw_field_source_bindings(
                 self.bindings.insert(hir_id);
             }
         }
+
+        fn rhs_reads_raw_field(&self, rhs: &'tcx hir::Expr<'tcx>) -> bool {
+            hir_struct_field_slot(self.tcx, hir_unwrap_casts(rhs))
+                .is_some_and(|field| self.field_stays_raw(field))
+        }
     }
 
     impl<'tcx> Visitor<'tcx> for DemotedFieldSourceVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+                && tcx_node_ty_is_raw_ptr(self.tcx, hir_id)
+                && self.rhs_reads_raw_field(init)
+            {
+                self.raw_field_locals.insert(hir_id);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
         fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
             match expr.kind {
                 hir::ExprKind::Struct(qpath, fields, _) => {
@@ -14887,10 +15896,35 @@ fn collect_raw_field_source_bindings(
                     }
                 }
                 hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if let Some(hir_id) = hir_unwrapped_local_id(lhs)
+                        && tcx_node_ty_is_raw_ptr(self.tcx, hir_id)
+                        && self.rhs_reads_raw_field(rhs)
+                    {
+                        self.raw_field_locals.insert(hir_id);
+                    }
                     if let Some(slot) = hir_struct_field_slot(self.tcx, lhs)
                         && self.field_stays_raw(slot)
                     {
                         self.record_rhs(rhs);
+                    }
+                }
+                hir::ExprKind::MethodCall(seg, receiver, args, _)
+                    if matches!(
+                        seg.ident.name.as_str(),
+                        "offset"
+                            | "add"
+                            | "sub"
+                            | "wrapping_offset"
+                            | "wrapping_add"
+                            | "wrapping_sub"
+                    ) && hir_unwrapped_local_id(receiver)
+                        .is_some_and(|hir_id| self.raw_field_locals.contains(&hir_id))
+                        && args.first().is_some_and(|arg| {
+                            !matches!(hir_unwrap_casts(arg).kind, hir::ExprKind::Lit(_))
+                        }) =>
+                {
+                    if let Some(hir_id) = hir_unwrapped_local_id(receiver) {
+                        self.bindings.insert(hir_id);
                     }
                 }
                 _ => {}
@@ -14910,6 +15944,7 @@ fn collect_raw_field_source_bindings(
             ptr_kinds,
             promoted_fields: &promoted_fields,
             demoted_fields,
+            raw_field_locals: FxHashSet::default(),
             bindings: FxHashSet::default(),
             callees: FxHashSet::default(),
         };
@@ -15613,6 +16648,36 @@ fn collect_struct_shape_demoted_field_reasons(
         }
     }
 
+    for union_did in tcx.hir_crate(()).owners.iter().filter_map(|owner| {
+        let owner = owner.as_owner()?;
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            return None;
+        };
+        matches!(item.kind, hir::ItemKind::Union(..)).then_some(item.owner_id.def_id)
+    }) {
+        let union_ty = tcx.type_of(union_did).skip_binder();
+        let ty::TyKind::Adt(union_def, args) = union_ty.kind() else {
+            continue;
+        };
+        let mut union_demoted = FxHashSet::default();
+        let mut visiting = FxHashSet::default();
+        for field in union_def.all_fields() {
+            collect_promoted_fields_in_union_storage(
+                tcx,
+                field.ty(tcx, args),
+                promoted_fields,
+                &mut union_demoted,
+                &mut visiting,
+            );
+        }
+        for field in union_demoted {
+            demoted
+                .entry(field)
+                .or_default()
+                .insert(DecisionReason::BorrowFieldShapeUnionStorage);
+        }
+    }
+
     demoted
 }
 
@@ -15671,6 +16736,7 @@ fn conflict_reason_to_decision_reason(reason: ConflictDemotionReason) -> Decisio
         ConflictDemotionReason::RawBindingFromField => DecisionReason::RawBindingFromField,
         ConflictDemotionReason::RawLocalCallArg => DecisionReason::RawLocalCallArg,
         ConflictDemotionReason::RawUnknownCallArg => DecisionReason::RawUnknownCallArg,
+        ConflictDemotionReason::AddressTakenNestedPointer => DecisionReason::RawLocalCallArg,
     }
 }
 
@@ -15831,6 +16897,65 @@ fn collect_promoted_fields_in_by_value_ty(
         }
         ty::TyKind::Array(ty, _) | ty::TyKind::Slice(ty) => {
             collect_promoted_fields_in_by_value_ty(*ty, promoted_fields, demoted);
+        }
+        _ => {}
+    }
+}
+
+fn collect_promoted_fields_in_union_storage<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    promoted_fields: &FxHashSet<StructFieldSlot>,
+    demoted: &mut FxHashSet<StructFieldSlot>,
+    visiting: &mut FxHashSet<LocalDefId>,
+) {
+    match ty.kind() {
+        ty::TyKind::RawPtr(inner, _)
+        | ty::TyKind::Ref(_, inner, _)
+        | ty::TyKind::Slice(inner)
+        | ty::TyKind::Array(inner, _) => {
+            collect_promoted_fields_in_union_storage(
+                tcx,
+                *inner,
+                promoted_fields,
+                demoted,
+                visiting,
+            );
+        }
+        ty::TyKind::Adt(adt_def, args) if adt_def.did().is_local() => {
+            let did = adt_def.did().expect_local();
+            if !visiting.insert(did) {
+                return;
+            }
+            if adt_def.is_struct() && !adt_def.is_union() {
+                demoted.extend(
+                    promoted_fields
+                        .iter()
+                        .copied()
+                        .filter(|field| field.struct_did == did),
+                );
+            }
+            for field in adt_def.all_fields() {
+                collect_promoted_fields_in_union_storage(
+                    tcx,
+                    field.ty(tcx, args),
+                    promoted_fields,
+                    demoted,
+                    visiting,
+                );
+            }
+            visiting.remove(&did);
+        }
+        ty::TyKind::Tuple(tys) => {
+            for ty in tys.iter() {
+                collect_promoted_fields_in_union_storage(
+                    tcx,
+                    ty,
+                    promoted_fields,
+                    demoted,
+                    visiting,
+                );
+            }
         }
         _ => {}
     }
@@ -16279,15 +17404,10 @@ fn is_slice_ref_expr(expr: &Expr) -> bool {
 }
 
 fn opt_ref_receiver_should_borrow(expr: &Expr) -> bool {
-    match &unwrap_paren(expr).kind {
-        ExprKind::Path(..) | ExprKind::Field(..) | ExprKind::Index(..) => true,
-        ExprKind::MethodCall(call)
-            if matches!(call.seg.ident.name.as_str(), "as_deref" | "as_deref_mut") =>
-        {
-            true
-        }
-        _ => false,
-    }
+    matches!(
+        &unwrap_paren(expr).kind,
+        ExprKind::Path(..) | ExprKind::Field(..) | ExprKind::Index(..)
+    )
 }
 
 fn hoist_opt_ref_borrow(expr: &mut Expr) {

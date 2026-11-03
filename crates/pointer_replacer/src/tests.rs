@@ -17,6 +17,28 @@ fn rewrite_array_local_provenance_with_config(code: &str, config: &Config) -> (S
     .unwrap()
 }
 
+fn run_gated_prepasses_then_pointer(code: &str, config: &Config) -> (GatedPrepassResult, String) {
+    let gated = run_gated_pointer_prepasses(config, code);
+    let (final_source, _) = rewrite_with_config(&gated.source, config);
+    (gated, final_source)
+}
+
+fn rewrite_array_local_provenance_with_allowlist(
+    code: &str,
+    accepted: Option<&rustc_hash::FxHashSet<crate::rewriter::profitability::CandidateId>>,
+    lineage: &crate::rewriter::profitability::LineageCatalog,
+) -> crate::rewriter::array_local_index_rewriter::ArrayLocalRewriteResult {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_with_allowlist(
+            &Config::default(),
+            tcx,
+            accepted,
+            lineage,
+        )
+    })
+    .unwrap()
+}
+
 fn array_local_trace_events(code: &str) -> Vec<crate::rewriter::array_local_trace::TraceEvent> {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true).1
@@ -1140,6 +1162,53 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 #[test]
+fn test_rewriter_removes_noop_path_statement_after_pointer_update() {
+    run_test(
+        r#"
+pub unsafe fn fill(mut values: *mut i32) {
+    loop {
+        *values = 1;
+        values = values.offset(1);
+        values;
+        if *values == 0 { break; }
+    }
+}
+"#,
+        &["values ="],
+        &["values;", "(values).offset"],
+    );
+}
+
+#[test]
+fn test_rewriter_reborrows_mutable_optional_ref_copied_before_reuse() {
+    run_test(
+        r#"
+pub struct Node {
+    pub next: *mut Node,
+}
+
+extern "C" {
+    fn alloc_node() -> *mut Node;
+}
+
+pub unsafe fn append(root: *mut Node) -> *mut Node {
+    if root.is_null() {
+        return alloc_node();
+    }
+    let mut alias = root;
+    while !(*alias).next.is_null() {
+        alias = (*alias).next;
+    }
+    (*alias).next = append((*alias).next);
+    root
+}
+"#,
+        &["let mut alias: Option<&mut crate::Node> = (root).as_mut()"],
+        &["let mut alias: Option<&mut crate::Node> = root;"],
+    );
+}
+
+#[test]
 fn test_non_null_param_to_ref() {
     run_test(
         r#"
@@ -1776,8 +1845,8 @@ pub unsafe fn make_buf(len: usize) -> *mut core::ffi::c_char {
 "#,
         &[
             "pub unsafe fn make_buf(len: usize) -> Box<[i8]>",
-            ".take(((1) * (len) /",
-            "std::mem::size_of::<i8>()) as",
+            ".wrapping_mul((len) as usize)",
+            "std::mem::size_of::<i8>())",
         ],
         &["Box::leak(", "Box::into_raw(", "calloc(1, len)"],
     );
@@ -1808,6 +1877,25 @@ pub unsafe fn foo() -> *mut i32 {
             "Box::into_raw(",
             "malloc(4 * std::mem::size_of::<i32>())",
         ],
+    );
+}
+
+#[test]
+fn test_rewriter_casts_wide_malloc_byte_count_before_size_division() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: u64) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn make_buf(len: u64) -> *mut i8 {
+    let p: *mut i8 = malloc(len) as *mut i8;
+    *p.offset(1) = 7;
+    p
+}
+"#,
+        &["(len) as usize", "std::mem::size_of::<i8>()"],
+        &["(len) / std::mem::size_of::<i8>()"],
     );
 }
 
@@ -2374,8 +2462,8 @@ pub unsafe fn clear_list(head: *mut Node) {
 }
         "#,
         &[
-            "let mut x: *mut crate::Node<'a> =",
-            "let mut y: *mut crate::Node<'a> = std::ptr::null_mut();",
+            "let mut x: *mut crate::Node<'_> =",
+            "let mut y: *mut crate::Node<'_> = std::ptr::null_mut();",
         ],
         &["Option<&crate::Node>"],
     );
@@ -4337,6 +4425,426 @@ pub unsafe fn hold(nodes: &Vec<Node>) -> usize {
 }
 
 #[test]
+fn test_rewriter_propagates_lifetime_through_nested_struct_value() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+}
+
+pub unsafe fn touch_inner(mut x: i32) -> i32 {
+    let mut inner = Inner { value: &raw mut x };
+    *inner.value = 7;
+    x
+}
+
+pub fn outer_size() -> usize {
+    std::mem::size_of::<Outer>()
+}
+"#,
+        &[
+            "pub struct Inner<'a>",
+            "pub struct Outer<'a>",
+            "pub inner: Inner<'a>",
+            "size_of::<Outer<'_>>()",
+        ],
+        &["pub inner: Inner<'_>"],
+    );
+}
+
+#[test]
+fn test_rewriter_updates_impl_for_struct_with_dependent_lifetime() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+}
+
+impl Copy for Inner {}
+impl Clone for Inner {
+    fn clone(&self) -> Self { *self }
+}
+impl Copy for Outer {}
+impl Clone for Outer {
+    fn clone(&self) -> Self { *self }
+}
+
+pub unsafe fn read() -> i32 {
+    let x = 7;
+    let inner = Inner { value: &raw const x };
+    *inner.value
+}
+"#,
+        &[
+            "impl<'a> Copy for Outer<'a>",
+            "impl<'a> Clone for Outer<'a>",
+        ],
+        &["impl Copy for Outer {"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_unrelated_struct_parameter_lifetimes_independent() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Left {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct Right {
+    pub data: *const u8,
+}
+
+pub unsafe fn seed() -> u8 {
+    let value = 7;
+    let left = Left { data: &raw const value };
+    let right = Right { data: &raw const value };
+    *left.data + *right.data
+}
+
+pub unsafe fn sum(left: *const Left, right: *const Right) -> u8 {
+    *(*left).data + *(*right).data
+}
+"#,
+        &[
+            "left: &crate::Left<'a>",
+            "right: &crate::Right<'crat_inner_1>",
+        ],
+        &["fn sum<'a>"],
+    );
+}
+
+#[test]
+fn test_rewriter_ties_promoted_struct_lifetimes_for_pointer_comparison() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn seed() -> i32 {
+    let mut value = 7;
+    let holder = Holder { data: &raw mut value };
+    *holder.data
+}
+
+pub unsafe fn same(a: *mut Holder, b: *mut Holder) -> bool {
+    a == b
+}
+"#,
+        &[
+            "fn same<'crat>",
+            "a: Option<&crate::Holder<'crat>>",
+            "b: Option<&crate::Holder<'crat>>",
+        ],
+        &["'crat_inner_1"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_fields_reachable_from_union_storage_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub data: *mut i32,
+}
+impl Copy for Inner {}
+impl Clone for Inner { fn clone(&self) -> Self { *self } }
+
+#[repr(C)]
+pub struct Wrapper {
+    pub inner: Inner,
+}
+impl Copy for Wrapper {}
+impl Clone for Wrapper { fn clone(&self) -> Self { *self } }
+
+#[repr(C)]
+pub union Storage {
+    pub wrapper: Wrapper,
+    pub bits: usize,
+}
+impl Copy for Storage {}
+impl Clone for Storage { fn clone(&self) -> Self { *self } }
+
+pub unsafe fn read(wrapper: *mut Wrapper) -> i32 {
+    *(*wrapper).inner.data
+}
+"#,
+        &["pub data: *mut i32", "pub union Storage"],
+        &["pub struct Inner<'", "Option<&mut i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_ties_slice_parameter_to_stored_struct_field_lifetime() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Reader {
+    pub data: *const u8,
+}
+
+pub unsafe fn init(reader: *mut Reader, data: *const u8) -> u8 {
+    (*reader).data = data;
+    *(*reader).data.offset(0)
+}
+"#,
+        &[
+            "fn init<'crat>",
+            "reader: &mut crate::Reader<'crat>",
+            "data: &'crat [u8]",
+        ],
+        &["Reader<'_>, mut data: &'crat"],
+    );
+}
+
+#[test]
+fn test_rewriter_ties_whole_struct_assignment_parameter_lifetimes() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub data: *const i32,
+}
+
+impl Copy for State {}
+impl Clone for State {
+    fn clone(&self) -> Self { *self }
+}
+
+pub unsafe fn seed() -> i32 {
+    let value = 7;
+    let state = State { data: &raw const value };
+    *state.data
+}
+
+pub unsafe fn copy(dest: *mut State, source: *const State) {
+    *dest = *source;
+}
+"#,
+        &[
+            "fn copy<'crat>",
+            "dest: &mut crate::State<'crat>",
+            "source: &crate::State<'crat>",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_related_parameters_use_return_lifetime() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Matrix {
+    pub values: [f32; 4],
+}
+
+pub unsafe fn assign(out: *mut Matrix, input: *const Matrix) -> *mut Matrix {
+    if out != input as *mut Matrix {
+        (*out).values = (*input).values;
+    }
+    out
+}
+"#,
+        &[
+            "fn assign<'a>",
+            "out: &'a mut crate::Matrix",
+            "input: Option<&'a crate::Matrix>",
+            "-> &'a mut crate::Matrix",
+        ],
+        &["'crat"],
+    );
+}
+
+#[test]
+fn test_rewriter_does_not_tie_snapshot_to_unpromoted_raw_source_field() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Reader {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct Snapshot {
+    pub data: *const u8,
+}
+
+unsafe fn advance_pointer(data: *mut *const u8) {
+    *data = (*data).offset(1);
+}
+
+pub unsafe fn advance(reader: *mut Reader) {
+    advance_pointer(&mut (*reader).data);
+}
+
+pub unsafe fn save(from: *const Reader, to: *mut Snapshot) {
+    (*to).data = (*from).data;
+}
+
+pub unsafe fn read(reader: *mut Reader) -> u8 {
+    let mut snapshot = Snapshot { data: std::ptr::null() };
+    save(reader, &raw mut snapshot);
+    advance(reader);
+    *snapshot.data
+}
+"#,
+        &["pub data: *const u8", "pub struct Snapshot<'"],
+        &[],
+    );
+}
+
+#[test]
+fn test_mutable_array_field_projection_through_promoted_struct_parameter() {
+    run_test(
+        r#"
+pub struct State {
+    pub values: [u32; 4],
+}
+
+pub unsafe fn initialize(state: *mut State) {
+    let p: *mut u32 = &mut *((*state).values.as_mut_ptr().offset(1));
+    *p = 7;
+}
+"#,
+        &["state: &mut crate::State"],
+        &["&mut ((*&*(state)).values)"],
+    );
+}
+
+#[test]
+fn test_shared_view_of_optional_mut_reference_does_not_reborrow_temporary() {
+    run_test(
+        r#"
+pub struct Queue {
+    pub values: [i32; 2],
+}
+
+unsafe fn first(queue: *const Queue) -> *const i32 {
+    (*queue).values.as_ptr()
+}
+
+unsafe fn update(queue: *mut Queue) {
+    (*queue).values[1] = 2;
+}
+
+pub unsafe fn read(queue: *mut Queue) -> i32 {
+    update(queue);
+    let value = first(queue);
+    *value
+}
+"#,
+        &[],
+        &[".as_deref()).as_deref()"],
+    );
+}
+
+#[test]
+fn test_nullable_struct_input_returning_interior_pointer_stays_raw() {
+    run_test(
+        r#"
+pub struct State {
+    pub values: [i32; 4],
+}
+
+pub unsafe fn first(state: *mut State) -> *mut i32 {
+    if state.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*state).values.as_mut_ptr()
+}
+"#,
+        &["state: *mut crate::State"],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_adds_named_lifetime_to_promoted_struct_alias() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub value: *mut i32,
+}
+
+pub type HolderAlias = Holder;
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let holder: HolderAlias = Holder { value: &raw mut x };
+    *holder.value
+}
+"#,
+        &[
+            "pub type HolderAlias<'a> = Holder<'a>",
+            "let holder: HolderAlias<'_>",
+        ],
+        &["pub type HolderAlias = Holder<'_>"],
+    );
+}
+
+#[test]
+fn test_rewriter_transforms_struct_literal_through_type_alias_constructor() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub value: *mut i32,
+}
+
+pub type HolderAlias = Holder;
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let mut holder = Holder { value: &raw mut x };
+    *holder.value = 7;
+    x
+}
+
+pub fn empty() {
+    let _holder: HolderAlias = HolderAlias { value: std::ptr::null_mut() };
+}
+"#,
+        &["HolderAlias { value: None }"],
+        &["HolderAlias { value: std::ptr::null_mut() }"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_reassigned_pointer_parameter_raw() {
+    run_test(
+        r#"
+pub unsafe fn replace(p: *mut i32) -> *mut i32 {
+    p
+}
+
+pub unsafe fn read(mut p: *mut i32) -> i32 {
+    p = replace(p);
+    *p
+}
+"#,
+        &["pub unsafe fn read(mut p: *mut i32)"],
+        &["pub unsafe fn read(mut p: Option<&mut i32>)"],
+    );
+}
+
+#[test]
 fn test_rewriter_demotes_multiple_mutable_struct_fields_from_same_local() {
     run_test(
         r#"
@@ -4446,6 +4954,34 @@ pub unsafe fn mark_if_linked(node: *mut Node) -> i32 {
 }
 
 #[test]
+fn test_cross_nominal_raw_struct_cast_demotes_pointer_field() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub chars: *mut u32,
+}
+
+#[repr(C)]
+pub struct Other {
+    pub chars: *mut u32,
+}
+
+extern "C" {
+    fn bridge(p: *mut Other);
+}
+
+pub unsafe fn read(a: *mut Holder, i: usize) -> u32 {
+    bridge(a as *mut Other);
+    *(*a).chars.offset(i as isize)
+}
+"#,
+        &["pub chars: *mut u32", "*(*a).chars.offset(i as isize)"],
+        &["pub chars: &mut [u32]"],
+    );
+}
+
+#[test]
 fn test_rewriter_preserves_address_taken_field_base_for_promoted_struct_param() {
     run_test(
         r#"
@@ -4480,10 +5016,10 @@ pub unsafe fn vm_init(vm: *mut VM) {
 "#,
         &[
             "pub unsafe fn vm_init(mut vm: &mut crate::VM)",
-            "init_vec((Some(&mut (*vm).stack)).unwrap())",
+            "&raw mut (vm.stack)",
             "vm.steps = 0",
         ],
-        &["&raw mut (vm.stack)", "&mut *(&raw mut"],
+        &[],
     );
 }
 
@@ -6021,7 +6557,8 @@ pub unsafe fn multiply_with_log(a: i32, b: i32) -> (i32, *mut i8) {
             "pub unsafe fn multiply_with_log(a: i32, b: i32) -> (i32, *mut i8)",
             "let mut log_msg: *mut i8 = std::ptr::null_mut();",
             "log_msg =",
-            "create_result_string(bytemuck::cast_slice",
+            "create_result_string(unsafe",
+            "std::slice::from_raw_parts",
         ],
         &[
             "Option<&mut i8>",
@@ -7284,6 +7821,84 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+/// a cast around a projected slice pointer must not hide its promoted base
+/// from null-check rewriting.
+#[test]
+fn test_is_null_projected_cast_slice() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut values: [libc::c_int; 4] = [0; 4];
+    let mut p: *mut libc::c_int = values.as_mut_ptr();
+    *p.offset(1 as isize) = 10 as libc::c_int;
+    if !((p.offset(1 as isize) as *mut libc::c_int).is_null()) {
+        return *p.offset(1 as isize);
+    }
+    return 0 as libc::c_int;
+}
+"#,
+        &["&mut [i32]", "is_empty"],
+        &["is_null", ").offset(1 as isize) as *mut i32"],
+    );
+}
+
+#[test]
+fn test_address_taken_pointer_field_stays_raw_for_nested_pointer_parameter() {
+    run_test(
+        r#"
+pub struct Context {
+    pub next: *const u8,
+}
+
+unsafe fn advance(next: *mut *const u8) {
+    *next = (*next).offset(1);
+}
+
+pub unsafe fn read(context: *mut Context) -> u8 {
+    let before = *(*context).next;
+    advance(&mut (*context).next);
+    before + *(*context).next
+}
+"#,
+        &["pub next: *const u8", "&raw mut (context.next)"],
+        &[
+            "pub next: &[u8]",
+            "pub next: crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_fields_stay_raw_across_nominal_struct_pointer_cast() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Number {
+    pub len: usize,
+    pub data: *mut u32,
+}
+
+#[repr(C)]
+pub struct AllocatorNumber {
+    pub len: usize,
+    pub data: *mut u32,
+}
+
+unsafe fn reserve(number: *mut AllocatorNumber) {
+    (*number).len = 1;
+}
+
+pub unsafe fn set(number: *mut Number) {
+    reserve(number as *mut AllocatorNumber);
+    *(*number).data = 7;
+}
+"#,
+        &["pub data: *mut u32"],
+        &["pub data: Option<&mut u32>", "pub data: &mut [u32]"],
+    );
+}
+
 /// Return statement with raw pointer return type — p is internally OptRef
 /// but the function returns `*mut c_int`, so the return coerces p to Raw.
 #[test]
@@ -7617,6 +8232,177 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 "#,
         &["as usize"],
+        &[],
+    );
+}
+
+/// Round trip through `wrapping_add` (`PtrExprProj::IntegerOp`): the inner
+/// `p as usize` is also visited by the integer-cast arm of `visit_expr`, but
+/// the round-trip rewrite must still convert `p` only once.
+#[test]
+fn test_cast_int_ptr_wrapping_add() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut y: libc::c_int = 43 as libc::c_int;
+    let mut q: *mut libc::c_int = &mut y;
+    let mut s: *mut libc::c_int = &mut y;
+    *q = 1 as libc::c_int;
+    *s = 2 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    q = (p as usize).wrapping_add(0 as usize) as *mut libc::c_int;
+    return *q;
+}
+"#,
+        &[
+            "let mut p: &mut i32",
+            "(((p) as *mut i32) as usize).wrapping_add(",
+        ],
+        &["as *mut i32) as *mut i32"],
+    );
+}
+
+/// Pointer-to-integer cast whose result stays an integer: a `&mut` param is
+/// turned back into a raw pointer before the cast (E0606 otherwise).
+#[test]
+fn test_ptr_to_int_cast_ref_param() {
+    run_test(
+        r#"
+pub unsafe fn bump(mut p: *mut i32) -> usize {
+    *p += 1;
+    p as usize
+}
+"#,
+        &["mut p: &mut i32", "(p) as *mut i32 as usize"],
+        &[],
+    );
+}
+
+/// Same for a slice param: the address comes from `.as_mut_ptr()`.
+#[test]
+fn test_ptr_to_int_cast_slice_param() {
+    run_test(
+        r#"
+pub unsafe fn clear(mut p: *mut i32) -> usize {
+    *p.offset(1 as isize) = 0;
+    p as usize
+}
+"#,
+        &[".as_mut_ptr() as usize"],
+        &[],
+    );
+}
+
+/// Pointer-to-pointer cast before the integer cast: `p as *mut u8 as usize`.
+#[test]
+fn test_ptr_to_int_cast_chain() {
+    run_test(
+        r#"
+pub unsafe fn bump(mut p: *mut i32) -> usize {
+    *p += 1;
+    p as *mut u8 as usize
+}
+"#,
+        &["mut p: &mut i32", "as *mut u8 as usize"],
+        &[],
+    );
+}
+
+/// Signed and C integer targets.
+#[test]
+fn test_ptr_to_int_cast_isize_c_ulong() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe fn addr(mut p: *mut i32) -> libc::c_ulong {
+    *p += 1;
+    (p as isize as libc::c_ulong).wrapping_add(p as libc::c_ulong)
+}
+"#,
+        &[
+            "mut p: &mut i32",
+            "as *mut i32 as isize",
+            "as *mut i32 as libc::c_ulong",
+        ],
+        &[],
+    );
+}
+
+/// A byte buffer passed as `p as *mut u16`: a `&mut [u16]` parameter would need
+/// a `bytemuck` cast that panics on misaligned addresses, so it stays raw.
+#[test]
+fn test_upcast_call_arg_keeps_param_raw() {
+    run_test(
+        r#"
+pub unsafe fn copy_be16(mut pdest: *mut u16, mut psource: *mut u16) {
+    let mut source: *mut u8 = psource as *mut u8;
+    let mut dest: *mut u8 = pdest as *mut u8;
+    *dest.offset(0) = *source.offset(1);
+    *dest.offset(1) = *source.offset(0);
+}
+pub unsafe fn put(mut buf: *mut u8, mut v: u16) {
+    let mut p: *mut u8 = buf;
+    *p = 1;
+    p = p.offset(1);
+    copy_be16(p as *mut u16, &mut v as *mut u16);
+}
+"#,
+        &["mut pdest: *mut u16"],
+        &["cast_slice_mut::<_, u16>"],
+    );
+}
+
+#[test]
+fn test_same_align_cast_call_arg_still_promoted() {
+    run_test(
+        r#"
+pub unsafe fn inc(mut p: *mut u32) {
+    *p = (*p).wrapping_add(1);
+}
+pub unsafe fn f() -> i32 {
+    let mut x: i32 = 0;
+    inc(&mut x as *mut i32 as *mut u32);
+    x
+}
+"#,
+        &["mut p: &mut u32"],
+        &[],
+    );
+}
+
+#[test]
+fn test_downcast_call_arg_still_promoted() {
+    run_test(
+        r#"
+pub unsafe fn second(mut p: *mut u8) -> u8 {
+    *p.offset(1)
+}
+pub unsafe fn g(mut buf: *mut u32) -> u8 {
+    *buf = 7;
+    second(buf as *mut u8)
+}
+"#,
+        &["mut p: &[u8]"],
+        &[],
+    );
+}
+
+#[test]
+fn test_void_ptr_cast_call_arg_not_demoted() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe fn get16(mut p: *mut u16) -> u16 {
+    *p
+}
+pub unsafe fn h(mut v: *mut libc::c_void) -> u16 {
+    get16(v as *mut u16)
+}
+"#,
+        &["mut p: &u16"],
         &[],
     );
 }
@@ -7992,7 +8778,7 @@ pub unsafe fn foo(info: *mut Info) {
     consume((*info).addr.as_mut_ptr().offset(pos as isize));
 }
 "#,
-        &["consume(&mut ((*info).addr)[(pos as isize) as usize..]);"],
+        &["consume(&mut (info.addr)[(pos as isize) as usize..]);"],
         &["from_raw_parts_mut", ".addr.as_mut_ptr().offset"],
     );
 }
@@ -8025,7 +8811,7 @@ pub unsafe fn transform(m: *mut Md5) -> u32 {
             "unpack(&",
             "buffer)[",
             "10 as core::ffi::c_int",
-            "* 4 as core::ffi::c_int",
+            "4 as core::ffi::c_int",
             "as usize..])",
         ],
         &["from_raw_parts", ".buffer.as_mut_ptr().offset"],
@@ -8253,6 +9039,134 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_static_i8_bytestr_slice_uses_const_compatible_cast() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub name: *const i8,
+}
+
+impl Copy for Entry {}
+impl Clone for Entry {
+    fn clone(&self) -> Self { *self }
+}
+
+static mut ENTRIES: [Entry; 1] = [Entry {
+    name: b"name\0" as *const u8 as *const i8,
+}];
+
+pub unsafe fn read_name() -> i8 {
+    let entry = ENTRIES[0];
+    *entry.name.offset(0) + *entry.name.offset(1)
+}
+"#,
+        &["std::slice::from_raw_parts", "*const i8"],
+        &["bytemuck::cast_slice"],
+    );
+}
+
+#[test]
+fn test_mutable_bytestr_argument_uses_writable_copy() {
+    run_test(
+        r#"
+pub unsafe fn overwrite(p: *mut i8) {
+    *p.offset(0) = b'X' as i8;
+    *p.offset(1) = b'Y' as i8;
+}
+pub unsafe fn caller() {
+    overwrite(b"ab\0" as *const u8 as *const i8 as *mut i8);
+}
+"#,
+        &["Box::leak", "to_vec().into_boxed_slice()"],
+        &[],
+    );
+}
+
+#[test]
+fn test_bytestr_conditional_cast_drops_obsolete_raw_cast() {
+    run_test(
+        r#"
+pub unsafe fn first(flag: bool) -> i8 {
+    let fmt: *mut i8 = (if flag {
+        b"a\0" as *const u8 as *const i8
+    } else {
+        b"b\0" as *const u8 as *const i8
+    }) as *mut i8;
+    *fmt
+}
+"#,
+        &["let fmt: &i8", "std::slice::from_raw_parts"],
+        &["as *mut i8"],
+    );
+}
+
+#[test]
+fn test_casted_raw_pointer_deref_keeps_pointee_cast() {
+    run_test(
+        r#"
+pub unsafe fn read(ptr: *mut core::ffi::c_void) -> u32 {
+    *(ptr as *mut u32)
+}
+"#,
+        &["*(ptr as *mut u32)"],
+        &["*ptr"],
+    );
+}
+
+#[test]
+fn test_transmuted_fn_ptr_local_call_uses_declared_raw_signature() {
+    run_test(
+        r#"
+pub type Erased = Option<unsafe fn()>;
+pub type Concrete = Option<unsafe fn(*mut i32)>;
+
+pub struct Hooks {
+    pub callback: Erased,
+}
+
+pub unsafe fn target(p: *mut i32) {
+    *p = 7;
+}
+
+pub unsafe fn install(hooks: &mut Hooks) {
+    hooks.callback = std::mem::transmute::<Concrete, Erased>(
+        Some(target as unsafe fn(*mut i32)),
+    );
+}
+
+pub unsafe fn invoke(hooks: &Hooks, p: *mut i32) {
+    let callback: Concrete = std::mem::transmute::<Erased, Concrete>(hooks.callback);
+    callback.unwrap()(p);
+}
+"#,
+        &["callback.unwrap()((p).as_mut_ptr())"],
+        &["callback.unwrap()((p).as_mut())"],
+    );
+}
+
+#[test]
+fn test_fn_ptr_cast_rewrites_pointer_type_alias_inputs() {
+    run_test(
+        r#"
+pub type IntPtr = *mut i32;
+
+pub unsafe fn target(p: IntPtr) {
+    *p = 7;
+}
+
+pub unsafe fn install() {
+    let _erased = std::mem::transmute::<_, unsafe fn()>(
+        target as unsafe fn(IntPtr),
+    );
+}
+"#,
+        &["target as unsafe fn(&mut i32)"],
+        &["target as unsafe fn(IntPtr)"],
+    );
+}
+
 // ===== Fallthrough tests (lines 734-755): struct field pointer access =====
 
 /// Fallthrough + OptRef: struct field `s.data` is a `*mut c_int` → `PtrExprBaseKind::Other`.
@@ -8372,8 +9286,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(0 as isize);
 }
 "#,
-        &["let _x", "from_raw_parts_mut"],
-        &["as *mut _"],
+        &["let _x", "from_raw_parts_mut", "as *mut _"],
+        &[],
     );
 }
 
@@ -8422,6 +9336,50 @@ pub unsafe extern "C" fn foo() {
 }
 
 #[test]
+fn test_negative_offset_from_struct_field_address_stays_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub prefix: [i32; 4],
+    pub fields: [i32; 4],
+}
+
+pub unsafe fn read_prefix(info: &mut Info) -> i32 {
+    *(&mut info.fields[0] as *mut i32).offset(-(3 as isize))
+}
+"#,
+        &["as *mut i32).offset(-(3 as isize))"],
+        &["18446744073709551613", "slice::from_mut", "slice::from_ref"],
+    );
+}
+
+#[test]
+fn test_flexible_array_member_pointer_uses_allocated_tail() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Stream {
+    pub count: i32,
+    pub buffer: [f64; 0],
+}
+
+pub unsafe fn update(stream: *mut Stream, index: i32, value: f64) -> f64 {
+    let buffer: *mut f64 = (*stream).buffer.as_mut_ptr();
+    *buffer.offset(index as isize) = value;
+    *buffer.offset(index as isize)
+}
+"#,
+        &[
+            "SliceCursorMut<'_, f64>",
+            "SliceCursorMut::from_raw_parts_mut",
+            "1_000_000",
+        ],
+        &["SliceCursorMut::new(&mut stream.buffer)"],
+    );
+}
+
+#[test]
 fn test_param_byte_cast_offset_rewrites_to_slice_cursor() {
     run_test(
         r#"
@@ -8454,7 +9412,7 @@ pub unsafe extern "C" fn caller(info: *mut Info, offset: i32, value: u32) {
 }
 
 #[test]
-fn test_raw_local_noop_cast_call_does_not_demote_cursor_callee() {
+fn test_foreign_struct_escape_demotes_later_array_field_pointer() {
     run_test(
         r#"
 #[repr(C)]
@@ -8478,15 +9436,12 @@ pub unsafe extern "C" fn caller(v_info: *mut core::ffi::c_void, offset: i32, val
 }
 "#,
         &[
-            "crate::slice_cursor::SliceCursorMut<'_, u32>",
-            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
-            "as *mut u8, 1_000_000",
-            "set_type(if (leaf_addr).is_null()",
-            "SliceCursorMut::from_raw_parts_mut((leaf_addr),",
+            "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
+            "let mut leaf_addr: *mut u32",
+            "set_type(leaf_addr as *mut u32, offset, value)",
         ],
         &[
-            "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
-            "*(addr as *mut u8).offset",
+            "crate::slice_cursor::SliceCursorMut<'_, u32>",
             "bytemuck::cast_slice_mut",
         ],
     );
@@ -9036,6 +9991,58 @@ pub unsafe fn drive() -> u8 {
 }
 
 #[test]
+fn test_raw_field_caller_keeps_dynamic_backward_cursor_input_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub values: *mut u16,
+}
+
+pub unsafe fn store(values: *mut u16, links: *const i32) {
+    *values.offset(*links.offset(1) as isize) = 7;
+}
+
+pub unsafe fn drive(state: *mut State, links: *const i32) {
+    store((*state).values, links);
+}
+"#,
+        &["pub unsafe fn store(mut values: *mut u16"],
+        &[
+            "pub unsafe fn store(values: crate::slice_cursor::SliceCursorMut",
+            "SliceCursorMut::from_raw_parts_mut((*state).values",
+        ],
+    );
+}
+
+#[test]
+fn test_local_loaded_from_raw_abi_field_stays_raw() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("update".to_string());
+    run_test_with_config(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub values: *mut u32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn update(state: *mut State, index: usize, value: u32) {
+    let values: *mut u32 = (*state).values;
+    *values.offset(index as isize) = value;
+}
+"#,
+        &config,
+        &[
+            "pub values: *mut u32",
+            "let mut values: *mut u32",
+            "*values.offset(index as isize) = value",
+        ],
+        &["let values: &mut [u32]", "from_raw_parts_mut(state.values"],
+    );
+}
+
+#[test]
 fn test_array_pointer_caller_keeps_negative_cursor_input_cursor() {
     run_test(
         r#"
@@ -9067,7 +10074,10 @@ pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) {
     *p.offset(a).offset(b) = 1;
 }
 "#,
-        &["(p)[((a) as isize).wrapping_add((b) as isize)] = 1"],
+        &[
+            "let __crat_index = ((a) as isize).wrapping_add((b) as isize);",
+            "(p)[__crat_index] = 1",
+        ],
         &["(p).as_deref_mut().offset_by"],
     );
 }
@@ -9247,8 +10257,8 @@ pub unsafe fn copy_tail(
     );
 }
 "#,
-        &["&((*src).data)[("],
-        &["&mut ((*src).data)"],
+        &["&(src.data)[("],
+        &["&mut (src.data)"],
     );
 }
 
@@ -9774,7 +10784,7 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("q_idx"), "{s}");
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
-    assert!(s.contains("(&mut ((p)[(q_idx) as usize..]))[0] = 3"), "{s}");
+    assert!(s.contains("(p)[((q_idx)) as usize] = 3"), "{s}");
 }
 
 #[test]
@@ -10996,6 +12006,107 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: isize, mut distance:
 }
 
 #[test]
+fn test_array_local_rewriter_field_base_through_aliased_pointer_param() {
+    // the root `s` is declared through a pointer alias; the field base
+    // (*s).out is a raw pointer and must be offset directly.
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out: *mut i8,
+    pub out_end: *mut i8,
+}
+pub type State_t = *mut State;
+
+pub unsafe fn copy_from_back(mut s: State_t, mut length: isize, mut distance: isize) -> i32 {
+    let mut src: *mut i8 = (*s).out.offset(-distance);
+    let mut dst: *mut i8 = (*s).out;
+    (*s).out = (*s).out.offset(length);
+    *dst = *src;
+    dst = dst.offset(1);
+    src = src.offset(1);
+    *dst as i32 + *src as i32
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(!s.contains(".as_ptr()"), "{s}");
+    assert!(s.contains("src_idx"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_direct_base_declared_through_pointer_alias() {
+    let code = r#"
+pub type buf_t = *mut i32;
+pub unsafe fn foo(mut p: buf_t) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(!s.contains(".as_ptr()"), "{s}");
+    assert!(s.contains("q_idx"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_raw_field_of_by_value_struct_param() {
+    // the root `s` is not a pointer but the field base s.out is; `out` is not
+    // the first field, so the base is a field path rather than the root local.
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out_end: *mut i8,
+    pub out: *mut i8,
+}
+
+pub unsafe fn copy_from_back(mut s: State, mut length: isize, mut distance: isize) -> i32 {
+    let mut src: *mut i8 = s.out.offset(-distance);
+    let mut dst: *mut i8 = s.out;
+    s.out = s.out.offset(length);
+    *dst = *src;
+    dst = dst.offset(1);
+    src = src.offset(1);
+    *dst as i32 + *src as i32
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(!s.contains(".as_ptr()"), "{s}");
+    assert!(s.contains("src_idx"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_raw_field_through_reference_param() {
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out_end: *mut i8,
+    pub out: *mut i8,
+}
+
+pub unsafe fn copy_from_back(mut s: &mut State, mut length: isize, mut distance: isize) -> i32 {
+    let mut src: *mut i8 = (*s).out.offset(-distance);
+    let mut dst: *mut i8 = (*s).out;
+    (*s).out = (*s).out.offset(length);
+    *dst = *src;
+    dst = dst.offset(1);
+    src = src.offset(1);
+    *dst as i32 + *src as i32
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(!s.contains(".as_ptr()"), "{s}");
+    assert!(s.contains("src_idx"), "{s}");
+}
+
+#[test]
 fn test_array_local_rewriter_rewrites_memory_copy_cursors_of_reassigned_pointee_field_base() {
     // (*s).out is caller-visible: the field write is KEPT live (approach D),
     // a shadow counter tracks the advance, and members are index-rewritten.
@@ -11093,7 +12204,7 @@ pub unsafe fn f(mut s: *mut State, mut n: isize) -> i32 {
 }
 
 #[test]
-fn test_array_local_rewriter_rewrites_field_base_cursor_local_used_in_offset_from() {
+fn test_array_local_rewriter_skips_group_when_member_application_fails() {
     let code = r#"
 #[repr(C)]
 pub struct ProcessState {
@@ -11120,26 +12231,11 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        changed,
-        "expected field-base cursor local to be rewritten:\n{s}"
-    );
+    assert!(!changed, "partial group rewrite must be rolled back:\n{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    // cursor is now an Option<isize> because memchr may return null
-    assert!(s.contains("ptr_idx: Option<isize>"), "{s}");
-    assert!(!s.contains("let mut ptr: *mut i8"), "{s}");
-    assert!(!s.contains("let ptr: *mut i8"), "{s}");
-    // memchr arg inlines the nullable cursor via map_or: ...map_or(...null..., |idx| ...offset(idx)...)
-    assert!(
-        s.contains("ptr_idx.map_or(") && s.contains(".offset(idx)"),
-        "expected memchr to inline nullable ptr_idx via map_or from the field base:\n{s}"
-    );
-    assert!(!s.contains("memchr(ptr as *const core::ffi::c_void"), "{s}");
-    assert!(!s.contains("ptr = found.offset(1)"), "{s}");
-    assert!(
-        !s.contains("ptr = ((*state).buffer).offset(ptr_idx)"),
-        "{s}"
-    );
+    assert!(s.contains("let mut ptr: *mut i8"), "{s}");
+    assert!(s.contains("let mut found: *mut i8"), "{s}");
+    assert!(!s.contains("ptr_idx"), "{s}");
 }
 
 #[test]
@@ -11261,6 +12357,37 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
 }
 
 #[test]
+fn test_array_local_trace_reports_anonymous_offset_origin() {
+    use crate::rewriter::array_local_trace::{TraceStage, TraceSubject};
+
+    let code = r#"
+pub unsafe fn anonymous_offset_member(p: *mut i32) -> i32 {
+    let q = p.offset(1);
+    let first = *p;
+    let second = *q.offset(1);
+    first + second
+}
+"#;
+    let events = array_local_trace_events(code);
+    assert!(
+        events.iter().any(|event| event.stage == TraceStage::Origin
+            && matches!(event.subject, TraceSubject::Member(_))
+            && event.reason.contains("origin=expression")
+            && event.reason.contains("ast=yes")
+            && event.reason.contains("shape=offset")),
+        "expected an anonymous offset origin event: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| event.stage == TraceStage::Origin
+            && matches!(event.subject, TraceSubject::Member(_))
+            && event
+                .reason
+                .contains("origin=binding-copy source=_1 represented=yes")),
+        "expected a copy of the represented base binding: {events:#?}"
+    );
+}
+
+#[test]
 fn test_array_local_trace_disabled_is_neutral() {
     // enabling the trace must not change the rewritten output, and the disabled
     // trace must record nothing.
@@ -11272,14 +12399,16 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     *q
 }
 "#;
-    let (src_enabled, _events) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true)
-    })
-    .unwrap();
-    let (src_disabled, events_disabled) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, false)
-    })
-    .unwrap();
+    let (src_enabled, _events, candidates_enabled) =
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true)
+        })
+        .unwrap();
+    let (src_disabled, events_disabled, candidates_disabled) =
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, false)
+        })
+        .unwrap();
     assert!(
         events_disabled.is_empty(),
         "disabled trace must record nothing: {events_disabled:#?}"
@@ -11287,6 +12416,10 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     assert_eq!(
         src_enabled, src_disabled,
         "enabling the trace must not change pass output"
+    );
+    assert_eq!(
+        candidates_enabled, candidates_disabled,
+        "enabling the trace must not change P1 candidate records"
     );
 }
 
@@ -11631,6 +12764,7 @@ pub unsafe fn foo(base: *mut i8, needle: *const i8, n: isize) -> i32 {
     }
     total
 }
+
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(changed, "{s}");
@@ -11644,10 +12778,315 @@ pub unsafe fn foo(base: *mut i8, needle: *const i8, n: isize) -> i32 {
     );
 }
 
+#[test]
+fn test_array_local_allowlist_replays_complete_candidate_with_stable_member_order() {
+    // this catches a replay implementation that derives an ID from HashMap
+    // iteration or applies only a subset of a provenance rewrite group.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut q: *mut i32 = base.offset(2);
+    let mut p: *mut i32 = base.offset(1);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        total += *p + *q;
+        p = p.offset(1);
+        q = q.offset(1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let trial = rewrite_array_local_provenance_with_allowlist(
+        code,
+        None,
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert_eq!(trial.candidates.len(), 1, "{trial:#?}");
+    let candidate = &trial.candidates[0];
+    let artifact_ids = candidate
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.id.clone())
+        .collect::<rustc_hash::FxHashSet<_>>();
+    assert_eq!(
+        artifact_ids.len(),
+        candidate.artifacts.len(),
+        "{candidate:#?}"
+    );
+    let crate::rewriter::profitability::CandidateId::ArrayLocal { members, .. } = &candidate.id
+    else {
+        panic!("array-local pass produced a non-array candidate: {candidate:#?}");
+    };
+    assert_eq!(
+        members.as_slice(),
+        &[
+            crate::rewriter::profitability::SourceBindingKey::new("p", 0),
+            crate::rewriter::profitability::SourceBindingKey::new("q", 0),
+        ],
+    );
+    let accepted = rustc_hash::FxHashSet::from_iter([candidate.id.clone()]);
+    let replay = rewrite_array_local_provenance_with_allowlist(
+        code,
+        Some(&accepted),
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert!(replay.changed, "{}", replay.source);
+    assert_eq!(replay.candidates.len(), 1);
+    assert!(replay.source.contains("p_idx"), "{}", replay.source);
+    assert!(replay.source.contains("q_idx"), "{}", replay.source);
+    ::utils::compilation::run_compiler_on_str(&replay.source, ::utils::type_check)
+        .expect(&replay.source);
+}
+
+#[test]
+fn test_array_local_allowlist_omits_unaccepted_group() {
+    // an explicit replay allowlist is a hard gate: no matching record means the
+    // whole group remains source-identical, regardless of its local cost shape.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    p = p.offset(1);
+    *p
+}
+"#;
+    let accepted = rustc_hash::FxHashSet::default();
+    let replay = rewrite_array_local_provenance_with_allowlist(
+        code,
+        Some(&accepted),
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert!(!replay.changed, "{}", replay.source);
+    assert!(replay.candidates.is_empty(), "{replay:#?}");
+    assert!(replay.source.contains("let mut p: *mut i32"));
+    ::utils::compilation::run_compiler_on_str(&replay.source, ::utils::type_check)
+        .expect(&replay.source);
+}
+
+#[test]
+fn test_array_local_profitability_rejection_omits_replay_group() {
+    // with raw materializations tied, the compiler-backed reports expose one
+    // additional trial unsafe operation, so the shared gate rejects the group.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let trial = rewrite_array_local_provenance_with_allowlist(
+        code,
+        None,
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert!(trial.changed, "{}", trial.source);
+    let trial_report = ::utils::compilation::run_compiler_on_str(&trial.source, |tcx| {
+        crate::rewriter::collect_promotion_report(
+            &Config::default(),
+            tcx,
+            &crate::rewriter::profitability::LineageCatalog::default(),
+            &trial.artifacts,
+        )
+    })
+    .unwrap();
+    let baseline_report = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::collect_promotion_report(
+            &Config::default(),
+            tcx,
+            &crate::rewriter::profitability::LineageCatalog::default(),
+            &trial.artifacts,
+        )
+    })
+    .unwrap();
+    let measurement = crate::rewriter::profitability::CandidateMeasurement {
+        baseline: baseline_report.observations[0].metrics.clone(),
+        trial: trial_report.observations[0].metrics.clone(),
+        unknown_promotions: baseline_report.unknown_attributions
+            + trial_report.unknown_attributions,
+    };
+    assert!(
+        matches!(
+            crate::rewriter::profitability::decide(measurement.clone()),
+            crate::rewriter::profitability::ProfitabilityDecision::Reject {
+                reason: crate::rewriter::profitability::RejectionReason::MoreUnsafeOperations,
+                ..
+            }
+        ),
+        "{measurement:?}"
+    );
+    let rejected = rustc_hash::FxHashSet::default();
+    let replay = rewrite_array_local_provenance_with_allowlist(
+        code,
+        Some(&rejected),
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert!(!replay.changed, "{}", replay.source);
+    assert!(replay.source.contains("let mut q: *mut i32"));
+}
+
+#[test]
+fn test_array_local_candidate_keys_distinguish_shadowed_members() {
+    // a name-only candidate identity would merge these two lexical `p`
+    // bindings. the compiler-backed trial must retain their occurrences.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32) -> i32 {
+    let mut total = 0;
+    {
+        let mut p: *mut i32 = base.offset(1);
+        p = p.offset(1);
+        total += *p;
+    }
+    {
+        let mut p: *mut i32 = base.offset(2);
+        p = p.offset(1);
+        total += *p;
+    }
+    total
+}
+"#;
+    let trial = rewrite_array_local_provenance_with_allowlist(
+        code,
+        None,
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    let mut occurrences = trial
+        .candidates
+        .iter()
+        .flat_map(|candidate| match &candidate.id {
+            crate::rewriter::profitability::CandidateId::ArrayLocal { members, .. } => members,
+            _ => unreachable!("array-local adapter returned a non-array candidate"),
+        })
+        .filter(|member| member.name == "p")
+        .map(|member| member.occurrence)
+        .collect::<Vec<_>>();
+    occurrences.sort_unstable();
+    assert_eq!(occurrences, vec![0, 1], "{trial:#?}");
+}
+
+#[test]
+fn test_array_local_allowlist_rejects_epoch_parent_not_selected() {
+    // replay must not consume an epoch-generated cursor unless the epoch record
+    // that created it is selected by the same shared gate.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, mut r: *mut i32) -> i32 {
+    let mut q: *mut i32 = 0 as *mut i32;
+    q = p.offset(3);
+    *p = 1;
+    *q = 3;
+    let a: i32 = *q;
+    q = r.offset(1);
+    *r = 2;
+    *q = 5;
+    a
+}
+"#;
+    let epoch = rewrite_epoch_split_with_allowlist_config(code, None);
+    assert!(epoch.changed, "{}", epoch.source);
+    let trial = rewrite_array_local_provenance_with_allowlist(&epoch.source, None, &epoch.lineage);
+    assert!(!trial.candidates.is_empty(), "{trial:#?}");
+    let accepted = rustc_hash::FxHashSet::from_iter(
+        trial
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.clone()),
+    );
+    let replay = rewrite_array_local_provenance_with_allowlist(
+        &epoch.source,
+        Some(&accepted),
+        &epoch.lineage,
+    );
+    assert!(!replay.changed, "{}", replay.source);
+    assert!(
+        replay.candidates.iter().all(|candidate| {
+            candidate.counts.unknown == 1
+                && candidate.artifacts.iter().any(|artifact| {
+                    artifact.fate == crate::rewriter::profitability::ArtifactFate::Unknown
+                })
+        }),
+        "{replay:#?}"
+    );
+    assert!(replay.source.contains("q_0"));
+    ::utils::compilation::run_compiler_on_str(&replay.source, ::utils::type_check)
+        .expect(&replay.source);
+}
+
+#[test]
+fn test_array_local_allowlist_fails_closed_for_ambiguous_epoch_lineage() {
+    // duplicate lineage attribution is ambiguous even when the array candidate
+    // itself is allowlisted, so replay leaves the complete group untouched.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base.offset(2);
+    p = p.offset(n);
+    q = q.offset(1);
+    *p + *q
+}
+"#;
+    let trial = rewrite_array_local_provenance_with_allowlist(
+        code,
+        None,
+        &crate::rewriter::profitability::LineageCatalog::default(),
+    );
+    assert_eq!(trial.candidates.len(), 1, "{trial:#?}");
+    let candidate = &trial.candidates[0];
+    let crate::rewriter::profitability::CandidateId::ArrayLocal { function, .. } = candidate.id
+    else {
+        unreachable!("expected an array-local candidate");
+    };
+    let mut lineage = crate::rewriter::profitability::LineageCatalog::default();
+    lineage.insert(
+        function,
+        "p",
+        crate::rewriter::profitability::CandidateId::epoch(
+            function,
+            crate::rewriter::profitability::SourceBindingKey::new("scratch", 0),
+        ),
+        0,
+    );
+    lineage.insert(
+        function,
+        "p",
+        crate::rewriter::profitability::CandidateId::epoch(
+            function,
+            crate::rewriter::profitability::SourceBindingKey::new("other", 0),
+        ),
+        0,
+    );
+    let accepted = rustc_hash::FxHashSet::from_iter([candidate.id.clone()]);
+    let replay = rewrite_array_local_provenance_with_allowlist(code, Some(&accepted), &lineage);
+    assert!(!replay.changed, "{}", replay.source);
+    assert!(
+        replay
+            .candidates
+            .iter()
+            .any(|candidate| candidate.counts.unknown == 1)
+    );
+    assert!(replay.source.contains("let mut p: *mut i32"));
+}
+
 // ── epoch split (pointer-pass stage before array-local provenance) ────────────
 
 fn rewrite_epoch_split_with_config(code: &str, config: &Config) -> (String, bool) {
     ::utils::compilation::run_compiler_on_str(code, |tcx| rewrite_epoch_split(config, tcx)).unwrap()
+}
+
+fn analyze_epoch_split_candidates_with_config(code: &str) -> crate::rewriter::EpochSplitTrialPlan {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::analyze_epoch_split_candidates(tcx)
+    })
+    .unwrap()
+}
+
+fn rewrite_epoch_split_with_allowlist_config(
+    code: &str,
+    accepted: Option<&rustc_hash::FxHashSet<crate::rewriter::profitability::CandidateId>>,
+) -> crate::rewriter::EpochSplitRewriteResult {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_epoch_split_with_allowlist(&Config::default(), tcx, accepted)
+    })
+    .unwrap()
 }
 
 fn run_epoch_split_test(code: &str, includes: &[&str], excludes: &[&str]) {
@@ -11702,6 +13141,242 @@ pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
         ],
         &["let mut x: *mut i8 = 0 as *mut i8"],
     )
+}
+
+#[test]
+fn test_epoch_split_trial_records_stable_generated_lineage() {
+    let code = r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let _c: i8 = *x;
+    x = b;
+    x
+}
+    "#;
+    let trial = analyze_epoch_split_candidates_with_config(code);
+    assert_eq!(trial.candidates.len(), 1, "{trial:?}");
+    let candidate = &trial.candidates[0];
+    assert_eq!(candidate.generated_epochs.len(), 2, "{candidate:?}");
+    assert_eq!(candidate.generated_epochs[0].name, "x_0");
+    assert_eq!(candidate.generated_epochs[0].ordinal, 0);
+    assert_eq!(candidate.generated_epochs[1].name, "x_1");
+    assert_eq!(candidate.generated_epochs[1].ordinal, 1);
+    assert_eq!(
+        trial.lineage.lookup(
+            match candidate.id {
+                crate::rewriter::profitability::CandidateId::Epoch { function, .. } => function,
+                _ => unreachable!("epoch split produced a non-epoch candidate"),
+            },
+            "x_1",
+        ),
+        Some((&candidate.id, 1)),
+    );
+    assert!(candidate.artifacts.iter().any(|artifact| {
+        artifact.ownership == crate::rewriter::profitability::ArtifactOwnership::Baseline
+            && artifact.fate == crate::rewriter::profitability::ArtifactFate::Eliminated
+            && artifact.id.ordinal == usize::MAX
+    }));
+    assert_eq!(
+        candidate
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.ownership == crate::rewriter::profitability::ArtifactOwnership::Trial
+                    && artifact.fate == crate::rewriter::profitability::ArtifactFate::RemainsRaw
+            })
+            .count(),
+        2,
+    );
+}
+
+#[test]
+fn test_epoch_split_allowlist_rejects_raw_increasing_trial() {
+    // the shared downstream report proves both generated epochs remain raw, so
+    // the shared profitability decision rejects the raw-increasing trial.
+    let code = r#"
+pub unsafe extern "C" fn f(
+    mut a: *mut core::ffi::c_void,
+    mut b: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    let mut x: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;
+    x = a;
+    let _is_null: bool = x.is_null();
+    x = b;
+    x
+}
+    "#;
+    let trial = rewrite_epoch_split_with_allowlist_config(code, None);
+    let trial_report = ::utils::compilation::run_compiler_on_str(&trial.source, |tcx| {
+        crate::rewriter::collect_promotion_report(
+            &Config::default(),
+            tcx,
+            &trial.lineage,
+            &trial.artifacts,
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        trial_report.observations[0]
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.ownership == crate::rewriter::profitability::ArtifactOwnership::Trial
+                    && artifact.fate == crate::rewriter::profitability::ArtifactFate::RemainsRaw
+            })
+            .count(),
+        2,
+    );
+    let mut baseline_artifact = trial.candidates[0].artifacts[0].clone();
+    baseline_artifact.ownership = crate::rewriter::profitability::ArtifactOwnership::Trial;
+    baseline_artifact.fate = crate::rewriter::profitability::ArtifactFate::RemainsRaw;
+    let baseline_report = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::collect_promotion_report(
+            &Config::default(),
+            tcx,
+            &crate::rewriter::profitability::LineageCatalog::default(),
+            &[baseline_artifact],
+        )
+    })
+    .unwrap();
+    let measurement = crate::rewriter::profitability::CandidateMeasurement {
+        baseline: baseline_report.observations[0].metrics.clone(),
+        trial: trial_report.observations[0].metrics.clone(),
+        unknown_promotions: baseline_report.unknown_attributions
+            + trial_report.unknown_attributions,
+    };
+    assert!(
+        matches!(
+            crate::rewriter::profitability::decide(measurement.clone()),
+            crate::rewriter::profitability::ProfitabilityDecision::Reject {
+                reason: crate::rewriter::profitability::RejectionReason::MoreRawMaterializations,
+                ..
+            }
+        ),
+        "{measurement:?}",
+    );
+    let accepted = rustc_hash::FxHashSet::default();
+    let replay = rewrite_epoch_split_with_allowlist_config(code, Some(&accepted));
+    assert!(!replay.changed, "{}", replay.source);
+    assert!(replay.candidates.is_empty());
+    assert!(replay.artifacts.is_empty());
+    assert!(
+        replay
+            .source
+            .contains("let mut x: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void")
+    );
+    assert!(replay.source.contains("x = a"));
+    assert!(replay.source.contains("x = b"));
+    ::utils::compilation::run_compiler_on_str(&replay.source, ::utils::type_check)
+        .expect(&replay.source);
+}
+
+#[test]
+fn test_epoch_split_allowlist_replays_complete_promotable_candidate() {
+    // the generated locals are proven promotable by the downstream report; the
+    // gate can therefore select this complete scratch-local candidate for replay.
+    let code = r#"
+pub unsafe fn f() -> i32 {
+    let mut a: i32 = 1;
+    let mut b: i32 = 2;
+    let mut x: *mut i32 = 0 as *mut i32;
+    x = &mut a;
+    *x = 3;
+    x = &mut b;
+    *x
+}
+    "#;
+    let trial = analyze_epoch_split_candidates_with_config(code);
+    let accepted = rustc_hash::FxHashSet::from_iter([trial.candidates[0].id.clone()]);
+    let result = rewrite_epoch_split_with_allowlist_config(code, Some(&accepted));
+    assert!(result.changed, "{}", result.source);
+    assert_eq!(result.candidates.len(), 1);
+    assert_eq!(result.candidates[0].generated_epochs.len(), 2);
+    assert!(result.source.contains("let mut x_0: *mut i32 = &mut a"));
+    assert!(result.source.contains("let mut x_1: *mut i32 = &mut b"));
+    assert!(
+        !result
+            .source
+            .contains("let mut x: *mut i32 = 0 as *mut i32")
+    );
+    ::utils::compilation::run_compiler_on_str(&result.source, ::utils::type_check)
+        .expect(&result.source);
+    let report = ::utils::compilation::run_compiler_on_str(&result.source, |tcx| {
+        crate::rewriter::collect_promotion_report(
+            &Config::default(),
+            tcx,
+            &result.lineage,
+            &result.artifacts,
+        )
+    })
+    .unwrap();
+    assert!(report.observations[0].artifacts.iter().any(|artifact| {
+        artifact.ownership == crate::rewriter::profitability::ArtifactOwnership::Trial
+            && matches!(
+                artifact.fate,
+                crate::rewriter::profitability::ArtifactFate::Promoted(_)
+            )
+    }));
+}
+
+#[test]
+fn test_epoch_split_allowlist_skips_missing_candidate_identity() {
+    let code = r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let _c: i8 = *x;
+    x = b;
+    x
+}
+    "#;
+    let trial = analyze_epoch_split_candidates_with_config(code);
+    let crate::rewriter::profitability::CandidateId::Epoch { function, .. } =
+        &trial.candidates[0].id
+    else {
+        unreachable!("epoch split produced a non-epoch candidate");
+    };
+    let accepted =
+        rustc_hash::FxHashSet::from_iter([crate::rewriter::profitability::CandidateId::epoch(
+            *function,
+            crate::rewriter::profitability::SourceBindingKey::new("missing", 0),
+        )]);
+    let result = rewrite_epoch_split_with_allowlist_config(code, Some(&accepted));
+    assert!(!result.changed, "{}", result.source);
+    assert!(result.candidates.is_empty());
+    assert!(result.source.contains("let mut x: *mut i8 = 0 as *mut i8"));
+}
+
+#[test]
+fn test_epoch_split_allowlist_skips_ambiguous_candidate_identity() {
+    let code = r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let _c: i8 = *x;
+    x = b;
+    x
+}
+    "#;
+    let mut trial = analyze_epoch_split_candidates_with_config(code);
+    let candidate = trial.candidates[0].clone();
+    let accepted = rustc_hash::FxHashSet::from_iter([candidate.id.clone()]);
+    // a duplicated record models an identity collision discovered during replay.
+    trial.candidates.push(candidate);
+    let (_, selected, lineage) = trial.select(Some(&accepted));
+    assert!(selected.is_empty());
+    assert!(
+        lineage
+            .lookup_all(
+                match &accepted.iter().next().unwrap() {
+                    crate::rewriter::profitability::CandidateId::Epoch { function, .. } =>
+                        *function,
+                    _ => unreachable!("epoch split produced a non-epoch candidate"),
+                },
+                "x_0",
+            )
+            .is_none()
+    );
 }
 
 #[test]
@@ -11964,6 +13639,480 @@ pub unsafe fn foo(mut p: *mut i32, mut r: *mut i32) -> i32 {
     assert!(s.contains("*((p).offset(q_0_idx) as *mut i32) = 3"), "{s}");
     assert!(s.contains("*((r).offset(q_1_idx) as *mut i32) = 5"), "{s}");
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
+}
+
+#[test]
+fn gated_pointer_prepasses_preserve_trial_selection_and_replay_order() {
+    use crate::rewriter::profitability::{
+        CandidateId, ProfitabilityDecision, ProfitabilityMetric, ProfitabilityMetrics,
+    };
+    // this fixture has one whole-local epoch candidate and array-local groups
+    // derived from its generated epochs. The driver must finish the complete
+    // in-memory trial before restoring the checkpoint and replaying IDs.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, mut r: *mut i32) -> i32 {
+    let mut q: *mut i32 = 0 as *mut i32;
+    q = p.offset(3);
+    *p = 1;
+    *q = 3;
+    let a: i32 = *q;
+    q = r.offset(1);
+    *r = 2;
+    *q = 5;
+    a
+}
+"#;
+
+    let (result, final_source) = run_gated_prepasses_then_pointer(code, &Config::default());
+    assert_eq!(
+        result.phases,
+        vec![
+            GatedPrepassPhase::EpochTrial,
+            GatedPrepassPhase::AliasingTrial,
+            GatedPrepassPhase::ArrayTrial,
+            GatedPrepassPhase::DownstreamReport,
+            GatedPrepassPhase::ArraySelection,
+            GatedPrepassPhase::EpochSelection,
+            GatedPrepassPhase::RestoreCheckpoint,
+            GatedPrepassPhase::EpochReplay,
+            GatedPrepassPhase::AliasingReplay,
+            GatedPrepassPhase::ArrayReplay,
+        ]
+    );
+    assert_eq!((result.accepted_epochs, result.rejected_epochs), (1, 0));
+    assert_eq!((result.accepted_arrays, result.rejected_arrays), (2, 0));
+    assert_eq!(result.decisions.len(), 3);
+    let mut saw_p = false;
+    let mut saw_r = false;
+    let mut saw_epoch = false;
+    for record in &result.decisions {
+        let ProfitabilityDecision::Accept {
+            measurement,
+            deciding_metric: ProfitabilityMetric::RawMaterializations,
+        } = &record.decision
+        else {
+            panic!("unexpected profitability decision: {record:?}");
+        };
+        match &record.candidate {
+            CandidateId::ArrayLocal { base, .. } if base.name == "p" => {
+                saw_p = true;
+                assert_eq!(
+                    (measurement.baseline.clone(), measurement.trial.clone()),
+                    (
+                        ProfitabilityMetrics {
+                            raw_materializations: 1,
+                            unsafe_operations: 4,
+                            dereferences: 3,
+                        },
+                        ProfitabilityMetrics {
+                            raw_materializations: 0,
+                            unsafe_operations: 5,
+                            dereferences: 3,
+                        },
+                    )
+                );
+            }
+            CandidateId::ArrayLocal { base, .. } if base.name == "r" => {
+                saw_r = true;
+                assert_eq!(
+                    (measurement.baseline.clone(), measurement.trial.clone()),
+                    (
+                        ProfitabilityMetrics {
+                            raw_materializations: 1,
+                            unsafe_operations: 3,
+                            dereferences: 2,
+                        },
+                        ProfitabilityMetrics {
+                            raw_materializations: 0,
+                            unsafe_operations: 3,
+                            dereferences: 2,
+                        },
+                    )
+                );
+            }
+            CandidateId::Epoch { binding, .. } if binding.name == "q" => {
+                saw_epoch = true;
+                assert_eq!(
+                    (measurement.baseline.clone(), measurement.trial.clone()),
+                    (
+                        ProfitabilityMetrics {
+                            raw_materializations: 1,
+                            unsafe_operations: 5,
+                            dereferences: 3,
+                        },
+                        ProfitabilityMetrics {
+                            raw_materializations: 0,
+                            unsafe_operations: 6,
+                            dereferences: 3,
+                        },
+                    )
+                );
+            }
+            _ => panic!("unexpected candidate: {record:?}"),
+        }
+        assert_eq!(measurement.unknown_promotions, 0);
+    }
+    assert!((saw_p && saw_r && saw_epoch), "{:#?}", result.decisions);
+    assert!(!result.combined_trial_failed);
+    ::utils::compilation::run_compiler_on_str(&final_source, ::utils::type_check)
+        .expect(&final_source);
+}
+
+#[test]
+fn gated_pointer_prepasses_uses_each_reported_metric_as_the_decider() {
+    use crate::rewriter::{
+        CandidateObservation, array_local_index_rewriter,
+        profitability::{
+            CandidateId, ProfitabilityDecision, ProfitabilityMetric, ProfitabilityMetrics,
+            SourceBindingKey,
+        },
+    };
+
+    let id = CandidateId::array_local(
+        rustc_span::def_id::DefPathHash::default(),
+        SourceBindingKey::new("base", 0),
+        vec![SourceBindingKey::new("member", 0)],
+    );
+    let candidate = array_local_index_rewriter::ArrayLocalCandidateRecord {
+        id: id.clone(),
+        artifacts: Vec::new(),
+        counts: array_local_index_rewriter::ArrayLocalArtifactCounts::default(),
+        upstream_origins: Vec::new(),
+    };
+    let observation = |metrics| CandidateObservation {
+        candidate: id.clone(),
+        artifacts: Vec::new(),
+        metrics,
+        unknown_attributions: 0,
+    };
+
+    for (baseline, trial, deciding_metric) in [
+        (
+            ProfitabilityMetrics {
+                raw_materializations: 2,
+                unsafe_operations: 5,
+                dereferences: 4,
+            },
+            ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 7,
+                dereferences: 6,
+            },
+            ProfitabilityMetric::RawMaterializations,
+        ),
+        (
+            ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 5,
+                dereferences: 4,
+            },
+            ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 4,
+                dereferences: 6,
+            },
+            ProfitabilityMetric::UnsafeOperations,
+        ),
+        (
+            ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 5,
+                dereferences: 4,
+            },
+            ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 5,
+                dereferences: 3,
+            },
+            ProfitabilityMetric::Dereferences,
+        ),
+    ] {
+        let baseline = observation(baseline);
+        let trial = observation(trial);
+        let measurement =
+            crate::rewriter::array_candidate_measurement(&candidate, Some(&baseline), Some(&trial));
+        assert!(matches!(
+            crate::rewriter::profitability::decide(measurement),
+            ProfitabilityDecision::Accept {
+                deciding_metric: actual,
+                ..
+            } if actual == deciding_metric
+        ));
+    }
+}
+
+#[test]
+fn gated_pointer_prepasses_rejects_unknown_or_missing_candidate_reports() {
+    use crate::rewriter::{
+        CandidateObservation, array_local_index_rewriter,
+        profitability::{
+            CandidateId, ProfitabilityDecision, ProfitabilityMetrics, RejectionReason,
+            SourceBindingKey,
+        },
+    };
+
+    let id = CandidateId::array_local(
+        rustc_span::def_id::DefPathHash::default(),
+        SourceBindingKey::new("base", 0),
+        vec![SourceBindingKey::new("member", 0)],
+    );
+    let candidate = array_local_index_rewriter::ArrayLocalCandidateRecord {
+        id: id.clone(),
+        artifacts: Vec::new(),
+        counts: array_local_index_rewriter::ArrayLocalArtifactCounts::default(),
+        upstream_origins: Vec::new(),
+    };
+    let baseline = CandidateObservation {
+        candidate: id,
+        artifacts: Vec::new(),
+        metrics: ProfitabilityMetrics {
+            raw_materializations: 1,
+            unsafe_operations: 1,
+            dereferences: 1,
+        },
+        unknown_attributions: 1,
+    };
+
+    for measurement in [
+        crate::rewriter::array_candidate_measurement(&candidate, Some(&baseline), None),
+        crate::rewriter::array_candidate_measurement(&candidate, None, Some(&baseline)),
+    ] {
+        assert!(matches!(
+            crate::rewriter::profitability::decide(measurement),
+            ProfitabilityDecision::Reject {
+                reason: RejectionReason::UnknownAttribution,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn gated_pointer_prepasses_epoch_measurement_adds_only_retained_array_deltas() {
+    use crate::rewriter::{
+        CandidateObservation, EpochSplitCandidateRecord,
+        array_local_index_rewriter::{ArrayLocalArtifactCounts, ArrayLocalCandidateRecord},
+        profitability::{
+            CandidateId, CandidateMeasurement, ProfitabilityMetrics, SourceBindingKey,
+        },
+    };
+
+    let function = rustc_span::def_id::DefPathHash::default();
+    let epoch_id = CandidateId::epoch(function, SourceBindingKey::new("scratch", 0));
+    let array_id = CandidateId::array_local(
+        function,
+        SourceBindingKey::new("base", 0),
+        vec![SourceBindingKey::new("scratch_0", 0)],
+    );
+    let epoch = EpochSplitCandidateRecord {
+        id: epoch_id.clone(),
+        generated_epochs: Vec::new(),
+        artifacts: Vec::new(),
+    };
+    let array = ArrayLocalCandidateRecord {
+        id: array_id.clone(),
+        artifacts: Vec::new(),
+        counts: ArrayLocalArtifactCounts::default(),
+        upstream_origins: vec![epoch_id.clone()],
+    };
+    let observation = |metrics| CandidateObservation {
+        candidate: epoch_id.clone(),
+        artifacts: Vec::new(),
+        metrics,
+        unknown_attributions: 0,
+    };
+    let baseline = observation(ProfitabilityMetrics {
+        raw_materializations: 1,
+        unsafe_operations: 5,
+        dereferences: 3,
+    });
+    let pre_array = observation(ProfitabilityMetrics {
+        raw_materializations: 2,
+        unsafe_operations: 6,
+        dereferences: 4,
+    });
+    let array_measurements = rustc_hash::FxHashMap::from_iter([(
+        array_id.clone(),
+        CandidateMeasurement {
+            baseline: ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 3,
+                dereferences: 2,
+            },
+            trial: ProfitabilityMetrics {
+                raw_materializations: 0,
+                unsafe_operations: 1,
+                dereferences: 1,
+            },
+            unknown_promotions: 0,
+        },
+    )]);
+    let accepted = rustc_hash::FxHashSet::from_iter([array_id]);
+
+    let measurement = crate::rewriter::epoch_candidate_measurement(
+        &epoch,
+        Some(&baseline),
+        Some(&pre_array),
+        &[array],
+        &accepted,
+        &array_measurements,
+    );
+    assert_eq!(measurement.baseline, baseline.metrics);
+    assert_eq!(
+        measurement.trial,
+        ProfitabilityMetrics {
+            raw_materializations: 1,
+            unsafe_operations: 4,
+            dereferences: 3,
+        }
+    );
+}
+
+#[test]
+fn gated_pointer_prepasses_aliasing_propagates_epoch_lineage_to_snapshots() {
+    use crate::rewriter::profitability::CandidateId;
+
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) {
+    *out = *src;
+}
+pub unsafe fn driver(mut p: *mut i32, mut r: *mut i32) {
+    let mut q: *mut i32 = 0 as *mut i32;
+    q = p.offset(0);
+    callee(q, q);
+    q = r.offset(0);
+    callee(q, q);
+}
+"#;
+    let epoch = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_epoch_split_with_allowlist(&Config::default(), tcx, None)
+    })
+    .unwrap();
+    assert!(epoch.changed, "{}", epoch.source);
+    let parent = epoch.candidates[0].id.clone();
+    let CandidateId::Epoch { function, .. } = parent else { unreachable!() };
+    let result = ::utils::compilation::run_compiler_on_str(&epoch.source, |tcx| {
+        crate::rewriter::rewrite_aliasing_with_lineage(&Config::default(), tcx, &epoch.lineage)
+    })
+    .unwrap();
+
+    assert!(result.changed, "{}", result.source);
+    assert!(result.source.contains("__crat_snap_0"), "{}", result.source);
+    assert_eq!(
+        result.lineage.lookup(function, "__crat_snap_0"),
+        Some((&parent, 0))
+    );
+}
+
+#[test]
+fn gated_pointer_prepasses_reject_array_groups_with_rejected_epoch_parent() {
+    // shadowed whole-locals make baseline attribution ambiguous, so both epoch
+    // parents fail closed even though their generated array groups are locally
+    // profitable. None of those groups may escape the hierarchy during replay.
+    let code = r#"
+pub unsafe fn foo(
+    mut p: *mut i32,
+    mut r: *mut i32,
+) -> i32 {
+    let mut total = 0;
+    {
+        let mut q: *mut i32 = 0 as *mut i32;
+        q = p.offset(3);
+        *p = 1;
+        *q = 3;
+        total += *q;
+        q = r.offset(1);
+        *r = 2;
+        *q = 5;
+        total += *q;
+    }
+    {
+        let mut q: *mut i32 = 0 as *mut i32;
+        q = p.offset(2);
+        *q = 7;
+        total += *q;
+        q = r.offset(2);
+        *q = 9;
+        total += *q;
+    }
+    total
+}
+"#;
+
+    let result = run_gated_pointer_prepasses(&Config::default(), code);
+    assert_eq!(result.accepted_epochs, 0, "{:#?}", result.decisions);
+    assert_eq!(result.rejected_epochs, 2, "{:#?}", result.decisions);
+    assert_eq!(result.accepted_arrays, 0, "{:#?}", result.decisions);
+    assert!(result.rejected_arrays > 0, "{:#?}", result.decisions);
+    assert!(result.source.contains("let mut q: *mut i32"));
+    assert!(!result.source.contains("q_0_idx"));
+    ::utils::compilation::run_compiler_on_str(&result.source, ::utils::type_check)
+        .expect(&result.source);
+}
+
+#[test]
+fn gated_pointer_prepasses_reject_mixed_epoch_lineage_even_when_both_parents_pass() {
+    use crate::rewriter::profitability::{
+        CandidateId, CandidateMeasurement, ProfitabilityDecision, ProfitabilityMetrics,
+        SourceBindingKey,
+    };
+
+    let function = rustc_span::def_id::DefPathHash::default();
+    let left = CandidateId::epoch(function, SourceBindingKey::new("left", 0));
+    let right = CandidateId::epoch(function, SourceBindingKey::new("right", 0));
+    let accepted = rustc_hash::FxHashSet::from_iter([left.clone(), right.clone()]);
+    let decision = ProfitabilityDecision::Accept {
+        measurement: CandidateMeasurement {
+            baseline: ProfitabilityMetrics {
+                raw_materializations: 1,
+                unsafe_operations: 0,
+                dereferences: 0,
+            },
+            trial: ProfitabilityMetrics {
+                raw_materializations: 0,
+                unsafe_operations: 0,
+                dereferences: 0,
+            },
+            unknown_promotions: 0,
+        },
+        deciding_metric: crate::rewriter::profitability::ProfitabilityMetric::RawMaterializations,
+    };
+
+    let decision =
+        crate::rewriter::gate_array_decision_by_upstream(decision, &[left, right], &accepted);
+    assert!(matches!(
+        decision,
+        ProfitabilityDecision::Reject {
+            reason: crate::rewriter::profitability::RejectionReason::UnknownAttribution,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn gated_pointer_prepasses_trial_failure_falls_back_through_aliasing_and_pointer() {
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) {
+    *out = *src;
+}
+pub unsafe fn driver() {
+    let mut a: [i32; 16] = [0; 16];
+    callee(a.as_mut_ptr(), a.as_ptr());
+}
+"#;
+    let config = Config {
+        force_gated_prepass_trial_failure: true,
+        ..Config::default()
+    };
+
+    let (result, final_source) = run_gated_prepasses_then_pointer(code, &config);
+    assert!(result.combined_trial_failed);
+    assert_eq!(result.accepted_epochs, 0);
+    assert_eq!(result.accepted_arrays, 0);
+    assert!(result.source.contains("__crat_snap_0"), "{}", result.source);
+    assert!(result.phases.contains(&GatedPrepassPhase::AliasingFallback));
+    ::utils::compilation::run_compiler_on_str(&final_source, ::utils::type_check)
+        .expect(&final_source);
 }
 
 #[test]
@@ -12478,4 +14627,230 @@ fn snapshot_runtime_prefix_validation_uses_captured_length() {
     );
     assert!(!rewritten.contains("len as usize"), "{rewritten}");
     ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+}
+
+#[test]
+fn test_call_result_pattern_binding_raw() {
+    run_test(
+        r#"
+unsafe fn init(mut buf: *mut u8, mut n: usize) -> Result<*mut u8, u32> {
+    let mut chunk___v: *mut u8 = 0 as *mut u8;
+    if n < 4 as usize { return Err(1 as u32); }
+    chunk___v = buf.offset(1 as isize);
+    *chunk___v.offset(2 as isize) = 0 as u8;
+    return Ok(chunk___v);
+}
+pub unsafe fn create(mut buf: *mut u8, mut n: usize) -> u32 {
+    let mut chunk: *mut u8 = 0 as *mut u8;
+    let mut error: u32 = match { let rv___ = init(buf, n); rv___ } {
+        Ok(v___) => { *(&mut chunk) = v___; 0 }
+        Err(v___) => v___,
+    };
+    if error != 0 { return error; }
+    *chunk.offset(1 as isize) = 1 as u8;
+    return 0 as u32;
+}
+unsafe fn encode(mut storage: *mut u8, mut n: usize) -> (Result<u64, i32>, Option<*mut u8>) {
+    let mut output___s: bool = false;
+    let mut output___v: *mut u8 = 0 as *mut u8;
+    if n == 0 as usize { return (Err(0 as i32), None); }
+    output___s = true;
+    output___v = storage.offset(0 as isize);
+    *output___v.offset(1 as isize) = 0 as u8;
+    return (Ok(0 as u64), if output___s { Some(output___v) } else { None });
+}
+pub unsafe fn process(mut storage: *mut u8, mut n: usize, mut out: *mut *mut u8) -> u64 {
+    let rv___t = encode(storage, n);
+    if let Some(v___) = rv___t.1 { *out = v___ };
+    return match rv___t.0 { Ok(v) => v, Err(_) => 0 as u64 };
+}
+"#,
+        &["*Some(&mut chunk).unwrap() = v___;", "((out))[0] = v___"],
+        &["(v___).as_mut_ptr()"],
+    );
+}
+
+#[test]
+fn test_ctor_arg_payload_mutability() {
+    run_test(
+        r#"
+pub unsafe fn encode(mut storage: *mut u8, mut n: usize) -> (Result<u64, i32>, Option<*mut u8>) {
+    let mut output___s: bool = false;
+    let mut output___v: *mut u8 = 0 as *mut u8;
+    if n == 0 as usize { return (Err(0 as i32), None); }
+    output___s = true;
+    output___v = storage.offset(0 as isize);
+    let mut x: u8 = *output___v.offset(1 as isize);
+    return (Ok(x as u64), if output___s { Some(output___v) } else { None });
+}
+"#,
+        &["Some((output___v).as_ptr().cast_mut())"],
+        &[],
+    );
+}
+
+#[test]
+fn test_slice_local_deref_offset_uses_direct_index() {
+    run_test(
+        r#"
+pub struct U {
+    pub v: u32,
+}
+impl U {
+    pub fn set_v(&mut self, x: u32) {
+        self.v = x;
+    }
+}
+pub struct N {
+    pub u: U,
+}
+unsafe fn count(mut nodes: *const N, n: usize) -> u32 {
+    let mut s: u32 = 0;
+    let mut i: usize = 0;
+    while i < n {
+        s = s.wrapping_add((*nodes.offset(i as isize)).u.v);
+        i = i + 1;
+    }
+    s
+}
+pub unsafe fn eval(mut nodes: *mut N, pos: usize) {
+    (*nodes.offset(pos as isize)).u.set_v(count(nodes, pos));
+    (*nodes.offset(1 as isize)).u.v = 0;
+}
+"#,
+        &["(nodes)[((pos as isize)) as usize]"],
+        &["usize..]))[0]"],
+    );
+}
+
+#[test]
+fn test_cursor_field_index_through_raw_struct_ptr_borrows_explicitly() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub words: *mut u32,
+}
+
+extern "C" {
+    fn observe(s: *mut State);
+}
+
+pub unsafe fn shift(s: *mut State, c: i32) {
+    *(*s).words.offset(c as isize) = *(*s).words.offset((c - 1) as isize);
+    observe(s);
+    observe(s.offset(1));
+}
+"#,
+        &[
+            "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
+            "(&mut ((*s).words))[",
+            "(&((*s).words))[",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_block_tail_keeps_outer_cast_pointee() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn read() -> (*mut libc::c_void, Option<i32>) {
+    (0 as *mut libc::c_void, None)
+}
+pub unsafe extern "C" fn get() -> libc::c_int {
+    let mut size: libc::c_int = 0;
+    let mut q: *mut libc::c_int = 0 as *mut libc::c_int;
+    q = {
+        let rv___t = read();
+        if let Some(v___) = rv___t.1 { *(&mut size) = v___ };
+        rv___t.0
+    } as *mut libc::c_int;
+    if q.is_null() {
+        return 0;
+    }
+    return *q + size;
+}
+"#,
+        &["Option<&i32>", "as *const i32).as_ref()"],
+        &[],
+    );
+}
+
+#[test]
+fn test_cursor_to_slice_arg_casts_pointee() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn copy_be32(mut pdest: *mut u32, mut psource: *mut u32) {
+    let mut source: *mut libc::c_uchar = psource as *mut libc::c_uchar;
+    let mut dest: *mut libc::c_uchar = pdest as *mut libc::c_uchar;
+    *dest.offset(0 as libc::c_int as isize) = *source.offset(3 as libc::c_int as isize);
+    *dest.offset(3 as libc::c_int as isize) = *source.offset(0 as libc::c_int as isize);
+}
+pub unsafe extern "C" fn load(mut buf: *mut libc::c_uchar, mut n: libc::c_int) -> u32 {
+    let mut p: *mut libc::c_uchar = buf;
+    let mut id: u32 = 0;
+    p = p.offset(n as isize);
+    copy_be32(&mut id, p as *mut u32);
+    p = p.offset(4 as libc::c_int as isize);
+    return id + *p as u32;
+}
+"#,
+        &["mut psource: *mut u32", "(p).as_ptr().cast_mut() as *mut _"],
+        &["bytemuck::cast_slice::<_, u32>("],
+    );
+}
+
+#[test]
+fn test_cursor_to_slice_arg_casts_pointee_same_align() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn sum2(mut psource: *mut u32) -> u32 {
+    (*psource.offset(0)).wrapping_add(*psource.offset(1))
+}
+pub unsafe extern "C" fn load(mut buf: *mut libc::c_int, mut n: libc::c_int) -> u32 {
+    let mut p: *mut libc::c_int = buf;
+    p = p.offset(n as isize);
+    let mut s: u32 = sum2(p as *mut u32);
+    p = p.offset(2 as libc::c_int as isize);
+    return s.wrapping_add(*p as u32);
+}
+"#,
+        &["bytemuck::cast_slice::<_, u32>("],
+        &[],
+    );
+}
+
+#[test]
+fn test_ref_returning_accessor_to_slice_arg() {
+    run_test(
+        r#"
+use ::libc;
+pub struct U {
+    pub v: i16,
+}
+impl U {
+    pub fn get_v_mut(&mut self) -> &mut i16 {
+        &mut self.v
+    }
+}
+pub struct V {
+    pub u: U,
+}
+pub unsafe extern "C" fn copy_be16(mut pdest: *mut u16, mut psource: *mut u16) {
+    let mut source: *mut libc::c_uchar = psource as *mut libc::c_uchar;
+    let mut dest: *mut libc::c_uchar = pdest as *mut libc::c_uchar;
+    *dest.offset(0 as libc::c_int as isize) = *source.offset(1 as libc::c_int as isize);
+    *dest.offset(1 as libc::c_int as isize) = *source.offset(0 as libc::c_int as isize);
+}
+pub unsafe extern "C" fn store(mut value: *mut V, mut p: *mut u16) {
+    copy_be16((*value).u.get_v_mut() as *mut i16 as *mut u16, p);
+}
+"#,
+        &["std::slice::from_mut(bytemuck::cast_mut("],
+        &["is_null"],
+    );
 }

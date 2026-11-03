@@ -395,7 +395,9 @@ impl<'a> AstVisitor<'a> for ParamUseChecker<'_, '_> {
 fn resolve_callee(tcx: TyCtxt<'_>, ast_to_hir: &AstToHir, callee: &Expr) -> Option<LocalDefId> {
     let hir_expr = ast_to_hir.get_expr(callee.id, tcx)?;
     let typeck = tcx.typeck(hir_expr.hir_id.owner);
-    let ty::TyKind::FnDef(def_id, _) = typeck.expr_ty(hir_expr).kind() else {
+    // a callee inside an array-length const (`[0u8; size_of::<T>()]`) has no
+    // type in the enclosing body's typeck results; `expr_ty` would panic
+    let ty::TyKind::FnDef(def_id, _) = typeck.node_type_opt(hir_expr.hir_id)?.kind() else {
         return None;
     };
     def_id.as_local()

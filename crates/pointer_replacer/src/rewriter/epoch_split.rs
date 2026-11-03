@@ -10,13 +10,19 @@ use rustc_hir::{
     intravisit::{self, Visitor},
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
-use rustc_span::Symbol;
+use rustc_span::{Symbol, def_id::DefPathHash};
 use utils::{
     hir::{is_lhs, lhs_base},
     ir::AstToHir,
 };
 
-use super::Config;
+use super::{
+    Config,
+    profitability::{
+        ArtifactFate, ArtifactFootprint, ArtifactId, ArtifactOwnership, CandidateId,
+        LineageCatalog, SourceBindingKey,
+    },
+};
 
 // splits a reused raw-pointer scratch local (`let mut x = null` reassigned to
 // several distinct base pointers) into one fresh `let x_N` per epoch, so the
@@ -28,6 +34,7 @@ use super::Config;
 // for the placement.
 
 // the finished plan consumed by `EpochSplitApplier`
+#[derive(Debug)]
 pub(crate) struct PointerEpochSplitPlan {
     // per-occurrence rename: HIR id of a path expr -> epoch local name.
     pub path_renames: FxHashMap<HirId, Symbol>,
@@ -37,9 +44,49 @@ pub(crate) struct PointerEpochSplitPlan {
     pub original_inits_to_remove: FxHashSet<HirId>,
 }
 
+#[derive(Debug)]
 pub(crate) struct EpochLetIntro {
     pub new_name: Symbol,
     pub ty_string: String,
+}
+
+// generated epochs retain zero-based ordinals; this reserved value identifies
+// the eliminated original scratch declaration.
+const BASELINE_ARTIFACT_ORDINAL: usize = usize::MAX;
+
+/// one generated binding belonging to a whole-original-local epoch candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedEpoch {
+    pub name: String,
+    pub ordinal: usize,
+}
+
+/// owned trial record for one original scratch local and all of its epochs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EpochSplitCandidateRecord {
+    pub id: CandidateId,
+    pub generated_epochs: Vec<GeneratedEpoch>,
+    pub artifacts: Vec<ArtifactFootprint>,
+}
+
+/// candidate records are session-independent; `plans` stays HIR-keyed and is
+/// only usable by the compiler session that produced it.
+#[derive(Debug, Default)]
+pub struct EpochSplitTrialPlan {
+    pub candidates: Vec<EpochSplitCandidateRecord>,
+    pub lineage: LineageCatalog,
+    plans: FxHashMap<CandidateId, PointerEpochSplitPlan>,
+}
+
+/// owned source and accounting data from either a combined trial or replay.
+#[derive(Debug)]
+pub struct EpochSplitRewriteResult {
+    pub source: String,
+    pub changed: bool,
+    pub candidates: Vec<EpochSplitCandidateRecord>,
+    #[allow(dead_code)]
+    pub lineage: LineageCatalog,
+    pub artifacts: Vec<ArtifactFootprint>,
 }
 
 impl PointerEpochSplitPlan {
@@ -60,6 +107,9 @@ struct Candidate {
     init_let_stmt: HirId,
     // the local's declared type, e.g. "*mut i8", rendered once here.
     ty_string: String,
+    function: DefPathHash,
+    binding: SourceBindingKey,
+    source_span: String,
 }
 
 // returns the accepted-shape candidates for one body: `let mut` raw-pointer locals
@@ -73,6 +123,8 @@ fn collect_candidates<'tcx>(
         tcx,
         candidates: FxHashMap::default(),
         disqualified: FxHashSet::default(),
+        bindings: FxHashMap::default(),
+        binding_occurrences: FxHashMap::default(),
         in_closure: 0,
     };
     v.visit_body(body);
@@ -84,6 +136,8 @@ struct CandidateVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     candidates: FxHashMap<HirId, Candidate>,
     disqualified: FxHashSet<HirId>,
+    bindings: FxHashMap<HirId, SourceBindingKey>,
+    binding_occurrences: FxHashMap<String, usize>,
     in_closure: usize,
 }
 
@@ -92,6 +146,17 @@ impl<'tcx> Visitor<'tcx> for CandidateVisitor<'tcx> {
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx
+    }
+
+    fn visit_pat(&mut self, pat: &'tcx hir::Pat<'tcx>) {
+        if let hir::PatKind::Binding(_, binding_id, ident, _) = pat.kind {
+            let name = ident.name.to_string();
+            let occurrence = self.binding_occurrences.entry(name.clone()).or_default();
+            self.bindings
+                .insert(binding_id, SourceBindingKey::new(name, *occurrence));
+            *occurrence += 1;
+        }
+        intravisit::walk_pat(self, pat);
     }
 
     fn visit_local(&mut self, let_stmt: &'tcx hir::LetStmt<'tcx>) {
@@ -116,12 +181,22 @@ impl<'tcx> Visitor<'tcx> for CandidateVisitor<'tcx> {
         if !is_null_init(init) {
             return;
         }
+        let Some(binding) = self.bindings.get(&binding_id).cloned() else {
+            return;
+        };
         let ty_string = utils::ir::mir_ty_to_string(ty, self.tcx);
         self.candidates.insert(
             binding_id,
             Candidate {
                 init_let_stmt: let_stmt.hir_id,
                 ty_string,
+                function: self.tcx.def_path_hash(binding_id.owner.def_id.to_def_id()),
+                binding,
+                source_span: self
+                    .tcx
+                    .sess
+                    .source_map()
+                    .span_to_string(let_stmt.span, rustc_span::FileNameDisplayPreference::Local),
             },
         );
     }
@@ -547,20 +622,21 @@ impl<'tcx> Visitor<'tcx> for BaseChangeScanner<'_, 'tcx> {
 
 // ── driver + finalization + name generation ───────────────────────────────────
 
-// entry point: analyze every body in the crate and build the split plan.
-fn analyze(tcx: TyCtxt<'_>) -> PointerEpochSplitPlan {
-    let mut plan = PointerEpochSplitPlan::empty();
+/// analyzes every body and returns owned candidate records plus in-session HIR
+/// plans. The records and lineage may safely cross compiler-session boundaries.
+pub fn analyze_epoch_split_candidates(tcx: TyCtxt<'_>) -> EpochSplitTrialPlan {
+    let mut trial = EpochSplitTrialPlan::default();
     let mut driver = Driver {
         tcx,
-        plan: &mut plan,
+        trial: &mut trial,
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut driver);
-    plan
+    trial
 }
 
 struct Driver<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    plan: &'a mut PointerEpochSplitPlan,
+    trial: &'a mut EpochSplitTrialPlan,
 }
 
 impl<'tcx> Visitor<'tcx> for Driver<'_, 'tcx> {
@@ -571,19 +647,19 @@ impl<'tcx> Visitor<'tcx> for Driver<'_, 'tcx> {
     }
 
     fn visit_body(&mut self, body: &hir::Body<'tcx>) {
-        analyze_body(self.tcx, body, self.plan);
+        analyze_body(self.tcx, body, self.trial);
         intravisit::walk_body(self, body);
     }
 }
 
-fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, body: &hir::Body<'tcx>, plan: &mut PointerEpochSplitPlan) {
+fn analyze_body<'tcx>(tcx: TyCtxt<'tcx>, body: &hir::Body<'tcx>, trial: &mut EpochSplitTrialPlan) {
     let candidates = collect_candidates(tcx, body);
     if candidates.is_empty() {
         return;
     }
     let mut state = FnState::new(tcx, candidates);
     state.analyze_expr(body.value, EpochEnv::default());
-    finalize(tcx, body, &mut state, plan);
+    finalize(tcx, body, &mut state, trial);
 }
 
 // commit accepted locals into `plan`, allocating fresh names for their epochs.
@@ -591,7 +667,7 @@ fn finalize<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &hir::Body<'tcx>,
     state: &mut FnState<'tcx>,
-    plan: &mut PointerEpochSplitPlan,
+    trial: &mut EpochSplitTrialPlan,
 ) {
     let mut existing = existing_names(tcx, body);
 
@@ -607,8 +683,32 @@ fn finalize<'tcx>(
         !state.rejected.contains(local) && epoch_count.get(local).copied().unwrap_or(0) >= 2
     };
 
+    let mut locals: Vec<HirId> = state
+        .candidates
+        .keys()
+        .copied()
+        .filter(|local| should_split(local))
+        .collect();
+    locals.sort_by(|left, right| {
+        state.candidates[left]
+            .binding
+            .cmp(&state.candidates[right].binding)
+    });
+    let candidate_ids: FxHashMap<HirId, CandidateId> = locals
+        .iter()
+        .map(|local| {
+            let candidate = &state.candidates[local];
+            (
+                *local,
+                CandidateId::epoch(candidate.function, candidate.binding.clone()),
+            )
+        })
+        .collect();
+
     // stable order: name epochs by allocation order so suffixes are deterministic.
     let mut epoch_names: FxHashMap<EpochId, Symbol> = FxHashMap::default();
+    let mut epoch_ordinals: FxHashMap<EpochId, usize> = FxHashMap::default();
+    let mut next_ordinal: FxHashMap<HirId, usize> = FxHashMap::default();
     let mut epochs: Vec<(EpochId, HirId)> =
         state.epoch_local.iter().map(|(e, l)| (*e, *l)).collect();
     epochs.sort_by_key(|(e, _)| e.0);
@@ -619,35 +719,84 @@ fn finalize<'tcx>(
         let stem = tcx.hir_name(local); // original binding name, e.g. `x`
         let name = fresh_name(stem.as_str(), &mut existing);
         epoch_names.insert(epoch, name);
+        let ordinal = next_ordinal.entry(local).or_default();
+        epoch_ordinals.insert(epoch, *ordinal);
+        *ordinal += 1;
     }
 
-    // path renames for split locals (only epochs that received a name).
-    for (occ, epoch) in &state.path_renames {
-        if let Some(name) = epoch_names.get(epoch) {
-            plan.path_renames.insert(*occ, *name);
-        }
-    }
-    // assignment -> let intros for split locals.
-    for (assign_hir_id, epoch) in &state.assignment_epochs {
-        let local = state.epoch_local[epoch];
-        if !should_split(&local) {
-            continue;
-        }
-        let name = epoch_names[epoch];
-        let ty_string = state.candidates[&local].ty_string.clone();
-        plan.assignment_replacements.insert(
-            *assign_hir_id,
-            EpochLetIntro {
-                new_name: name,
-                ty_string,
+    for local in locals {
+        let candidate = &state.candidates[&local];
+        let candidate_id = candidate_ids[&local].clone();
+        let mut plan = PointerEpochSplitPlan::empty();
+        let mut generated_epochs = Vec::new();
+        let mut artifacts = vec![ArtifactFootprint {
+            id: ArtifactId {
+                candidate: candidate_id.clone(),
+                ordinal: BASELINE_ARTIFACT_ORDINAL,
             },
-        );
-    }
-    // remove the scratch init only of split locals.
-    for (local, cand) in &state.candidates {
-        if should_split(local) {
-            plan.original_inits_to_remove.insert(cand.init_let_stmt);
+            source_name: Some(candidate.binding.name.clone()),
+            source_span: Some(candidate.source_span.clone()),
+            ownership: ArtifactOwnership::Baseline,
+            fate: ArtifactFate::Eliminated,
+        }];
+
+        for (occ, epoch) in &state.path_renames {
+            if state.epoch_local[epoch] == local {
+                plan.path_renames.insert(*occ, epoch_names[epoch]);
+            }
         }
+        for (assign_hir_id, epoch) in &state.assignment_epochs {
+            if state.epoch_local[epoch] != local {
+                continue;
+            }
+            plan.assignment_replacements.insert(
+                *assign_hir_id,
+                EpochLetIntro {
+                    new_name: epoch_names[epoch],
+                    ty_string: candidate.ty_string.clone(),
+                },
+            );
+        }
+        plan.original_inits_to_remove
+            .insert(candidate.init_let_stmt);
+
+        let mut candidate_epochs: Vec<(EpochId, Symbol)> = epoch_names
+            .iter()
+            .filter_map(|(epoch, name)| {
+                (state.epoch_local[epoch] == local).then_some((*epoch, *name))
+            })
+            .collect();
+        candidate_epochs.sort_by_key(|(epoch, _)| epoch_ordinals[epoch]);
+        for (epoch, name) in candidate_epochs {
+            let ordinal = epoch_ordinals[&epoch];
+            let name = name.to_string();
+            trial.lineage.insert(
+                candidate.function,
+                name.clone(),
+                candidate_id.clone(),
+                ordinal,
+            );
+            generated_epochs.push(GeneratedEpoch {
+                name: name.clone(),
+                ordinal,
+            });
+            artifacts.push(ArtifactFootprint {
+                id: ArtifactId {
+                    candidate: candidate_id.clone(),
+                    ordinal,
+                },
+                source_name: Some(name),
+                source_span: None,
+                ownership: ArtifactOwnership::Trial,
+                fate: ArtifactFate::RemainsRaw,
+            });
+        }
+        trial.candidates.push(EpochSplitCandidateRecord {
+            id: candidate_id.clone(),
+            generated_epochs,
+            artifacts,
+        });
+        trial.plans.insert(candidate_id, plan);
     }
 }
 
@@ -758,12 +907,75 @@ impl MutVisitor for EpochSplitApplier<'_, '_> {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
-pub fn rewrite_epoch_split(_config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+impl EpochSplitTrialPlan {
+    pub(crate) fn select(
+        mut self,
+        accepted: Option<&FxHashSet<CandidateId>>,
+    ) -> (
+        PointerEpochSplitPlan,
+        Vec<EpochSplitCandidateRecord>,
+        LineageCatalog,
+    ) {
+        let mut occurrences: FxHashMap<CandidateId, usize> = FxHashMap::default();
+        for record in &self.candidates {
+            *occurrences.entry(record.id.clone()).or_default() += 1;
+        }
+        let selected: FxHashSet<CandidateId> = self
+            .candidates
+            .iter()
+            .filter(|record| {
+                occurrences[&record.id] == 1
+                    && accepted.is_none_or(|accepted| accepted.contains(&record.id))
+            })
+            .map(|record| record.id.clone())
+            .collect();
+
+        let mut plan = PointerEpochSplitPlan::empty();
+        for candidate in &selected {
+            let Some(candidate_plan) = self.plans.remove(candidate) else {
+                continue;
+            };
+            plan.path_renames.extend(candidate_plan.path_renames);
+            plan.assignment_replacements
+                .extend(candidate_plan.assignment_replacements);
+            plan.original_inits_to_remove
+                .extend(candidate_plan.original_inits_to_remove);
+        }
+
+        let candidates: Vec<_> = self
+            .candidates
+            .into_iter()
+            .filter(|record| selected.contains(&record.id))
+            .collect();
+        let mut lineage = LineageCatalog::default();
+        for record in &candidates {
+            let CandidateId::Epoch { function, .. } = record.id else {
+                continue;
+            };
+            for epoch in &record.generated_epochs {
+                lineage.insert(
+                    function,
+                    epoch.name.clone(),
+                    record.id.clone(),
+                    epoch.ordinal,
+                );
+            }
+        }
+        (plan, candidates, lineage)
+    }
+}
+
+pub fn rewrite_epoch_split_with_allowlist(
+    _config: &Config,
+    tcx: TyCtxt<'_>,
+    accepted: Option<&FxHashSet<CandidateId>>,
+) -> EpochSplitRewriteResult {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
-    let plan = analyze(tcx);
+    let trial = analyze_epoch_split_candidates(tcx);
+    let (plan, candidates, lineage) = trial.select(accepted);
     let changed = !plan.path_renames.is_empty()
         || !plan.assignment_replacements.is_empty()
         || !plan.original_inits_to_remove.is_empty();
@@ -775,5 +987,20 @@ pub fn rewrite_epoch_split(_config: &Config, tcx: TyCtxt<'_>) -> (String, bool) 
         };
         applier.visit_crate(&mut krate);
     }
-    (pprust::crate_to_string_for_macros(&krate), changed)
+    let artifacts = candidates
+        .iter()
+        .flat_map(|candidate| candidate.artifacts.iter().cloned())
+        .collect();
+    EpochSplitRewriteResult {
+        source: pprust::crate_to_string_for_macros(&krate),
+        changed,
+        candidates,
+        lineage,
+        artifacts,
+    }
+}
+
+pub fn rewrite_epoch_split(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+    let result = rewrite_epoch_split_with_allowlist(config, tcx, None);
+    (result.source, result.changed)
 }

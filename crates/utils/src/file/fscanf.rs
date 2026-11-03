@@ -64,7 +64,11 @@ fn parse_format(s: &[u8]) -> ParseResult<'_> {
                     *negative = true;
                     state = State::ScanSet;
                 } else {
-                    err(s, start_idx);
+                    let Some((Conversion::ScanSet(ScanSet { chars, .. }), _)) = &mut conversion
+                    else {
+                        unreachable!()
+                    };
+                    chars.push(*c);
                 }
             } else if *c == b']' {
                 if state == State::ScanSet {
@@ -495,6 +499,20 @@ fn test_scanf_parse() {
             conversion: Conversion::ScanSet(ScanSet {
                 negative: true,
                 chars: vec![b'\n']
+            }),
+            leading_space: false,
+            trailing_space: false,
+        }
+    );
+    assert_eq!(
+        test_helper("%[^? | ^#]"),
+        ConversionSpec {
+            assign: true,
+            width: None,
+            length: None,
+            conversion: Conversion::ScanSet(ScanSet {
+                negative: true,
+                chars: b"? | ^#".to_vec(),
             }),
             leading_space: false,
             trailing_space: false,
