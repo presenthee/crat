@@ -7,8 +7,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{
     mir::{
-        self, AggregateKind, BasicBlock, Body, CastKind, Local, Location, Operand, Place,
-        ProjectionElem, Rvalue, StatementKind, TerminatorKind,
+        self, AggregateKind, BasicBlock, Body, CastKind, Const, ConstValue, Local, Location,
+        Operand, Place, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
+        interpret::{GlobalAlloc, Scalar},
     },
     ty::{self, Ty, TyCtxt},
 };
@@ -16,18 +17,22 @@ use rustc_span::{def_id::DefId, source_map::Spanned};
 
 use crate::{
     analyses::{
+        const_eval::{Ctx, EvalCx, MAX_EVAL_DEPTH, collect_defs},
         mir::CallGraphPostOrder,
         pointer_flow::{
             PointerFlowResult,
             builtin::{
-                builtin_summary, call_name, call_no_writes, call_propagates_first_arg,
-                constant_pointer_reason, is_as_ptr, is_empty_array_ref_ty, is_heap_alloc_call,
-                is_null_ptr_call, is_pointer_arithmetic, is_zero_int_operand,
+                builtin_summary, call_byte_displacement, call_name, call_no_writes,
+                call_propagates_first_arg, constant_pointer_reason, is_as_ptr,
+                is_empty_array_ref_ty, is_heap_alloc_call, is_null_ptr_call, is_pointer_arithmetic,
+                is_vec_as_ptr, is_vec_ty, is_zero_int_operand,
             },
             field_access::{
                 FieldAccess, FieldAccessReject, FieldAccessRejectKind, FieldEventScanner,
             },
-            graph::{BaseId, PfgNode, PointerFlowGraph, UnknownReason, solve_reachable_bases},
+            graph::{
+                BaseId, Offset, PfgNode, PointerFlowGraph, UnknownReason, solve_reachable_bases,
+            },
             slots::{SlotIdx, SlotPathElem, SlotTable, count_slots},
             summary::{
                 CallEffects, FunctionSummary, InstantiatedArgWrite, InstantiatedUnknownArgWrite,
@@ -448,7 +453,8 @@ impl<'tcx> Collector<'_, 'tcx> {
         location: Location,
     ) -> bool {
         let mut return_edges = Vec::new();
-        let mut arg_write_edges: FxHashMap<(usize, SlotIdx), Vec<PfgNode>> = FxHashMap::default();
+        let mut arg_write_edges: FxHashMap<(usize, SlotIdx), Vec<(PfgNode, Offset)>> =
+            FxHashMap::default();
         let mut unknown_returns = Vec::new();
         let mut unknown_arg_writes = Vec::new();
 
@@ -459,7 +465,7 @@ impl<'tcx> Collector<'_, 'tcx> {
             let Some(dst) = self.destination_path_node(destination, &flow.dst_return_path) else {
                 return false;
             };
-            return_edges.push((src, dst));
+            return_edges.push((src, dst, flow.offset));
         }
 
         for flow in &summary.arg_write_flows {
@@ -476,7 +482,7 @@ impl<'tcx> Collector<'_, 'tcx> {
             arg_write_edges
                 .entry((flow.dst_arg_index, destination))
                 .or_default()
-                .push(src);
+                .push((src, flow.offset));
         }
 
         for path in &summary.unknown_return_slots {
@@ -499,25 +505,26 @@ impl<'tcx> Collector<'_, 'tcx> {
             });
         }
 
-        for (src, dst) in return_edges {
+        for (src, dst, offset) in return_edges {
             if let PfgNode::Base(base) = &src {
                 self.graph.add_base(base.clone());
             }
-            self.graph.add_edge(src, dst);
+            self.graph.add_edge_with_offset(src, dst, offset);
         }
 
         let mut writes = Vec::with_capacity(arg_write_edges.len());
         for ((dst_arg_index, destination), sources) in arg_write_edges {
-            for src in &sources {
+            for (src, offset) in &sources {
                 if let PfgNode::Base(base) = src {
                     self.graph.add_base(base.clone());
                 }
-                self.graph.add_edge(src.clone(), PfgNode::Slot(destination));
+                self.graph
+                    .add_edge_with_offset(src.clone(), PfgNode::Slot(destination), *offset);
             }
             writes.push(InstantiatedArgWrite {
                 dst_arg_index,
                 destination,
-                sources,
+                sources: sources.into_iter().map(|(src, _)| src).collect(),
             });
         }
         writes.sort_by_key(|write| (write.dst_arg_index, write.destination));
@@ -667,12 +674,30 @@ impl<'tcx> Collector<'_, 'tcx> {
         }
 
         if let Some((def_id, name)) = call {
-            if is_pointer_arithmetic(self.tcx, def_id, &name) {
+            if is_pointer_arithmetic(self.tcx, def_id, &name)
+                && args
+                    .first()
+                    .is_some_and(|arg| arg.node.ty(self.body, self.tcx).is_raw_ptr())
+                && destination.ty(self.body, self.tcx).ty.is_raw_ptr()
+            {
                 let Some(dst) = self.destination_node(*destination, location) else {
                     return;
                 };
                 if let Some(arg) = args.first() {
-                    self.collect_operand_head_flow(&arg.node, dst, location);
+                    let offset = args
+                        .get(1)
+                        .and_then(|count| self.literal_integer(&count.node))
+                        .and_then(|count| {
+                            call_byte_displacement(
+                                self.tcx,
+                                ty::TypingEnv::post_analysis(self.tcx, self.body.source.def_id()),
+                                &name,
+                                arg.node.ty(self.body, self.tcx),
+                                count,
+                            )
+                        })
+                        .map_or(Offset::Unknown, Offset::Const);
+                    self.collect_operand_head_flow_offset(&arg.node, dst, location, offset);
                 } else {
                     self.graph.add_base_edge(
                         BaseId::Unknown {
@@ -699,6 +724,21 @@ impl<'tcx> Collector<'_, 'tcx> {
                         },
                         dst,
                     );
+                }
+                return;
+            }
+
+            // `Vec::as_ptr`/`as_mut_ptr` come from crate `alloc`, so they miss
+            // `is_as_ptr` and would fall to the opaque-return arm below. When the
+            // receiver resolves to a vec-typed local, base the returned pointer on
+            // that local; otherwise fall through to the generic handling.
+            if is_vec_as_ptr(self.tcx, def_id, &name)
+                && let Some(arg) = args.first()
+                && let Some(place) = operand_place(&arg.node)
+                && let Some(base) = self.local_vec_base_from_place(place)
+            {
+                if let Some(dst) = self.destination_node(*destination, location) {
+                    self.graph.add_base_edge(base, dst);
                 }
                 return;
             }
@@ -835,14 +875,24 @@ impl<'tcx> Collector<'_, 'tcx> {
                 if is_empty_array_ref_ty(operand.ty(self.body, self.tcx), self.tcx) {
                     return;
                 }
-                self.graph.add_base_edge(
-                    BaseId::Unknown {
-                        location,
-                        reason: constant_pointer_reason(operand, self.tcx),
-                    },
-                    dst,
-                );
+                let base = self.constant_base(operand, location);
+                self.graph.add_base_edge(base, dst);
             }
+        }
+    }
+
+    /// A constant pointer to a static gets a resolved `Static` base; every
+    /// other constant pointer stays `Unknown`.
+    fn constant_base(&self, operand: &Operand<'tcx>, location: Location) -> BaseId {
+        if let Some(constant) = operand.constant()
+            && let Const::Val(ConstValue::Scalar(Scalar::Ptr(ptr, _)), _) = constant.const_
+            && let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance.alloc_id())
+        {
+            return BaseId::Static { def_id };
+        }
+        BaseId::Unknown {
+            location,
+            reason: constant_pointer_reason(operand, self.tcx),
         }
     }
 
@@ -891,14 +941,62 @@ impl<'tcx> Collector<'_, 'tcx> {
                 if is_empty_array_ref_ty(operand.ty(self.body, self.tcx), self.tcx) {
                     return;
                 }
-                self.graph.add_base_edge(
-                    BaseId::Unknown {
-                        location,
-                        reason: constant_pointer_reason(operand, self.tcx),
-                    },
-                    dst,
-                );
+                let base = self.constant_base(operand, location);
+                self.graph.add_base_edge(base, dst);
             }
+        }
+    }
+
+    fn collect_operand_head_flow_offset(
+        &mut self,
+        operand: &Operand<'tcx>,
+        dst: PfgNode,
+        location: Location,
+        offset: Offset,
+    ) {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                if let Some(src) = self.source_node(*place) {
+                    self.graph.add_edge_with_offset(src, dst, offset);
+                } else {
+                    self.graph.add_base_edge(
+                        BaseId::Unknown {
+                            location,
+                            reason: UnknownReason::UnsupportedProjection,
+                        },
+                        dst,
+                    );
+                }
+            }
+            Operand::Constant(_) => {
+                if is_empty_array_ref_ty(operand.ty(self.body, self.tcx), self.tcx) {
+                    return;
+                }
+                let base = self.constant_base(operand, location);
+                self.graph.add_base_edge(base, dst);
+            }
+        }
+    }
+
+    /// A constant integer operand, folded backward through single-def chains:
+    /// debug MIR routes `c1 + c2` through overflow-checked tuples that a plain
+    /// constant check cannot see through.
+    fn literal_integer(&self, operand: &Operand<'tcx>) -> Option<i128> {
+        let defs = collect_defs(self.body);
+        let ctx = Ctx::new();
+        let eval = EvalCx {
+            tcx: self.tcx,
+            body: self.body,
+            defs: &defs,
+            ctx: &ctx,
+            typing_env: ty::TypingEnv::post_analysis(self.tcx, self.body.source.def_id()),
+        };
+        let v = eval.operand(operand, MAX_EVAL_DEPTH)?;
+        let size = eval.int_size(v.ty)?;
+        match v.ty.kind() {
+            ty::TyKind::Int(_) => Some(size.sign_extend(v.bits)),
+            ty::TyKind::Uint(_) => i128::try_from(v.bits).ok(),
+            _ => None,
         }
     }
 
@@ -1096,6 +1194,40 @@ impl<'tcx> Collector<'_, 'tcx> {
 
         self.array_source_for_local(place.local, &mut FxHashSet::default())
             .map(|local| BaseId::LocalArray { local })
+    }
+
+    fn local_vec_base_from_place(&self, place: Place<'tcx>) -> Option<BaseId> {
+        self.vec_source_for_local(place.local, &mut FxHashSet::default())
+            .map(|local| BaseId::LocalVec { local })
+    }
+
+    fn vec_source_for_local(&self, local: Local, visited: &mut FxHashSet<Local>) -> Option<Local> {
+        if !visited.insert(local) {
+            return None;
+        }
+
+        if is_vec_ty(self.local_ty(local), self.tcx) {
+            return Some(local);
+        }
+
+        for rhs in self.rhs_map.get(&local).into_iter().flatten() {
+            match rhs {
+                AssignRhs::ArrayBorrow(place) => {
+                    if place.projection.is_empty()
+                        && is_vec_ty(self.local_ty(place.local), self.tcx)
+                    {
+                        return Some(place.local);
+                    }
+                }
+                AssignRhs::Follow(src_local) => {
+                    if let Some(vec_local) = self.vec_source_for_local(*src_local, visited) {
+                        return Some(vec_local);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn array_source_for_local(

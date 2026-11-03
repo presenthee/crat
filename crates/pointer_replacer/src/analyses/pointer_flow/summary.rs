@@ -11,7 +11,7 @@ use crate::analyses::pointer_flow::{
     builtin::{call_name, call_no_writes},
     collector::operand_place,
     field_access::{FieldAccessKind, FieldAccessRejectKind},
-    graph::{BaseId, PfgNode, UnknownReason},
+    graph::{BaseId, Offset, PfgNode, UnknownReason},
     slots::{SlotIdx, SlotPathElem, count_slots, slot_path_from_projection},
 };
 
@@ -58,6 +58,7 @@ pub(crate) enum SummaryCompleteness {
 pub(crate) struct SummaryFlow {
     pub(crate) dst_return_path: Vec<SlotPathElem>,
     pub(crate) src: SummarySource,
+    pub(crate) offset: Offset,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -65,6 +66,7 @@ pub(crate) struct ArgWriteFlow {
     pub(crate) dst_arg_index: usize,
     pub(crate) dst_path: Vec<SlotPathElem>,
     pub(crate) src: SummarySource,
+    pub(crate) offset: Offset,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -140,9 +142,29 @@ fn summary_source_for_base(base: &BaseId, result: &PointerFlowResult) -> Summary
         BaseId::OpaqueReturn { .. } => SummarySource::OpaqueReturn,
         BaseId::Unknown { reason, .. } => SummarySource::Unknown(reason.clone()),
         BaseId::IntToPtr { .. } => SummarySource::Unknown(UnknownReason::ConstantPointer),
-        BaseId::LocalArray { .. } | BaseId::LocalScalar { .. } | BaseId::RawBorrow { .. } => {
-            SummarySource::Unknown(UnknownReason::UnsupportedMemoryLoad)
-        }
+        // a Static base reaching a summary source degrades conservatively
+        // instead of gaining a dedicated variant
+        BaseId::LocalArray { .. }
+        | BaseId::LocalVec { .. }
+        | BaseId::LocalScalar { .. }
+        | BaseId::RawBorrow { .. }
+        | BaseId::Static { .. } => SummarySource::Unknown(UnknownReason::UnsupportedMemoryLoad),
+    }
+}
+
+fn summary_offset_for_source(
+    node: &PfgNode,
+    base: &BaseId,
+    source: &SummarySource,
+    result: &PointerFlowResult,
+) -> Offset {
+    if matches!(source, SummarySource::ParamSlot { .. }) {
+        result
+            .provenance
+            .offset_from_base(node, base)
+            .unwrap_or(Offset::Unknown)
+    } else {
+        Offset::Const(0)
     }
 }
 
@@ -457,9 +479,11 @@ pub(crate) fn build_function_summary<'tcx>(
         let mut emitted = false;
         for base in bases {
             let src = summary_source_for_base(base, result);
+            let offset = summary_offset_for_source(&node, base, &src, result);
             summary.return_flows.push(SummaryFlow {
                 dst_return_path: path.clone(),
                 src,
+                offset,
             });
             emitted = true;
         }
@@ -473,11 +497,8 @@ pub(crate) fn build_function_summary<'tcx>(
         summary.completeness = SummaryCompleteness::Incomplete;
     }
     for (target, written_slot) in boundary_writes.targets {
-        let Some(bases) = result
-            .provenance
-            .reachable_bases
-            .get(&PfgNode::Slot(written_slot))
-        else {
+        let node = PfgNode::Slot(written_slot);
+        let Some(bases) = result.provenance.reachable_bases.get(&node) else {
             summary.unknown_arg_writes.push(target);
             continue;
         };
@@ -491,10 +512,12 @@ pub(crate) fn build_function_summary<'tcx>(
                 continue;
             }
             let src = summary_source_for_base(base, result);
+            let offset = summary_offset_for_source(&node, base, &src, result);
             summary.arg_write_flows.push(ArgWriteFlow {
                 dst_arg_index: target.arg_index,
                 dst_path: target.path.clone(),
                 src,
+                offset,
             });
             emitted = true;
         }

@@ -327,6 +327,7 @@ pub fn analyze(
                     call_info_map,
                     is_merged,
                 } = analyzer.analyze_body(&body);
+
                 if config.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
                         "{:?}\n{}",

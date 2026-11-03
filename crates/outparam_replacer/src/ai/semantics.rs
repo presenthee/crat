@@ -561,6 +561,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let offsets2 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
                 offsets.extend(offsets2);
                 let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
+                    // Collapsing Arg bases to Top would make every offset write
+                    // unanalyzable; the access-order run only needs parameter-
+                    // granularity attribution, not precise indices, so keep the base.
                     if ptrs.iter().any(|ptr| matches!(ptr.base, AbsBase::Arg(_))) {
                         AbsPtr::top()
                     } else {
@@ -568,9 +571,14 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             ptrs.iter()
                                 .cloned()
                                 .map(|mut ptr| {
-                                    let last = ptr.projections.last_mut();
-                                    if let Some(AbsProjElem::Index(i)) = last {
-                                        *i = i.to_i64().add(&args[1].intv).to_u64();
+                                    match ptr.projections.last_mut() {
+                                        Some(AbsProjElem::Index(i)) => {
+                                            *i = i.to_i64().add(&args[1].intv).to_u64();
+                                        }
+                                        // Also fires for non-Arg bases without a trailing
+                                        // Index; harmless since AbsPath::from_place only
+                                        // resolves Arg bases.
+                                        _ => ptr.projections.push(AbsProjElem::Index(AbsUint::Top)),
                                     }
                                     ptr
                                 })
@@ -623,14 +631,12 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 }
             }
             ("ptr", "mut_ptr" | "const_ptr", _, "offset_from") => AbsValue::top_int(),
+            ("", "", "ptr", "null" | "null_mut") => AbsValue::null(),
             ("", "", "ptr", "write_volatile") => {
                 self.indirect_assign(&args[0].ptrv, &args[1], &[], state);
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
-                let bases = self
-                    .get_write_bases_of_ptr(&args[0].ptrv)
-                    .unwrap_or_default();
-                call_kind = CallKind::RustEffect(Some(bases));
+                call_kind = effect_write_call_kind(&args[0].ptrv);
                 AbsValue::top()
             }
             ("", "", "ptr", "read_volatile")
@@ -706,19 +712,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 reads.extend(reads2);
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
-                let bases = self
-                    .get_write_bases_of_ptr(&args[0].ptrv)
-                    .unwrap_or_default();
-                call_kind = CallKind::RustEffect(Some(bases));
+                call_kind = effect_write_call_kind(&args[0].ptrv);
                 args[0].clone()
             }
             ("", "unix", _, "memset") => {
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
-                let bases = self
-                    .get_write_bases_of_ptr(&args[0].ptrv)
-                    .unwrap_or_default();
-                call_kind = CallKind::RustEffect(Some(bases));
+                call_kind = effect_write_call_kind(&args[0].ptrv);
                 args[0].clone()
             }
             ("", "vec", _, "as_mut_ptr") => AbsValue::top_ptr(),
@@ -962,7 +962,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 };
                 (v, reads, vec![])
             }
-            Rvalue::Discriminant(_) => todo!("{:?}", rvalue),
+            Rvalue::Discriminant(place) => {
+                let (_, reads) = self.transfer_place(place, state);
+                (AbsValue::top_int(), reads, vec![])
+            }
             Rvalue::Aggregate(box kind, fields) => match kind {
                 AggregateKind::Array(_) => {
                     let (vs, readss): (Vec<_>, Vec<_>) = fields
@@ -973,7 +976,15 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     let reads = readss.into_iter().flatten().collect();
                     (v, reads, vec![])
                 }
-                AggregateKind::Tuple => unreachable!("{:?}", rvalue),
+                AggregateKind::Tuple => {
+                    let (vs, readss): (Vec<_>, Vec<_>) = fields
+                        .iter()
+                        .map(|operand| self.transfer_operand(operand, state))
+                        .unzip();
+                    let v = AbsValue::alpha_list(vs.into_iter().collect());
+                    let reads = readss.into_iter().flatten().collect();
+                    (v, reads, vec![])
+                }
                 AggregateKind::Adt(def_id, _, _, _, _) => {
                     let adt_def = self.tcx.adt_def(def_id);
                     match adt_def.adt_kind() {
@@ -997,21 +1008,25 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             (v, reads, vec![])
                         }
                         AdtKind::Enum => {
-                            assert_eq!(
-                                format!("{adt_def:?}"),
-                                "std::option::Option",
-                                "{:?}",
-                                rvalue
-                            );
-                            if let Some(field) = fields.get(FieldIdx::from_usize(0)) {
-                                let (v, reads) = self.transfer_operand(field, state);
-                                if v.is_bot() {
-                                    (AbsValue::bot(), reads, vec![])
+                            if format!("{adt_def:?}") == "std::option::Option" {
+                                if let Some(field) = fields.get(FieldIdx::from_usize(0)) {
+                                    let (v, reads) = self.transfer_operand(field, state);
+                                    if v.is_bot() {
+                                        (AbsValue::bot(), reads, vec![])
+                                    } else {
+                                        (AbsValue::some(v), reads, vec![])
+                                    }
                                 } else {
-                                    (AbsValue::some(v), reads, vec![])
+                                    (AbsValue::none(), vec![], vec![])
                                 }
                             } else {
-                                (AbsValue::none(), vec![], vec![])
+                                // Any other enum variant: the composed value is not
+                                // modeled, but its field operands are still read.
+                                let reads = fields
+                                    .iter()
+                                    .flat_map(|operand| self.transfer_operand(operand, state).1)
+                                    .collect();
+                                (AbsValue::top(), reads, vec![])
                             }
                         }
                     }
@@ -1157,7 +1172,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     match ty.as_str() {
                         "std::option::Option" => AbsValue::top_option(),
                         "libc::c_void" | "std::ffi::c_void" => AbsValue::top(),
-                        _ => unreachable!("{:?}", ty),
+                        _ => AbsValue::top(),
                     }
                 }
             },
@@ -1175,7 +1190,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TyKind::Slice(_) => unreachable!("{:?}", ty),
             TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) => AbsValue::heap_or_null(),
             TyKind::FnDef(_, _) => unreachable!("{:?}", ty),
-            TyKind::FnPtr(_, _) => todo!("{:?}", ty),
+            TyKind::FnPtr(_, _) => AbsValue::top_fn(),
             TyKind::UnsafeBinder(_) => unreachable!("{:?}", ty),
             TyKind::Dynamic(_, _, _) => unreachable!("{:?}", ty),
             TyKind::Closure(_, _) => unreachable!("{:?}", ty),
@@ -1211,6 +1226,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     ) -> Vec<AbsProjElem> {
         projection
             .iter()
+            .filter(|e| !matches!(e, ProjectionElem::Downcast(_, _)))
             .map(|e| self.abstract_elem(e, state))
             .collect()
     }
@@ -1287,16 +1303,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
         }
         vec![]
-    }
-
-    fn get_write_bases_of_ptr(&self, ptr: &AbsPtr) -> Option<Vec<AbsBase>> {
-        if let AbsPtr::Set(ptrs) = ptr
-            && ptrs.len() == 1
-        {
-            let ptr = ptrs.first().unwrap().clone();
-            return Some(vec![ptr.base]);
-        }
-        None
     }
 
     fn update_value(
@@ -1428,5 +1434,22 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 Some(path)
             })
             .collect::<Vec<_>>()
+    }
+}
+
+/// Build the `CallKind` for an effect intrinsic (write_volatile, memcpy, memset)
+/// based on all pointer targets of the destination argument. Every parameter
+/// target is collected; a `Top` pointer or any `Heap` target means the write
+/// destination cannot be bounded, which the caller will treat as unanalyzable.
+fn effect_write_call_kind(dst: &AbsPtr) -> CallKind {
+    match dst {
+        AbsPtr::Top => CallKind::RustEffect(None),
+        AbsPtr::Set(ptrs) => {
+            if ptrs.iter().any(|p| matches!(p.base, AbsBase::Heap)) {
+                CallKind::RustEffect(None)
+            } else {
+                CallKind::RustEffect(Some(ptrs.iter().map(|p| p.base).collect()))
+            }
+        }
     }
 }

@@ -56,6 +56,16 @@ pub struct BaseClassification {
     pub reason: String,
 }
 
+/// The unique non-null base of a pointer operand or place, with its admissibility.
+/// Same-base is pure provenance equality; admissibility is returned as data so
+/// callers, not the analysis, decide whether the base is rewriteable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperandBase {
+    pub slot: SlotIdx,
+    pub base: BaseId,
+    pub admissibility: BaseAdmissibility,
+}
+
 #[derive(Clone, Debug)]
 pub struct ArrayLocalProvenance {
     pub flow: PointerFlowResult,
@@ -129,6 +139,39 @@ impl ArrayLocalProvenance {
             .unwrap_or(BaseAdmissibility::Reject)
     }
 
+    /// The unique non-null base of a place that resolves to a raw-pointer slot.
+    /// Returns `None` for non-pointer places, missing or zero-slot places,
+    /// multi-base slots, and null-only slots.
+    pub fn unique_non_null_base_of_place<'tcx>(
+        &self,
+        place: Place<'tcx>,
+        body: &Body<'tcx>,
+        tcx: TyCtxt<'tcx>,
+    ) -> Option<OperandBase> {
+        let slot = self.slot_table().place_head_slot(place, body, tcx)?;
+        let base = self
+            .provenance()
+            .unique_non_null_base(&PfgNode::Slot(slot))?;
+        let admissibility = self.admissibility_of_base(&base);
+        Some(OperandBase {
+            slot,
+            base,
+            admissibility,
+        })
+    }
+
+    /// Like [`Self::unique_non_null_base_of_place`], but for a MIR operand.
+    /// Returns `None` for constants and other non-place operands.
+    pub fn unique_non_null_base_of_operand<'tcx>(
+        &self,
+        operand: &Operand<'tcx>,
+        body: &Body<'tcx>,
+        tcx: TyCtxt<'tcx>,
+    ) -> Option<OperandBase> {
+        let place = operand.place()?;
+        self.unique_non_null_base_of_place(place, body, tcx)
+    }
+
     pub fn is_potential_rewrite_base(&self, base: &BaseId) -> bool {
         matches!(
             self.admissibility_of_base(base),
@@ -185,9 +228,16 @@ pub fn array_local_provenance_analysis(
     input: &RustProgram<'_>,
     alloc_fns: &FxHashSet<LocalDefId>,
 ) -> FxHashMap<LocalDefId, ArrayLocalProvenance> {
-    crate::analyses::pointer_flow::pointer_flow_analysis(input, alloc_fns)
-        .into_iter()
-        .map(|(def_id, flow)| (def_id, wrap_flow(flow)))
+    let flows = crate::analyses::pointer_flow::pointer_flow_analysis(input, alloc_fns);
+    array_local_provenance_from_flows(&flows)
+}
+
+pub fn array_local_provenance_from_flows(
+    flows: &FxHashMap<LocalDefId, PointerFlowResult>,
+) -> FxHashMap<LocalDefId, ArrayLocalProvenance> {
+    flows
+        .iter()
+        .map(|(&def_id, flow)| (def_id, wrap_flow(flow.clone())))
         .collect()
 }
 
@@ -1524,6 +1574,10 @@ fn classify_base(base: &BaseId) -> BaseClassification {
             BaseAdmissibility::DirectlyRewriteable,
             "local array pointer can later become array/slice indexing",
         ),
+        BaseId::LocalVec { .. } => (
+            BaseAdmissibility::TrackOnly,
+            "vec-backed pointer has a stable base but no in-place rewrite; only call-site copies may use it",
+        ),
         BaseId::LocalScalar { .. } => (
             BaseAdmissibility::DirectlyRewriteable,
             "local scalar raw borrow can later become direct local access",
@@ -1547,6 +1601,10 @@ fn classify_base(base: &BaseId) -> BaseClassification {
         BaseId::IntToPtr { .. } => (
             BaseAdmissibility::Reject,
             "integer-to-pointer cast has no known safe Rust allocation object",
+        ),
+        BaseId::Static { .. } => (
+            BaseAdmissibility::Reject,
+            "static memory is outside the local rewrite scope",
         ),
         BaseId::Unknown { reason, .. } => (
             BaseAdmissibility::Reject,

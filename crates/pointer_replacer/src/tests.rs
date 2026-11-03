@@ -12206,3 +12206,276 @@ pub mod b {
     assert!(!mod_b.contains("use crate::build_field"), "{s}");
     assert!(!mod_b.contains("use crate::a::build_field"), "{s}");
 }
+
+fn rewrite_aliasing_with_config(code: &str, config: &Config) -> (String, bool) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| rewrite_aliasing(config, tcx)).unwrap()
+}
+
+#[test]
+fn snapshot_prefix_copy_is_emitted() {
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32, len: i32) {
+    let _ = len;
+    *out = *src;
+}
+pub unsafe fn driver(len: i32) {
+    let mut a: [i32; 16] = [0; 16];
+    callee(a.as_mut_ptr(), a.as_ptr(), len);
+}
+"#;
+    let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
+    assert!(changed);
+    assert!(
+        s.contains("*(a.as_ptr() as *const i32 as *const [i32; 1]);"),
+        "expected the snapshot let in:\n{s}"
+    );
+    assert!(
+        s.contains("callee(a.as_mut_ptr(), __crat_snap_0.as_ptr(), len);"),
+        "expected the rewritten argument in:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
+#[test]
+fn snapshot_in_safe_fn_wraps_initializer_in_unsafe() {
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) {
+    *out = *src;
+}
+pub fn driver() {
+    let mut a: [i32; 16] = [0; 16];
+    unsafe {
+        callee(a.as_mut_ptr(), a.as_ptr());
+    }
+}
+"#;
+    let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
+    assert!(changed);
+    assert!(
+        s.contains("unsafe { *(a.as_ptr() as *const i32 as *const [i32; 1]) };"),
+        "expected an unsafe-wrapped initializer in:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
+#[test]
+fn snapshot_expression_position_call_is_untouched() {
+    // The call's value is used, so there is no statement to insert before;
+    // the site is infeasible and the callee must not be rewritten at all.
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) -> i32 {
+    *out = *src;
+    0
+}
+pub unsafe fn driver() -> i32 {
+    let mut a: [i32; 16] = [0; 16];
+    let r = callee(a.as_mut_ptr(), a.as_ptr());
+    r
+}
+"#;
+    let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
+    assert!(!changed);
+    assert!(!s.contains("__crat_snap"), "no snapshot expected in:\n{s}");
+}
+
+#[test]
+fn snapshot_whole_array_is_rejected_when_access_order_is_unknown() {
+    // A write at a dynamic parameter offset precedes the reads, so the
+    // call-site access-order query stays unknown and snapshotting is
+    // rejected before the whole-array fallback.
+    let code = r#"
+pub unsafe fn callee(out: *mut u8, a: *const u8, b: *const u8, n: usize) {
+    *out.offset(n as isize) = 0;
+    let v = *a.offset(n as isize) ^ *b.offset(n as isize);
+    *out.offset(n as isize) = v;
+}
+pub unsafe fn driver(n: usize) {
+    let mut arr: [u8; 16] = [0; 16];
+    callee(arr.as_mut_ptr(), arr.as_ptr(), arr.as_ptr(), n);
+}
+"#;
+    let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
+    assert!(!changed);
+    assert!(!s.contains("__crat_snap"), "no snapshot expected in:\n{s}");
+}
+
+#[test]
+fn snapshot_pass_reports_unchanged_without_candidates() {
+    let code = r#"
+pub unsafe fn callee(out: *mut i32, src: *const i32) {
+    *out = *src;
+}
+pub unsafe fn driver() {
+    let mut a: [i32; 4] = [0; 4];
+    let mut b: [i32; 4] = [0; 4];
+    callee(a.as_mut_ptr(), b.as_ptr());
+}
+"#;
+    let (s, changed) = rewrite_aliasing_with_config(code, &Config::default());
+    assert!(!changed);
+    assert!(!s.contains("__crat_snap"), "no snapshot expected in:\n{s}");
+}
+
+const RUNTIME_SNAPSHOT_FMA: &str = r#"
+pub unsafe fn fma_array(
+    out: *mut i32,
+    mul1: *const i32,
+    mul2: *const i32,
+    add: *const i32,
+    len: i32,
+) {
+    let mut i = 0i32;
+    while i < len {
+        *out.offset(i as isize) = *mul1.offset(i as isize)
+            * *mul2.offset(i as isize)
+            + *add.offset(i as isize);
+        i += 1;
+    }
+}
+pub unsafe fn driver(out: *mut i32, len: i32) {
+    fma_array(out, out, out, out, len);
+}
+pub unsafe fn root(len: i32) {
+    let mut values = [0i32; 16];
+    driver(values.as_mut_ptr(), len);
+}
+"#;
+
+#[test]
+fn snapshot_runtime_prefix_captures_once_and_emits_three_vecs() {
+    // Assumes CRAT_SNAPSHOT_VALIDATE is unset; hold the lock so a
+    // concurrently running SnapshotValidateEnv user can't flip it mid-test.
+    let _guard = SNAPSHOT_VALIDATE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (rewritten, changed) =
+        rewrite_aliasing_with_config(RUNTIME_SNAPSHOT_FMA, &Config::default());
+    assert!(changed);
+    assert_eq!(
+        rewritten.matches("let __crat_snap_len_").count(),
+        1,
+        "{rewritten}"
+    );
+    assert_eq!(rewritten.matches("Vec<i32>").count(), 3, "{rewritten}");
+    assert_eq!(rewritten.matches(".to_vec()").count(), 3, "{rewritten}");
+    assert_eq!(
+        rewritten.matches("if __crat_snap_len_0 > 0").count(),
+        3,
+        "{rewritten}"
+    );
+    assert_eq!(
+        rewritten.matches("__crat_snap_len_0 as usize").count(),
+        3,
+        "{rewritten}",
+    );
+    let compact: String = rewritten.split_whitespace().collect();
+    assert!(compact.contains(
+        "fma_array(out,__crat_snap_1.as_ptr(),__crat_snap_2.as_ptr(),__crat_snap_3.as_ptr(),__crat_snap_len_0);"
+    ), "{rewritten}");
+    ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+}
+
+#[test]
+fn snapshot_runtime_prefix_rejects_any_non_plain_call_argument() {
+    let code = RUNTIME_SNAPSHOT_FMA.replace(
+        "fma_array(out, out, out, out, len);",
+        "fma_array(out, out.offset(0), out, out, len);",
+    );
+    let (rewritten, changed) = rewrite_aliasing_with_config(&code, &Config::default());
+    assert!(!changed);
+    assert!(!rewritten.contains("__crat_snap"), "{rewritten}");
+}
+
+#[test]
+fn snapshot_runtime_prefix_rejects_non_parameter_length_path() {
+    let code = RUNTIME_SNAPSHOT_FMA.replace(
+        "fma_array(out, out, out, out, len);",
+        "let count = len; fma_array(out, out, out, out, count);",
+    );
+    let (rewritten, changed) = rewrite_aliasing_with_config(&code, &Config::default());
+    assert!(!changed);
+    assert!(!rewritten.contains("__crat_snap"), "{rewritten}");
+}
+
+#[test]
+fn snapshot_runtime_prefix_accepts_parenthesized_plain_arguments() {
+    let code = RUNTIME_SNAPSHOT_FMA.replace(
+        "fma_array(out, out, out, out, len);",
+        "fma_array((out), (out), (out), (out), (len));",
+    );
+    let (rewritten, changed) = rewrite_aliasing_with_config(&code, &Config::default());
+    assert!(changed);
+    assert_eq!(rewritten.matches("Vec<i32>").count(), 3, "{rewritten}");
+    ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+}
+
+#[test]
+fn snapshot_runtime_prefix_in_safe_fn_wraps_raw_read() {
+    let code = RUNTIME_SNAPSHOT_FMA.replace(
+        "pub unsafe fn driver(out: *mut i32, len: i32) {\n    fma_array(out, out, out, out, len);\n}",
+        "pub fn driver(out: *mut i32, len: i32) { unsafe { fma_array(out, out, out, out, len); } }",
+    );
+    let (rewritten, changed) = rewrite_aliasing_with_config(&code, &Config::default());
+    assert!(changed);
+    let compact: String = rewritten.split_whitespace().collect();
+    assert!(
+        compact.contains("unsafe{std::slice::from_raw_parts"),
+        "{rewritten}"
+    );
+    ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+}
+
+// `rewrite_aliasing` reads `CRAT_SNAPSHOT_VALIDATE` from the process
+// environment, which every test in this binary shares. Any test that
+// depends on the variable's value (set or unset) must hold this lock for
+// the duration of its rewrite, or it can race with a concurrently running
+// test that flips the variable out from under it.
+static SNAPSHOT_VALIDATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct SnapshotValidateEnv<'a> {
+    previous: Option<std::ffi::OsString>,
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl SnapshotValidateEnv<'_> {
+    fn enable() -> Self {
+        let guard = SNAPSHOT_VALIDATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("CRAT_SNAPSHOT_VALIDATE");
+        unsafe { std::env::set_var("CRAT_SNAPSHOT_VALIDATE", "1") };
+        Self {
+            previous,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for SnapshotValidateEnv<'_> {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var("CRAT_SNAPSHOT_VALIDATE", value) },
+            None => unsafe { std::env::remove_var("CRAT_SNAPSHOT_VALIDATE") },
+        }
+    }
+}
+
+#[test]
+fn snapshot_runtime_prefix_validation_uses_captured_length() {
+    let _env = SnapshotValidateEnv::enable();
+    let (rewritten, changed) =
+        rewrite_aliasing_with_config(RUNTIME_SNAPSHOT_FMA, &Config::default());
+    assert!(changed);
+    assert_eq!(
+        rewritten.matches("debug_assert_eq!").count(),
+        3,
+        "{rewritten}"
+    );
+    assert_eq!(
+        rewritten.matches("__crat_snap_len_0 as usize").count(),
+        6,
+        "three initializers plus three validation reads: {rewritten}",
+    );
+    assert!(!rewritten.contains("len as usize"), "{rewritten}");
+    ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).expect(&rewritten);
+}
