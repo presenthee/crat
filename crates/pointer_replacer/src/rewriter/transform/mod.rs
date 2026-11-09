@@ -8069,7 +8069,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 ty::TyKind::Array(..) => self.projected_base_mutability(pe, m),
                 _ => m,
             },
-            |kind| kind.is_mut(),
+            // a mutable field reached through a shared reference can only be borrowed shared
+            |kind| kind.is_mut() && self.projected_base_mutability(pe, true),
         );
         let mut is_plain_slice = matches!(self.ptr_source_kind(pe), Some(PtrKind::Slice(_)));
         // A "data container" is a Vec/array accessed via as_ptr that is NOT a cursor.

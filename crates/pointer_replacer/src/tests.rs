@@ -3320,7 +3320,7 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
             ".as_slice()",
-            ".offset_by((-((s.count / 8) as isize))",
+            ".offset_by((-((s.count / 8) as",
         ],
         &["}).as_mut_ptr()", "*(*s).words.offset"],
     );
@@ -14877,5 +14877,28 @@ pub unsafe fn parse(p: *const core::ffi::c_char) -> i64 {
 "#,
         &["let mut e: *mut"],
         &["as *mut *mut", "let mut e: &"],
+    );
+}
+
+#[test]
+fn test_slice_field_behind_shared_ref_cast_is_shared_borrow() {
+    // `cur` only reads `words` through `s: &State`; the cast view between the two offsets must
+    // borrow it shared, while `put` keeps `words` a mutable slice.
+    run_test(
+        r#"
+pub struct State { pub words: *mut u32, pub idx: u32 }
+pub unsafe fn cur(s: *const State) -> *const i8 {
+    (((*s).words).offset((*s).idx as usize as isize) as *mut i8).offset(1)
+}
+pub unsafe fn put(s: *mut State, v: u32) {
+    *((*s).words).offset((*s).idx as isize) = v;
+}
+"#,
+        &[
+            "pub words: &'a mut [u32]",
+            "bytemuck::cast_slice::<_,",
+            "(&((s.words)",
+        ],
+        &["cast_slice_mut"],
     );
 }
