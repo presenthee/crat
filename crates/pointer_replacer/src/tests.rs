@@ -4126,8 +4126,13 @@ pub unsafe fn parse(str: *const core::ffi::c_char) -> core::ffi::c_long {
     strtol(str, &raw mut endp, 10)
 }
 "#,
-        &["let mut endp: &[i8]"],
-        &[],
+        &[
+            "pub unsafe fn parse(str: *const i8)",
+            "let mut endp: *mut i8",
+            "str as *mut core::ffi::c_char as *mut i8",
+            "strtol(str, &raw mut (endp), 10)",
+        ],
+        &["str: Option<&i8>", "strtol((str)"],
     );
 }
 
@@ -14852,5 +14857,25 @@ pub unsafe extern "C" fn store(mut value: *mut V, mut p: *mut u16) {
 "#,
         &["std::slice::from_mut(bytemuck::cast_mut("],
         &["is_null"],
+    );
+}
+
+#[test]
+fn test_foreign_out_param_local_stays_raw() {
+    // `strtol` writes a thin C pointer through `&mut e`: `e` must keep its C layout.
+    run_test(
+        r#"
+extern "C" {
+    fn strtol(s: *const core::ffi::c_char, end: *mut *mut core::ffi::c_char,
+              base: core::ffi::c_int) -> core::ffi::c_long;
+}
+pub unsafe fn parse(p: *const core::ffi::c_char) -> i64 {
+    let mut e: *mut core::ffi::c_char = core::ptr::null_mut();
+    let t = strtol(p, &mut e, 10);
+    if !e.is_null() && *e == 0 { t } else { -1 }
+}
+"#,
+        &["let mut e: *mut"],
+        &["as *mut *mut", "let mut e: &"],
     );
 }
