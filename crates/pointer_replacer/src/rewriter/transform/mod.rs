@@ -8069,7 +8069,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 ty::TyKind::Array(..) => self.projected_base_mutability(pe, m),
                 _ => m,
             },
-            |kind| kind.is_mut(),
+            // a mutable field reached through a shared reference can only be borrowed shared
+            |kind| kind.is_mut() && self.projected_base_mutability(pe, true),
         );
         let mut is_plain_slice = matches!(self.ptr_source_kind(pe), Some(PtrKind::Slice(_)));
         // A "data container" is a Vec/array accessed via as_ptr that is NOT a cursor.
@@ -14450,6 +14451,22 @@ fn collect_raw_local_assignment_bindings(
                 && self.tcx.typeck(rhs.hir_id.owner).expr_ty(rhs).is_raw_ptr()
             {
                 self.bindings.insert(lhs_hir_id);
+            }
+            // A foreign callee reads or writes a pointer local through its address as a thin C
+            // pointer (e.g. `strtol(s, &mut end, 10)`), so the local must keep its C layout.
+            if let hir::ExprKind::Call(func, args) = expr.kind
+                && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) =
+                    hir_unwrap_casts(func).kind
+                && let Res::Def(DefKind::Fn, def_id) = path.res
+                && self.tcx.is_foreign_item(def_id)
+            {
+                for arg in args {
+                    if let Some((hir_id, _)) = hir_addr_local(arg)
+                        && self.tcx.typeck(hir_id.owner).node_type(hir_id).is_raw_ptr()
+                    {
+                        self.bindings.insert(hir_id);
+                    }
+                }
             }
             intravisit::walk_expr(self, expr);
         }
